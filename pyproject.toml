@@ -9,7 +9,6 @@ dependencies = [
     "pydantic>=2.12.5",
     "pymysql>=1.1.2",
     "python-dotenv>=1.2.1",
-    "sqlalchemy>=2.0.44",
     "uvicorn>=0.38.0",
     "bcrypt>=4.2.0",
     "requests>=2.32.0",

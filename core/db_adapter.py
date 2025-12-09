@@ -4,7 +4,7 @@
 """
 from contextlib import contextmanager
 from typing import Optional, Any, Dict, List
-from config import get_conn
+from core.database import get_conn
 import pymysql
 
 

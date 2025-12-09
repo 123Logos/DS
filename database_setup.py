@@ -1,76 +1,15 @@
 # database_setup.py - 表结构与项目2完全一致
 # 注意：此文件主要用于数据库表结构定义和初始化
-# 日常数据库操作请使用 config.get_conn() 或 core.database.get_conn()
+# 日常数据库操作请使用 core.database.get_conn()
+# 已移除 SQLAlchemy ORM，完全使用 pymysql
 import logging
-from sqlalchemy import create_engine
-from sqlalchemy.sql import text  # 仅用于表结构初始化
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.pool import QueuePool
-from config import get_db_config, PLATFORM_MERCHANT_ID, MEMBER_PRODUCT_PRICE, LOG_FILE
+import pymysql
+from core.config import get_db_config, PLATFORM_MERCHANT_ID, MEMBER_PRODUCT_PRICE, LOG_FILE
 
 # 配置日志：统一输出到 logs/api.log
 # 注意：如果 finance_logic.py 已经配置了 basicConfig，这里不会重复配置
 # 使用 getLogger 获取 logger 实例，共享全局日志配置
 logger = logging.getLogger(__name__)
-
-_engine = None
-
-# SQLAlchemy Base 类（用于 ORM 模型定义，product 模块仍在使用）
-Base = declarative_base()
-
-def get_engine():
-    global _engine
-    if _engine is None:
-        try:
-            cfg = get_db_config()
-            connection_url = (
-                f"mysql+pymysql://{cfg['user']}:{cfg['password']}"
-                f"@{cfg['host']}:{cfg['port']}/{cfg['database']}"
-                f"?charset={cfg['charset']}"
-            )
-            _engine = create_engine(
-                connection_url,
-                poolclass=QueuePool,
-                pool_size=20,
-                max_overflow=30,
-                pool_timeout=30,
-                pool_pre_ping=True,
-                echo=False
-            )
-            logger.info("✅ SQLAlchemy 引擎已创建 (pool_size=20)")
-        except Exception as e:
-            logger.error(f"❌ SQLAlchemy 引擎创建失败: {e}")
-            raise
-    return _engine
-
-# engine - 用于兼容 product 模块（延迟初始化）
-# 注意：这是一个属性访问，每次访问都会调用 get_engine()
-# 为了兼容 product 模块，我们提供一个属性访问方式
-class _EngineProxy:
-    """Engine 代理类，用于兼容 product 模块"""
-    def __getattr__(self, name):
-        return getattr(get_engine(), name)
-    
-    def __call__(self, *args, **kwargs):
-        return get_engine()(*args, **kwargs)
-    
-    def connect(self, *args, **kwargs):
-        return get_engine().connect(*args, **kwargs)
-    
-    def execute(self, *args, **kwargs):
-        return get_engine().execute(*args, **kwargs)
-
-# 创建 engine 实例（兼容 product 模块）
-engine = _EngineProxy()
-
-# 注意：以下 Session 相关代码已废弃，统一使用 config.get_conn() 或 core.database.get_conn()
-# 保留 engine 用于表结构定义和初始化
-# 
-# 如需使用数据库连接，请使用：
-#   from config import get_conn
-#   with get_conn() as conn:
-#       with conn.cursor() as cur:
-#           cur.execute("SELECT ...")
 
 class DatabaseManager:
     def __init__(self):
@@ -94,7 +33,7 @@ class DatabaseManager:
             logger.error(f"❌ 数据库初始化失败: {e}")
             raise
 
-    def init_all_tables(self, conn):
+    def init_all_tables(self, cursor):
         logger.info("\n=== 初始化数据库表结构 ===")
 
         tables = {
@@ -430,225 +369,225 @@ class DatabaseManager:
         }
 
         for table_name, sql in tables.items():
-            conn.execute(text(sql))
+            cursor.execute(sql)
             logger.info(f"✅ 表 `{table_name}` 已创建/确认")
 
         # 在表创建后添加外键约束（避免类型不匹配问题）
-        self._add_cart_foreign_keys(conn)
-        self._add_refunds_foreign_keys(conn)
-        self._add_orders_foreign_keys(conn)
-        self._add_order_items_foreign_keys(conn)
-        self._add_user_addresses_foreign_keys(conn)
-        self._add_merchant_balance_foreign_keys(conn)
+        self._add_cart_foreign_keys(cursor)
+        self._add_refunds_foreign_keys(cursor)
+        self._add_orders_foreign_keys(cursor)
+        self._add_order_items_foreign_keys(cursor)
+        self._add_user_addresses_foreign_keys(cursor)
+        self._add_merchant_balance_foreign_keys(cursor)
 
-        self._init_finance_accounts(conn)
+        self._init_finance_accounts(cursor)
         logger.info("✅ 所有表结构初始化完成")
 
-    def _add_cart_foreign_keys(self, conn):
+    def _add_cart_foreign_keys(self, cursor):
         """为 cart 表添加外键约束（如果不存在）"""
         try:
             # 检查 cart 表和被引用表是否存在
-            result = conn.execute(text("""
+            cursor.execute("""
                 SELECT TABLE_NAME 
                 FROM information_schema.TABLES 
                 WHERE TABLE_SCHEMA = DATABASE() 
                 AND TABLE_NAME IN ('cart', 'users', 'products')
-            """))
-            existing_tables = {row[0] for row in result.fetchall()}
+            """)
+            existing_tables = {row['TABLE_NAME'] for row in cursor.fetchall()}
             
             if 'cart' not in existing_tables or 'users' not in existing_tables or 'products' not in existing_tables:
                 logger.debug("⚠️ cart 表或引用表不存在，跳过外键添加")
                 return
             
             # 检查外键是否已存在
-            result = conn.execute(text("""
+            cursor.execute("""
                 SELECT CONSTRAINT_NAME 
                 FROM information_schema.TABLE_CONSTRAINTS 
                 WHERE TABLE_SCHEMA = DATABASE() 
                 AND TABLE_NAME = 'cart' 
                 AND CONSTRAINT_TYPE = 'FOREIGN KEY'
-            """))
-            existing_fks = [row[0] for row in result.fetchall()]
+            """)
+            existing_fks = [row['CONSTRAINT_NAME'] for row in cursor.fetchall()]
             
             if 'cart_ibfk_1' not in existing_fks:
-                conn.execute(text("""
+                cursor.execute("""
                     ALTER TABLE cart 
                     ADD CONSTRAINT cart_ibfk_1 
                     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-                """))
+                """)
                 logger.info("✅ cart 表外键约束 cart_ibfk_1 已添加")
             
             if 'cart_ibfk_2' not in existing_fks:
-                conn.execute(text("""
+                cursor.execute("""
                     ALTER TABLE cart 
                     ADD CONSTRAINT cart_ibfk_2 
                     FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
-                """))
+                """)
                 logger.info("✅ cart 表外键约束 cart_ibfk_2 已添加")
         except Exception as e:
             # 如果添加外键失败（可能是类型不匹配或表不存在），静默忽略
             logger.debug(f"⚠️ cart 表外键约束添加失败（已忽略）: {e}")
 
-    def _add_refunds_foreign_keys(self, conn):
+    def _add_refunds_foreign_keys(self, cursor):
         """为 refunds 表添加外键约束（如果不存在）"""
         try:
             # 检查 refunds 表和 orders 表是否存在，以及 orders 表是否有 order_number 列
-            result = conn.execute(text("""
+            cursor.execute("""
                 SELECT TABLE_NAME 
                 FROM information_schema.TABLES 
                 WHERE TABLE_SCHEMA = DATABASE() 
                 AND TABLE_NAME IN ('refunds', 'orders')
-            """))
-            existing_tables = {row[0] for row in result.fetchall()}
+            """)
+            existing_tables = {row['TABLE_NAME'] for row in cursor.fetchall()}
             
             if 'refunds' not in existing_tables or 'orders' not in existing_tables:
                 logger.debug("⚠️ refunds 表或 orders 表不存在，跳过外键添加")
                 return
             
             # 检查 orders 表是否有 order_number 列
-            result = conn.execute(text("""
+            cursor.execute("""
                 SELECT COLUMN_NAME 
                 FROM information_schema.COLUMNS 
                 WHERE TABLE_SCHEMA = DATABASE() 
                 AND TABLE_NAME = 'orders' 
                 AND COLUMN_NAME = 'order_number'
-            """))
-            if result.fetchone() is None:
+            """)
+            if cursor.fetchone() is None:
                 logger.debug("⚠️ orders 表缺少 order_number 列，跳过外键添加")
                 return
             
             # 检查外键是否已存在
-            result = conn.execute(text("""
+            cursor.execute("""
                 SELECT CONSTRAINT_NAME 
                 FROM information_schema.TABLE_CONSTRAINTS 
                 WHERE TABLE_SCHEMA = DATABASE() 
                 AND TABLE_NAME = 'refunds' 
                 AND CONSTRAINT_TYPE = 'FOREIGN KEY'
-            """))
-            existing_fks = [row[0] for row in result.fetchall()]
+            """)
+            existing_fks = [row['CONSTRAINT_NAME'] for row in cursor.fetchall()]
             
             if 'refunds_ibfk_1' not in existing_fks:
-                conn.execute(text("""
+                cursor.execute("""
                     ALTER TABLE refunds 
                     ADD CONSTRAINT refunds_ibfk_1 
                     FOREIGN KEY (order_number) REFERENCES orders(order_number) ON DELETE CASCADE
-                """))
+                """)
                 logger.info("✅ refunds 表外键约束 refunds_ibfk_1 已添加")
         except Exception as e:
             # 如果添加外键失败（可能是类型不匹配或表不存在），静默忽略
             logger.debug(f"⚠️ refunds 表外键约束添加失败（已忽略）: {e}")
 
-    def _add_orders_foreign_keys(self, conn):
+    def _add_orders_foreign_keys(self, cursor):
         """为 orders 表添加外键约束（如果不存在）"""
         try:
-            result = conn.execute(text("""
+            cursor.execute("""
                 SELECT CONSTRAINT_NAME 
                 FROM information_schema.TABLE_CONSTRAINTS 
                 WHERE TABLE_SCHEMA = DATABASE() 
                 AND TABLE_NAME = 'orders' 
                 AND CONSTRAINT_TYPE = 'FOREIGN KEY'
-            """))
-            existing_fks = [row[0] for row in result.fetchall()]
+            """)
+            existing_fks = [row['CONSTRAINT_NAME'] for row in cursor.fetchall()]
             
             if 'orders_ibfk_1' not in existing_fks:
-                conn.execute(text("""
+                cursor.execute("""
                     ALTER TABLE orders 
                     ADD CONSTRAINT orders_ibfk_1 
                     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-                """))
+                """)
                 logger.info("✅ orders 表外键约束 orders_ibfk_1 已添加")
         except Exception as e:
             logger.warning(f"⚠️ orders 表外键约束添加失败（可忽略）: {e}")
 
-    def _add_order_items_foreign_keys(self, conn):
+    def _add_order_items_foreign_keys(self, cursor):
         """为 order_items 表添加外键约束（如果不存在）"""
         try:
-            result = conn.execute(text("""
+            cursor.execute("""
                 SELECT CONSTRAINT_NAME 
                 FROM information_schema.TABLE_CONSTRAINTS 
                 WHERE TABLE_SCHEMA = DATABASE() 
                 AND TABLE_NAME = 'order_items' 
                 AND CONSTRAINT_TYPE = 'FOREIGN KEY'
-            """))
-            existing_fks = [row[0] for row in result.fetchall()]
+            """)
+            existing_fks = [row['CONSTRAINT_NAME'] for row in cursor.fetchall()]
             
             if 'order_items_ibfk_1' not in existing_fks:
-                conn.execute(text("""
+                cursor.execute("""
                     ALTER TABLE order_items 
                     ADD CONSTRAINT order_items_ibfk_1 
                     FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
-                """))
+                """)
                 logger.info("✅ order_items 表外键约束 order_items_ibfk_1 已添加")
             
             if 'order_items_ibfk_2' not in existing_fks:
-                conn.execute(text("""
+                cursor.execute("""
                     ALTER TABLE order_items 
                     ADD CONSTRAINT order_items_ibfk_2 
                     FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
-                """))
+                """)
                 logger.info("✅ order_items 表外键约束 order_items_ibfk_2 已添加")
         except Exception as e:
             logger.warning(f"⚠️ order_items 表外键约束添加失败（可忽略）: {e}")
 
-    def _add_user_addresses_foreign_keys(self, conn):
+    def _add_user_addresses_foreign_keys(self, cursor):
         """为 user_addresses 表添加外键约束（如果不存在）"""
         try:
             # 检查 user_addresses 表和 users 表是否存在
-            result = conn.execute(text("""
+            cursor.execute("""
                 SELECT TABLE_NAME 
                 FROM information_schema.TABLES 
                 WHERE TABLE_SCHEMA = DATABASE() 
                 AND TABLE_NAME IN ('user_addresses', 'users')
-            """))
-            existing_tables = {row[0] for row in result.fetchall()}
+            """)
+            existing_tables = {row['TABLE_NAME'] for row in cursor.fetchall()}
             
             if 'user_addresses' not in existing_tables or 'users' not in existing_tables:
                 logger.debug("⚠️ user_addresses 表或 users 表不存在，跳过外键添加")
                 return
             
-            result = conn.execute(text("""
+            cursor.execute("""
                 SELECT CONSTRAINT_NAME 
                 FROM information_schema.TABLE_CONSTRAINTS 
                 WHERE TABLE_SCHEMA = DATABASE() 
                 AND TABLE_NAME = 'user_addresses' 
                 AND CONSTRAINT_TYPE = 'FOREIGN KEY'
-            """))
-            existing_fks = [row[0] for row in result.fetchall()]
+            """)
+            existing_fks = [row['CONSTRAINT_NAME'] for row in cursor.fetchall()]
             
             if 'user_addresses_ibfk_1' not in existing_fks:
-                conn.execute(text("""
+                cursor.execute("""
                     ALTER TABLE user_addresses 
                     ADD CONSTRAINT user_addresses_ibfk_1 
                     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-                """))
+                """)
                 logger.info("✅ user_addresses 表外键约束 user_addresses_ibfk_1 已添加")
         except Exception as e:
             # 如果添加外键失败（可能是类型不匹配或表不存在），静默忽略
             logger.debug(f"⚠️ user_addresses 表外键约束添加失败（已忽略）: {e}")
 
-    def _add_merchant_balance_foreign_keys(self, conn):
+    def _add_merchant_balance_foreign_keys(self, cursor):
         """为 merchant_balance 表添加外键约束（如果不存在）"""
         try:
-            result = conn.execute(text("""
+            cursor.execute("""
                 SELECT CONSTRAINT_NAME 
                 FROM information_schema.TABLE_CONSTRAINTS 
                 WHERE TABLE_SCHEMA = DATABASE() 
                 AND TABLE_NAME = 'merchant_balance' 
                 AND CONSTRAINT_TYPE = 'FOREIGN KEY'
-            """))
-            existing_fks = [row[0] for row in result.fetchall()]
+            """)
+            existing_fks = [row['CONSTRAINT_NAME'] for row in cursor.fetchall()]
             
             if 'merchant_balance_ibfk_1' not in existing_fks:
-                conn.execute(text("""
+                cursor.execute("""
                     ALTER TABLE merchant_balance 
                     ADD CONSTRAINT merchant_balance_ibfk_1 
                     FOREIGN KEY (merchant_id) REFERENCES merchants(id)
-                """))
+                """)
                 logger.info("✅ merchant_balance 表外键约束 merchant_balance_ibfk_1 已添加")
         except Exception as e:
             logger.warning(f"⚠️ merchant_balance 表外键约束添加失败（可忽略）: {e}")
 
-    def _init_finance_accounts(self, conn):
+    def _init_finance_accounts(self, cursor):
         accounts = [
             ('周补贴池', 'subsidy_pool'),
             ('公益基金', 'public_welfare'),
@@ -663,63 +602,57 @@ class DatabaseManager:
             ('平台收入池（会员商品）', 'platform_revenue_pool'),
         ]
 
-        conn.execute(text("DELETE FROM finance_accounts"))
+        cursor.execute("DELETE FROM finance_accounts")
         for name, acc_type in accounts:
-            conn.execute(
-                text("INSERT INTO finance_accounts (account_name, account_type, balance) VALUES (:name, :type, 0)"),
-                {"name": name, "type": acc_type}
+            cursor.execute(
+                "INSERT INTO finance_accounts (account_name, account_type, balance) VALUES (%s, %s, 0)",
+                (name, acc_type)
             )
         logger.info(f"✅ 初始化 {len(accounts)} 个资金池账户")
 
-    def create_test_data(self, conn) -> int:
+    def create_test_data(self, cursor, conn) -> int:
         logger.info("\n--- 创建测试数据 ---")
 
         pwd_hash = '$2b$12$9LjsHS5r4u1M9K4nG5KZ7e6zZxZn7qZ'
 
         mobile = '13800138004'
         # 幂等处理：如果手机号已存在则复用该用户，否则插入新用户
-        existing = conn.execute(
-            text("SELECT id FROM users WHERE mobile = :mobile"),
-            {"mobile": mobile}
-        ).fetchone()
-        if existing and getattr(existing, 'id', None):
-            merchant_id = existing.id
+        cursor.execute("SELECT id FROM users WHERE mobile = %s", (mobile,))
+        existing = cursor.fetchone()
+        if existing:
+            merchant_id = existing['id']
             logger.info(f"ℹ️ 测试商家手机号已存在，复用商家ID: {merchant_id}")
         else:
-            result = conn.execute(
-                text("INSERT INTO users (mobile, password_hash, name, status) VALUES (:mobile, :pwd, :name, 1)"),
-                {"mobile": mobile, "pwd": pwd_hash, "name": '优质商家'}
+            cursor.execute(
+                "INSERT INTO users (mobile, password_hash, name, status) VALUES (%s, %s, %s, 1)",
+                (mobile, pwd_hash, '优质商家')
             )
-            merchant_id = result.lastrowid
+            merchant_id = cursor.lastrowid
 
         # 创建会员商品（若 SKU 已存在则跳过）
         sku_member = 'SKU-MEMBER-001'
-        existing_prod = conn.execute(
-            text("SELECT id FROM products WHERE sku = :sku"),
-            {"sku": sku_member}
-        ).fetchone()
-        if existing_prod and getattr(existing_prod, 'id', None):
-            logger.info(f"ℹ️ 会员商品 SKU 已存在，跳过插入，product_id={existing_prod.id}")
+        cursor.execute("SELECT id FROM products WHERE sku = %s", (sku_member,))
+        existing_prod = cursor.fetchone()
+        if existing_prod:
+            logger.info(f"ℹ️ 会员商品 SKU 已存在，跳过插入，product_id={existing_prod['id']}")
         else:
-            conn.execute(
-                text("""INSERT INTO products (sku, name, price, stock, is_member_product, merchant_id, status)
-                        VALUES (:sku, :name, :price, 100, 1, :merchant_id, 1)"""),
-                {"sku": sku_member, "name": '会员星卡', "price": float(MEMBER_PRODUCT_PRICE), "merchant_id": PLATFORM_MERCHANT_ID}
+            cursor.execute(
+                """INSERT INTO products (sku, name, price, stock, is_member_product, merchant_id, status)
+                   VALUES (%s, %s, %s, 100, 1, %s, 1)""",
+                (sku_member, '会员星卡', float(MEMBER_PRODUCT_PRICE), PLATFORM_MERCHANT_ID)
             )
 
         # 创建普通商品（若 SKU 已存在则跳过）
         sku_normal = 'SKU-NORMAL-001'
-        existing_normal = conn.execute(
-            text("SELECT id FROM products WHERE sku = :sku"),
-            {"sku": sku_normal}
-        ).fetchone()
-        if existing_normal and getattr(existing_normal, 'id', None):
-            logger.info(f"ℹ️ 普通商品 SKU 已存在，跳过插入，product_id={existing_normal.id}")
+        cursor.execute("SELECT id FROM products WHERE sku = %s", (sku_normal,))
+        existing_normal = cursor.fetchone()
+        if existing_normal:
+            logger.info(f"ℹ️ 普通商品 SKU 已存在，跳过插入，product_id={existing_normal['id']}")
         else:
-            conn.execute(
-                text("""INSERT INTO products (sku, name, price, stock, is_member_product, merchant_id, status)
-                        VALUES (:sku, :name, 500.00, 200, 0, :merchant_id, 1)"""),
-                {"sku": sku_normal, "name": '普通商品', "merchant_id": merchant_id}
+            cursor.execute(
+                """INSERT INTO products (sku, name, price, stock, is_member_product, merchant_id, status)
+                   VALUES (%s, %s, 500.00, 200, 0, %s, 1)""",
+                (sku_normal, '普通商品', merchant_id)
             )
 
         conn.commit()
@@ -758,17 +691,21 @@ def create_database():
 def initialize_database():
     """初始化数据库表结构（如果尚未创建）。
 
-    先确保数据库存在（调用 `create_database()`），再通过 SQLAlchemy 创建表结构。
+    先确保数据库存在（调用 `create_database()`），再通过 pymysql 创建表结构。
     """
     print("正在检查数据库表结构...")
     # 确保数据库已创建
     create_database()
 
-    engine = get_engine()
-    with engine.connect() as conn:
-        with conn.begin():
+    cfg = get_db_config()
+    conn = pymysql.connect(**cfg, cursorclass=pymysql.cursors.DictCursor)
+    try:
+        with conn.cursor() as cursor:
             db_manager = DatabaseManager()
-            db_manager.init_all_tables(conn)
+            db_manager.init_all_tables(cursor)
+        conn.commit()
+    finally:
+        conn.close()
 
     print("数据库表结构初始化完成。")
 
@@ -776,11 +713,14 @@ def initialize_database():
 def create_test_data():
     """创建测试数据（可选）"""
     print("正在创建测试数据...")
-    engine = get_engine()
-    with engine.connect() as conn:
-        with conn.begin():
+    cfg = get_db_config()
+    conn = pymysql.connect(**cfg, cursorclass=pymysql.cursors.DictCursor)
+    try:
+        with conn.cursor() as cursor:
             db_manager = DatabaseManager()
-            db_manager.create_test_data(conn)
+            db_manager.create_test_data(cursor, conn)
+    finally:
+        conn.close()
     print("测试数据创建完成。")
 
 
@@ -815,7 +755,7 @@ def auto_receive_task(db_cfg: dict = None):
     def run():
         while True:
             try:
-                from config import get_conn
+                from core.database import get_conn
                 with get_conn() as conn:
                     with conn.cursor() as cur:
                         now = datetime.now()
@@ -842,18 +782,17 @@ def auto_receive_task(db_cfg: dict = None):
     logger.info("✅ 自动收货守护进程已启动")
 
 
-# ==================== Product 模块相关功能（来自 product/database_setup.py） ====================
+# ==================== Product 模块相关功能（已移除 SQLAlchemy ORM） ====================
 
 def _fix_pinyin():
-    """补全商品拼音（来自 product/init_db.py 的 fix_pinyin_once 函数）
+    """补全商品拼音
     
     该函数会检查所有商品，如果 pinyin 字段为空，则自动生成拼音。
     可重复执行，幂等操作。
-    等价于 product/init_db.py 中的 fix_pinyin_once() 函数。
     """
     try:
         from pypinyin import lazy_pinyin, Style
-        from config import get_conn
+        from core.database import get_conn
         
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -874,39 +813,3 @@ def _fix_pinyin():
         logger.warning("⚠️ pypinyin 未安装，跳过拼音补全功能")
     except Exception as e:
         logger.error(f"❌ 拼音补全失败: {e}")
-
-
-def create_tables_with_orm():
-    """根据 ORM 模型建表（来自 product/init_db.py）
-    
-    该函数会创建所有 ORM 模型定义的表。
-    等价于 product/init_db.py 中的 create_tables() 函数。
-    """
-    try:
-        # 导入 product 模块的模型，确保所有模型都被注册到 Base.metadata
-        from product.models import Product, ProductSku, ProductAttribute, Banner
-        engine = get_engine()
-        Base.metadata.create_all(engine)
-        logger.info("✅ ORM 模型表创建完成")
-    except Exception as e:
-        logger.warning(f"⚠️ ORM 表创建失败（可忽略）: {e}")
-
-
-def initialize_database_with_orm():
-    """初始化数据库（包含 ORM 表创建和拼音补全，兼容 product 模块）
-    
-    该函数会：
-    1. 确保数据库存在
-    2. 创建所有表（包括 ORM 模型定义的表）
-    3. 补全商品拼音
-    
-    等价于 product/init_db.py 中的 main() 函数（已注释掉的功能）。
-    """
-    # 先执行标准的数据库初始化
-    initialize_database()
-    
-    # 创建 ORM 模型定义的表
-    create_tables_with_orm()
-    
-    # 补全拼音
-    _fix_pinyin()

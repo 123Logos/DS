@@ -5,7 +5,7 @@
 import pymysql
 from contextlib import contextmanager
 from typing import Optional
-from config import get_db_config
+from core.config import get_db_config
 
 # 全局连接配置缓存
 _db_config = None
