@@ -1,7 +1,6 @@
 # services/wechat_service.py - 微信登录服务
 import uuid
 import pymysql
-import requests
 import jwt
 import datetime
 from typing import Optional, Dict, Any
@@ -75,6 +74,9 @@ class WechatService:
     @staticmethod
     def get_openid_by_code(code: str) -> tuple[str, str]:
         """通过code换取openid和session_key"""
+        # 延迟导入 requests，避免 Windows multiprocessing 导入问题
+        import requests
+        
         if not WECHAT_APP_ID or not WECHAT_APP_SECRET:
             raise HTTPException(status_code=500, detail="未配置微信小程序 AppId/Secret，请在 .env 中设置 WECHAT_APP_ID 与 WECHAT_APP_SECRET")
 

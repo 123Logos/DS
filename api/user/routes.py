@@ -406,7 +406,7 @@ def set_default_addr(addr_id: int, mobile: str):
             conn.commit()
     return {"msg": "ok"}
 
-@router.delete("/address/{addr_id}", summary="删除地址")
+@router.delete("/address/{addr_id}", summary="删除地址", operation_id="delete_user_address")
 def delete_addr(addr_id: int, mobile: str):
     with get_conn() as conn:
         with conn.cursor() as cur:

@@ -2,13 +2,13 @@
 统一的应用入口 - 集中创建 FastAPI 实例和配置
 """
 import sys
-import pathlib
+from pathlib import Path
 import uvicorn
 import pymysql
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from core.middleware import setup_cors, setup_static_files
-from core.config import get_db_config
+from core.config import get_db_config, PIC_PATH
 from core.logging import setup_logging
 from database_setup import initialize_database
 
@@ -16,7 +16,7 @@ from database_setup import initialize_database
 setup_logging(log_to_file=True, log_to_console=True)
 
 # 添加项目根目录到路径
-sys.path.insert(0, str(pathlib.Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent))
 
 # 导入路由注册函数（使用新的目录结构）
 from api.finance.routes import register_finance_routes
@@ -118,11 +118,8 @@ def custom_openapi():
 
 app.openapi = custom_openapi
 
-# 挂载静态文件目录（/pic -> pic_data）
-pic_path = pathlib.Path(__file__).parent / "pic_data"
-app.mount("/pic", StaticFiles(directory=str(pic_path)), name="pic")
-
-# 添加 CORS 中间件和静态文件（统一配置）
+app.mount("/pic", StaticFiles(directory=str(PIC_PATH)), name="pic")
+# 添加 CORS 中间件和静态文件（统一配置）pic_path
 setup_cors(app)
 setup_static_files(app)
 
