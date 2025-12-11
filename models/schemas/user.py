@@ -5,10 +5,10 @@ from typing import Optional
 from core.config import UserStatus
 
 
+
 class SetStatusReq(BaseModel):
-    """设置用户状态请求"""
     mobile: str
-    new_status: UserStatus = Field(..., description="0-正常 1-冻结 2-注销")
+    new_status: UserStatus          # 现在只能输入 0、1、2，且自动带校验/文档
     reason: str = "后台调整"
 
 
@@ -33,23 +33,29 @@ class SetLevelReq(BaseModel):
     reason: str = "后台手动调整"
 
 
+
 class AddressReq(BaseModel):
-    """地址请求"""
-    mobile: str
-    name: str
-    phone: str
+    mobile: str                # 用来查 user_id
+    label: str
+    name: str                  # 即 consignee_name
+    phone: str                 # 即 consignee_phone
     province: str
     city: str
     district: str
     detail: str
+    lng: Optional[float] = None
+    lat: Optional[float] = None
     is_default: bool = False
     addr_type: str = "shipping"
+
+    class Config:
+        allow_population_by_field_name = True   # 同时支持 name / consignee_name
 
 
 class PointsReq(BaseModel):
     """积分请求"""
     mobile: str
-    points_type: str = Field(pattern="^(member|merchant)$")
+    type: str = Field(pattern="^(member|merchant)$")
     amount: float = Field(..., ge=0, description="积分数量，支持小数点后4位精度")
     reason: str = "系统赠送"
 

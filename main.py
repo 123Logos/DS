@@ -2,13 +2,13 @@
 统一的应用入口 - 集中创建 FastAPI 实例和配置
 """
 import sys
-import pathlib
+from pathlib import Path
 import uvicorn
 import pymysql
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from core.middleware import setup_cors, setup_static_files
-from core.config import get_db_config
+from core.config import get_db_config, PIC_PATH
 from core.logging import setup_logging
 from database_setup import initialize_database
 
@@ -16,12 +16,11 @@ from database_setup import initialize_database
 setup_logging(log_to_file=True, log_to_console=True)
 
 # 添加项目根目录到路径
-sys.path.insert(0, str(pathlib.Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent))
 
 # 导入路由注册函数（使用新的目录结构）
 from api.finance.routes import register_finance_routes
 from api.user.routes import register_routes as register_user_routes
-from api.order import register_routes as register_order_routes
 from api.product.routes import register_routes as register_product_routes
 
 
@@ -69,7 +68,7 @@ tags_metadata = [
     },
     {
         "name": "订单系统",
-        "description": "订单系统相关接口，包括购物车、订单管理、退款、地址管理、商家后台等功能。",
+        "description": "订单系统相关接口，包括购物车、订单管理、退款、商家后台等功能。",
     },
     {
         "name": "商品管理",
@@ -80,8 +79,20 @@ tags_metadata = [
 # 更新 OpenAPI Schema 的 tags 元数据
 app.openapi_tags = tags_metadata
 
+app.mount("/pic", StaticFiles(directory=str(PIC_PATH)), name="pic")
+# 添加 CORS 中间件和静态文件（统一配置）pic_path
+setup_cors(app)
+setup_static_files(app)
+
+# 注册所有模块的路由（必须在设置 custom_openapi 之前注册）
+register_finance_routes(app)
+register_user_routes(app)
+register_order_routes(app)
+register_product_routes(app)
+
 
 # 自定义 OpenAPI Schema 生成函数，确保只显示定义的4个标签
+# 注意：必须在路由注册之后设置，否则 schema 中不会包含路由
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
@@ -129,7 +140,6 @@ setup_static_files(app)
 # 注册所有模块的路由
 register_finance_routes(app)
 register_user_routes(app)
-register_order_routes(app)
 register_product_routes(app)
 
 

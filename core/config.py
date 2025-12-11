@@ -4,7 +4,7 @@ from enum import StrEnum, IntEnum
 from typing import Final
 import os
 from dotenv import load_dotenv
-
+from pathlib import Path
 # 加载环境变量
 load_dotenv()
 
@@ -66,8 +66,9 @@ MAX_TEAM_LAYER: Final[int] = 6
 
 # ==================== 用户状态 ====================
 class UserStatus(IntEnum):
-    NORMAL = 1
-    HONOR_DIRECTOR = 9
+    NORMAL  = 0   # 恢复正常
+    FROZEN  = 1   # 冻结
+    DELETED = 2   # 注销
 
 # ==================== 奖励类型 ====================
 class RewardType(StrEnum):
@@ -116,13 +117,17 @@ class OrderStatus(StrEnum):
 VALID_PAY_WAYS: Final[set[str]] = {"alipay", "wechat", "card", "wx_pub", "wx_app"}
 
 # ==================== 日志配置 ====================
-LOG_DIR: Final[str] = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'logs')
-LOG_FILE: Final[str] = os.path.join(LOG_DIR, 'api.log')
-os.makedirs(LOG_DIR, exist_ok=True)
+LOG_DIR: Final[Path] = Path(__file__).resolve().parent.parent / 'logs'
+LOG_FILE: Final[Path] = LOG_DIR / 'api.log'
+LOG_DIR.mkdir(exist_ok=True)
 
 # ==================== 微信配置 ====================
 WECHAT_APP_ID: Final[str] = os.getenv('WECHAT_APP_ID', '')
 WECHAT_APP_SECRET: Final[str] = os.getenv('WECHAT_APP_SECRET', '')
+
+# ==================== 商品图片配置 ====================
+# 挂载静态文件目录（/pic -> pic_data）
+PIC_PATH: Final[Path] = Path(__file__).resolve().parent.parent / "pic_data"
 
 # 向后兼容：Wechat_ID 字典
 Wechat_ID: Final[dict] = {
@@ -131,8 +136,6 @@ Wechat_ID: Final[dict] = {
 }
 
 # ==================== 商品管理配置 ====================
-from pathlib import Path
-
 # 上传目录
 BASE_PIC_DIR: Final[Path] = Path(__file__).resolve().parent.parent / "pic_data"
 BASE_PIC_DIR.mkdir(exist_ok=True)

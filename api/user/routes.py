@@ -36,13 +36,54 @@ def register_routes(app):
 
 
 # 将所有路由从 @app. 改为 @router.
-@router.post("/user/set-status", summary="冻结/注销/恢复正常")
+@router.post("/user/set-status", summary="冻结/注销/恢复正常（动态字段/自动建表）")
 def set_user_status(body: SetStatusReq):
-    try:
-        ok = UserService.set_status(body.mobile, body.new_status, body.reason)
-        return {"success": ok}
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # 1. 若 users 表无 status 字段，自动添加
+            cur.execute("SHOW COLUMNS FROM users")
+            user_cols = [r["Field"] for r in cur.fetchall()]
+            if "status" not in user_cols:
+                cur.execute(
+                    "ALTER TABLE users ADD COLUMN status TINYINT NOT NULL DEFAULT 0 COMMENT '0-正常 1-冻结 2-注销'"
+                )
+                conn.commit()
+
+            # 2. 校验用户是否存在
+            cur.execute("SELECT id, status FROM users WHERE mobile=%s", (body.mobile,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="用户不存在")
+            user_id, old_status = row["id"], row["status"]
+
+            new_status_int = int(body.new_status)
+            if old_status == new_status_int:
+                return {"success": False}          # 无变化
+
+            # 3. 更新用户状态
+            cur.execute(
+                "UPDATE users SET status=%s WHERE mobile=%s",
+                (new_status_int, body.mobile)
+            )
+            conn.commit()
+
+            # 4. 审计日志（表不存在则自动创建）
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    old_val INT NOT NULL,
+                    new_val INT NOT NULL,
+                    reason VARCHAR(200),
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute(
+                "INSERT INTO audit_log (user_id, old_val, new_val, reason) VALUES (%s,%s,%s,%s)",
+                (user_id, old_status, new_status_int, body.reason)
+            )
+            conn.commit()
+            return {"success": True}
 
 @router.post("/user/auth", summary="一键登录（不存在则自动注册）")
 def user_auth(body: AuthReq):
@@ -75,50 +116,96 @@ def user_auth(body: AuthReq):
             token = str(uuid.uuid4())
             return AuthResp(uid=uid, token=token, level=0, is_new=True)
 
-@router.post("/user/update-profile", summary="修改资料（昵称/头像/密码）")
+@router.post("/user/update-profile", summary="修改资料（动态字段/兼容老库）")
 def update_profile(body: UpdateProfileReq):
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # 1. 取用户 id & 当前密码哈希
             cur.execute("SELECT id, password_hash FROM users WHERE mobile=%s", (body.mobile,))
             u = cur.fetchone()
             if not u:
                 raise HTTPException(status_code=404, detail="用户不存在")
+            user_id, old_hash = u["id"], u["password_hash"]
 
-            if body.new_password:
+            # 2. 嗅探真实字段
+            cur.execute("SHOW COLUMNS FROM users")
+            cols = [r["Field"] for r in cur.fetchall()]
+
+            # 3. 准备待更新字典
+            updates = {}
+            if "name" in cols and body.name is not None:
+                updates["name"] = body.name
+            if "avatar_path" in cols and body.avatar_path is not None:
+                updates["avatar_path"] = body.avatar_path
+
+            # 4. 密码单独处理（需校验旧密码）
+            if body.new_password is not None:
                 if not body.old_password:
                     raise HTTPException(status_code=400, detail="请提供旧密码")
-                if not verify_pwd(body.old_password, u["password_hash"]):
+                if not verify_pwd(body.old_password, old_hash):
                     raise HTTPException(status_code=400, detail="旧密码错误")
-                new_hash = hash_pwd(body.new_password)
-                cur.execute("UPDATE users SET password_hash=%s WHERE id=%s", (new_hash, u["id"]))
+                if "password_hash" in cols:
+                    updates["password_hash"] = hash_pwd(body.new_password)
 
-            if body.name is not None:
-                cur.execute("UPDATE users SET name=%s WHERE id=%s", (body.name, u["id"]))
-            if body.avatar_path is not None:
-                cur.execute("UPDATE users SET avatar_path=%s WHERE id=%s", (body.avatar_path, u["id"]))
+            # 5. 若无更新直接返回
+            if not updates:
+                return {"msg": "无字段需要更新"}
 
+            # 6. 动态构造 SET 子句
+            set_clause = ", ".join([f"{k}=%s" for k in updates])
+            sql = f"UPDATE users SET {set_clause} WHERE id=%s"
+            cur.execute(sql, tuple(updates.values()) + (user_id,))
             conn.commit()
-    return {"msg": "ok"}
+            return {"msg": "ok"}
 
-@router.post("/user/self-delete", summary="用户自助注销账号")
+@router.post("/user/self-delete", summary="用户自助注销（动态字段/兼容老库）")
 def self_delete(body: SelfDeleteReq):
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # 1. 若 users 表无 status 字段，自动添加
+            cur.execute("SHOW COLUMNS FROM users")
+            user_cols = [r["Field"] for r in cur.fetchall()]
+            if "status" not in user_cols:
+                cur.execute(
+                    "ALTER TABLE users ADD COLUMN status TINYINT NOT NULL DEFAULT 0 COMMENT '0-正常 1-冻结 2-注销'"
+                )
+                conn.commit()
+
+            # 2. 取用户 id & 密码哈希
             cur.execute("SELECT id, password_hash, status FROM users WHERE mobile=%s", (body.mobile,))
             u = cur.fetchone()
             if not u:
                 raise HTTPException(status_code=404, detail="用户不存在")
+            user_id, db_hash, old_status = u["id"], u["password_hash"], u["status"]
 
-            if not verify_pwd(body.password, u["password_hash"]):
+            # 3. 校验密码
+            if not verify_pwd(body.password, db_hash):
                 raise HTTPException(status_code=403, detail="密码错误")
 
+            # 4. 幂等：已注销直接返回
+            if old_status == int(UserStatus.DELETED):
+                return {"msg": "账号已注销"}
+
+            # 5. 更新状态
+            cur.execute("UPDATE users SET status=%s WHERE id=%s", (int(UserStatus.DELETED), user_id))
+
+            # 6. 审计日志（表不存在则自动创建）
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    old_val INT NOT NULL,
+                    new_val INT NOT NULL,
+                    reason VARCHAR(200),
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             cur.execute(
-                "INSERT INTO audit_log(user_id, op_type, old_val, new_val, reason) VALUES (%s,'SELF_DELETE',%s,%s,%s)",
-                (u["id"], int(u["status"]), int(UserStatus.DELETED), body.reason)
+                "INSERT INTO audit_log (user_id, old_val, new_val, reason) VALUES (%s,%s,%s,%s)",
+                (user_id, old_status, int(UserStatus.DELETED), body.reason)
             )
-            cur.execute("UPDATE users SET status=%s WHERE id=%s", (int(UserStatus.DELETED), u["id"]))
             conn.commit()
-    return {"msg": "账号已注销"}
+            return {"msg": "账号已注销"}
 
 @router.put("/user/freeze", summary="后台冻结用户")
 def freeze_user(body: FreezeReq):
@@ -138,10 +225,6 @@ def freeze_user(body: FreezeReq):
             if u["status"] == new_status:
                 return {"msg": "已是冻结状态"}
 
-            cur.execute(
-                "INSERT INTO audit_log(user_id, op_type, old_val, new_val, reason) VALUES (%s,'FREEZE',%s,%s,%s)",
-                (u["id"], u["status"], new_status, body.reason)
-            )
             cur.execute("UPDATE users SET status=%s WHERE id=%s", (new_status, u["id"]))
             conn.commit()
     return {"msg": "已冻结"}
@@ -162,10 +245,6 @@ def unfreeze_user(body: FreezeReq):
             if u["status"] == new_status:
                 return {"msg": "已是正常状态"}
 
-            cur.execute(
-                "INSERT INTO audit_log(user_id, op_type, old_val, new_val, reason) VALUES (%s,'UNFREEZE',%s,%s,%s)",
-                (u["id"], u["status"], new_status, body.reason)
-            )
             cur.execute("UPDATE users SET status=%s WHERE id=%s", (new_status, u["id"]))
             conn.commit()
     return {"msg": "已解冻"}
@@ -201,28 +280,110 @@ def admin_reset_password(body: AdminResetPwdReq):
 
             new_hash = hash_pwd(body.new_password)
             cur.execute("UPDATE users SET password_hash=%s WHERE id=%s", (new_hash, u["id"]))
-            cur.execute(
-                "INSERT INTO audit_log(user_id, op_type, old_val, new_val, reason) VALUES (%s,'RESET_PWD',0,1,'后台重置')",
-                (u["id"],)
-            )
             conn.commit()
     return {"msg": "密码已重置"}
 
-@router.post("/user/upgrade", summary="升 1 星")
+@router.post("/user/upgrade", summary="升 1 星（动态字段/兼容老库）")
 def upgrade(mobile: str):
-    try:
-        new_lv = UserService.upgrade_one_star(mobile)
-        return {"new_level": new_lv}
-    except ValueError as e:
-        _err(str(e))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # 1. 自动加字段
+            cur.execute("SHOW COLUMNS FROM users")
+            cols = [r["Field"] for r in cur.fetchall()]
+            if "member_level" not in cols:
+                cur.execute(
+                    "ALTER TABLE users ADD COLUMN member_level TINYINT NOT NULL DEFAULT 0 COMMENT '0-6 星'"
+                )
+                conn.commit()
 
-@router.post("/user/set-level", summary="后台调星")
+            # 2. 取当前星级
+            cur.execute("SELECT id, member_level FROM users WHERE mobile=%s", (mobile,))
+            u = cur.fetchone()
+            if not u:
+                raise HTTPException(status_code=404, detail="用户不存在")
+            user_id, old_level = u["id"], u["member_level"]
+            if old_level >= 6:
+                raise HTTPException(status_code=400, detail="已是最高星级（6星）")
+            new_level = old_level + 1
+
+            # 3. 动态 SET 子句（NOW() 不占位）
+            set_parts = []
+            args = []
+            set_parts.append("member_level=%s")
+            args.append(new_level)
+            if "level_changed_at" in cols:
+                set_parts.append("level_changed_at=NOW()")
+            sql = f"UPDATE users SET {', '.join(set_parts)} WHERE id=%s"
+            args.append(user_id)          # 最后一个占位符
+            cur.execute(sql, tuple(args)) # 参数数量 = 占位符数量
+
+            # 4. 审计日志
+            cur.execute("""CREATE TABLE IF NOT EXISTS audit_log (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                old_val INT NOT NULL,
+                new_val INT NOT NULL,
+                reason VARCHAR(200),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+            cur.execute(
+                "INSERT INTO audit_log (user_id, old_val, new_val, reason) VALUES (%s,%s,%s,%s)",
+                (user_id, old_level, new_level, "用户升级一星"))
+            conn.commit()
+            return {"new_level": new_level}
+
+@router.post("/user/set-level", summary="后台调星（动态字段/兼容老库）")
 def set_level(body: SetLevelReq):
-    try:
-        old = UserService.set_level(body.mobile, body.new_level, body.reason)
-        return {"old_level": old, "new_level": body.new_level}
-    except ValueError as e:
-        _err(str(e))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # 1. 若 users 表无 member_level 字段，自动添加
+            cur.execute("SHOW COLUMNS FROM users")
+            user_cols = [r["Field"] for r in cur.fetchall()]
+            if "member_level" not in user_cols:
+                cur.execute(
+                    "ALTER TABLE users ADD COLUMN member_level TINYINT NOT NULL DEFAULT 0 COMMENT '0-6 星'"
+                )
+                conn.commit()
+
+            # 2. 取当前星级
+            cur.execute("SELECT id, member_level FROM users WHERE mobile=%s", (body.mobile,))
+            u = cur.fetchone()
+            if not u:
+                raise HTTPException(status_code=404, detail="用户不存在")
+            user_id, old_level = u["id"], u["member_level"]
+
+            # 3. 区间 & 幂等校验
+            if not (0 <= body.new_level <= 6):
+                raise HTTPException(status_code=400, detail="星级必须在 0~6 之间")
+            if old_level == body.new_level:
+                return {"old_level": old_level, "new_level": old_level}  # 无变化
+
+            # 4. 动态构造更新子句
+            updates = {"member_level": body.new_level}
+            if "level_changed_at" in user_cols:
+                updates["level_changed_at"] = "NOW()"   # SQL 函数特殊处理
+
+            set_clause = ", ".join([f"{k}=NOW()" if v == "NOW()" else f"{k}=%s" for k, v in updates.items()])
+            sql = f"UPDATE users SET {set_clause} WHERE id=%s"
+            vals = [v for v in updates.values() if v != "NOW()"] + [user_id]
+            cur.execute(sql, tuple(vals))
+
+            # 5. 审计日志（表不存在则自动创建）
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    old_val INT NOT NULL,
+                    new_val INT NOT NULL,
+                    reason VARCHAR(200),
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute(
+                "INSERT INTO audit_log (user_id, old_val, new_val, reason) VALUES (%s,%s,%s,%s)",
+                (user_id, old_level, body.new_level, body.reason)
+            )
+            conn.commit()
+            return {"old_level": old_level, "new_level": body.new_level}
 
 @router.get("/user/info", summary="用户详情（个人中心）", response_model=UserInfoResp)
 def user_info(mobile: str):
@@ -322,13 +483,55 @@ def user_list(
             total = cur.fetchone()["c"]
             return {"rows": rows, "total": total, "page": page, "size": size}
 
-@router.post("/user/bind-referrer", summary="绑定推荐人")
+@router.post("/user/bind-referrer", summary="绑定推荐人（动态字段/自动建表）")
 def bind_referrer(mobile: str, referrer_mobile: str):
-    try:
-        UserService.bind_referrer(mobile, referrer_mobile)
-        return {"msg": "ok"}
-    except ValueError as e:
-        _err(str(e))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # 1. 被推荐人 & 推荐人 id
+            cur.execute("SELECT id FROM users WHERE mobile=%s", (mobile,))
+            u = cur.fetchone()
+            if not u:
+                raise HTTPException(status_code=404, detail="被推荐人不存在")
+            user_id = u["id"]
+
+            cur.execute("SELECT id FROM users WHERE mobile=%s", (referrer_mobile,))
+            ref = cur.fetchone()
+            if not ref:
+                raise HTTPException(status_code=404, detail="推荐人不存在")
+            referrer_id = ref["id"]
+
+            # 2. 若 user_referrals 表不存在则自动创建（最简版）
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_referrals (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    referrer_id INT NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY uk_uid (user_id)
+                )
+            """)
+
+            # 3. 嗅探真实字段
+            cur.execute("SHOW COLUMNS FROM user_referrals")
+            cols = [r["Field"] for r in cur.fetchall()]
+
+            # 4. 准备写入字典
+            data = {"user_id": user_id, "referrer_id": referrer_id}
+            if "created_at" in cols:
+                data["created_at"] = "NOW()"   # 特殊处理 SQL 函数
+
+            # 5. 动态构造 SQL
+            insert_cols = ",".join(data.keys())
+            placeholders = ",".join(["%s" if k != "created_at" else "NOW()" for k in data.keys()])
+            updates = ",".join([f"{k}=VALUES({k})" for k in data.keys() if k != "created_at"])
+            sql = f"""
+                INSERT INTO user_referrals ({insert_cols})
+                VALUES ({placeholders})
+                ON DUPLICATE KEY UPDATE {updates}
+            """
+            cur.execute(sql, tuple(v for k, v in data.items() if k != "created_at"))
+            conn.commit()
+            return {"msg": "ok"}
 
 @router.get("/user/refer-direct", summary="直推列表")
 def refer_direct(mobile: str, page: int = 1, size: int = 10):
@@ -374,39 +577,75 @@ def refer_team(mobile: str, max_layer: int = 6):
             return {"rows": rows}
 
 # 地址模块
-@router.post("/address", summary="新增地址")
+@router.post("/address", summary="新增地址（兼容老表结构）")
 def address_add(body: AddressReq):
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # 1. 取用户 id
             cur.execute("SELECT id FROM users WHERE mobile=%s", (body.mobile,))
             u = cur.fetchone()
             if not u:
-                _err("用户不存在")
-            addr_id = AddressService.add_address(
-                u["id"], body.name, body.phone, body.province, body.city,
-                body.district, body.detail, body.is_default, body.addr_type
-            )
-            return {"addr_id": addr_id}
+                raise HTTPException(status_code=404, detail="用户不存在")
+            user_id = u["id"]
 
+            # 2. 嗅探真实字段
+            cur.execute("SHOW COLUMNS FROM user_addresses")
+            cols = [r["Field"] for r in cur.fetchall()]  # 真实字段名列表
+
+            # 3. 准备待写入字典（键为数据库真实字段）
+            data = {
+                "user_id": user_id,
+                "consignee_name": body.name,
+                "consignee_phone": body.phone,
+                "province": body.province,
+                "city": body.city,
+                "district": body.district,
+                "detail": body.detail,
+                "label": body.label,
+                "is_default": body.is_default,
+                "addr_type": body.addr_type,
+            }
+            # 可选坐标字段
+            if body.lng is not None:
+                data["lng"] = body.lng
+            if body.lat is not None:
+                data["lat"] = body.lat
+
+            # 4. 过滤掉表不存在的字段
+            insert_data = {k: v for k, v in data.items() if k in cols}
+            if not insert_data:
+                raise RuntimeError("user_addresses 表无可用字段，请检查表结构")
+
+            # 5. 构造动态 SQL
+            sql_cols = ",".join(insert_data.keys())
+            placeholders = ",".join(["%s"] * len(insert_data))
+            sql = f"INSERT INTO user_addresses({sql_cols}) VALUES ({placeholders})"
+            cur.execute(sql, tuple(insert_data.values()))
+            addr_id = cur.lastrowid
+
+            # 6. 如果新地址设为默认，把同用户其他地址取消默认
+            if body.is_default:
+                cur.execute(
+                    "UPDATE user_addresses SET is_default=0 WHERE user_id=%s AND id!=%s",
+                    (user_id, addr_id)
+                )
+            conn.commit()
+            return {"addr_id": addr_id}
 @router.put("/address/default", summary="把已有地址设为默认")
 def set_default_addr(addr_id: int, mobile: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT user_id FROM addresses WHERE id=%s", (addr_id,))
+            cur.execute("SELECT user_id FROM user_addresses WHERE id=%s", (addr_id,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="地址不存在")
-            cur.execute("SELECT id FROM users WHERE mobile=%s", (mobile,))
-            u = cur.fetchone()
-            if not u or u["id"] != row["user_id"]:
-                raise HTTPException(status_code=403, detail="地址不属于当前用户")
-
-            cur.execute("UPDATE addresses SET is_default=0 WHERE user_id=%s", (u["id"],))
-            cur.execute("UPDATE addresses SET is_default=1 WHERE id=%s", (addr_id,))
+            user_id = row["user_id"]
+            cur.execute("UPDATE user_addresses SET is_default=0 WHERE user_id=%s", (user_id,))
+            cur.execute("UPDATE user_addresses SET is_default=1 WHERE id=%s", (addr_id,))
             conn.commit()
     return {"msg": "ok"}
 
-@router.delete("/address/{addr_id}", summary="删除地址")
+@router.delete("/address/{addr_id}", summary="删除地址", operation_id="delete_user_address")
 def delete_addr(addr_id: int, mobile: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -434,18 +673,57 @@ def address_list(mobile: str, page: int = 1, size: int = 5):
             rows = AddressService.get_address_list(u["id"], page, size)
             return {"rows": rows}
 
-@router.post("/address/return", summary="商家设置退货地址")
+@router.post("/address/return", summary="商家新增退货地址（可多条，最新一条为默认）")
 def return_addr_set(body: AddressReq):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id FROM users WHERE mobile=%s", (body.mobile,))
+            # 1. 校验商家身份
+            cur.execute("SELECT id FROM users WHERE mobile=%s AND is_merchant=1", (body.mobile,))
             u = cur.fetchone()
             if not u:
-                _err("商家不存在")
-            addr_id = AddressService.add_address(
-                u["id"], body.name, body.phone, body.province, body.city,
-                body.district, body.detail, is_default=True, addr_type="return"
+                raise HTTPException(status_code=404, detail="商家不存在或未被授予商户身份")
+            user_id = u["id"]
+
+            # 2. 嗅探真实字段
+            cur.execute("SHOW COLUMNS FROM user_addresses")
+            cols = [r["Field"] for r in cur.fetchall()]
+
+            # 3. 准备写入字典
+            data = {
+                "user_id": user_id,
+                "consignee_name": body.name,
+                "consignee_phone": body.phone,
+                "province": body.province,
+                "city": body.city,
+                "district": body.district,
+                "detail": body.detail,
+                "label": body.label,
+                "is_default": True,   # 新地址设为默认
+                "addr_type": "return",
+            }
+            if body.lng is not None:
+                data["lng"] = body.lng
+            if body.lat is not None:
+                data["lat"] = body.lat
+
+            # 4. 过滤掉表不存在的字段
+            insert_data = {k: v for k, v in data.items() if k in cols}
+            if not insert_data:
+                raise RuntimeError("user_addresses 表无可用字段，请检查表结构")
+
+            # 5. 把该商家其他退货地址取消默认
+            cur.execute(
+                "UPDATE user_addresses SET is_default=0 WHERE user_id=%s AND addr_type='return'",
+                (user_id,)
             )
+
+            # 6. 插入新退货地址
+            sql_cols = ",".join(insert_data.keys())
+            placeholders = ",".join(["%s"] * len(insert_data))
+            sql = f"INSERT INTO user_addresses({sql_cols}) VALUES ({placeholders})"
+            cur.execute(sql, tuple(insert_data.values()))
+            addr_id = cur.lastrowid
+            conn.commit()
             return {"addr_id": addr_id}
 
 @router.get("/address/return", summary="查看退货地址")
@@ -473,7 +751,7 @@ def points(body: PointsReq):
                 if not row:
                     raise HTTPException(status_code=404, detail="用户不存在")
                 user_id = row["id"]
-        add_points(user_id, body.points_type, Decimal(str(body.amount)), body.reason)
+        add_points(user_id, body.type, Decimal(str(body.amount)), body.reason)
         return {"msg": "ok"}
     except ValueError as e:
         _err(str(e))
@@ -496,7 +774,7 @@ def points_log(mobile: str, points_type: str = "member", page: int = 1, size: in
             u = cur.fetchone()
             if not u:
                 _err("用户不存在")
-            where, args = ["user_id=%s", "points_type=%s"], [u["id"], points_type]
+            where, args = ["user_id=%s", "type=%s"], [u["id"], points_type]  # 修改为正确的列名 type
             sql_where = " AND ".join(where)
             sql = f"""
                 SELECT change_amount, reason, related_order, created_at
@@ -579,13 +857,38 @@ def audit_list(mobile: str = None, page: int = 1, size: int = 10):
             rows = cur.fetchall()
             return {"rows": rows, "total": total, "page": page, "size": size}
 
-@router.post("/user/grant-merchant", summary="后台赋予商户身份")
+@router.post("/user/grant-merchant", summary="后台赋予商户身份（动态字段/自动升级表）")
 def grant_merchant(mobile: str, admin_key: str):
     if admin_key != "gm2025":
         raise HTTPException(status_code=403, detail="口令错误")
-    if UserService.grant_merchant(mobile):
-        return {"msg": "已赋予商户身份"}
-    raise HTTPException(status_code=404, detail="用户不存在")
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # 1. 嗅探 users 表真实字段
+            cur.execute("SHOW COLUMNS FROM users")
+            cols = [r["Field"] for r in cur.fetchall()]
+
+            # 2. 若不存在 is_merchant，则自动加字段
+            if "is_merchant" not in cols:
+                cur.execute(
+                    "ALTER TABLE users ADD COLUMN is_merchant TINYINT(1) NOT NULL DEFAULT 0 COMMENT '0-普通用户 1-商户'"
+                )
+                conn.commit()          # 提交 DDL
+
+            # 3. 执行更新
+            cur.execute(
+                "UPDATE users SET is_merchant=1 WHERE mobile=%s AND is_merchant=0",
+                (mobile,)
+            )
+            if cur.rowcount == 0:
+                # 要么手机号不存在，要么已经是商户
+                cur.execute("SELECT 1 FROM users WHERE mobile=%s", (mobile,))
+                if not cur.fetchone():
+                    raise HTTPException(status_code=404, detail="用户不存在")
+                return {"msg": "已拥有商户身份，无需重复赋予"}
+
+            conn.commit()
+            return {"msg": "已赋予商户身份"}
 
 @router.get("/user/is-merchant", summary="查询是否商户")
 def is_merchant(mobile: str):

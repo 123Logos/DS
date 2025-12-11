@@ -202,10 +202,11 @@ def search_products(
 
 @router.get("/products", summary="📄 商品列表分页")
 def get_all_products(
-        category: Optional[str] = Query(None, description="分类筛选"),
-        status: Optional[int] = Query(None, description="状态筛选"),
-        page: int = Query(1, ge=1, description="页码"),
-        size: int = Query(10, ge=1, le=100, description="每页条数"),
+    category: Optional[str] = Query(None, description="分类筛选"),
+    status: Optional[int] = Query(None, description="状态筛选"),
+    is_member_product: Optional[int] = Query(None, description="会员商品筛选，0=非会员，1=会员", ge=0, le=1),  # ✅ 新增
+    page: int = Query(1, ge=1, description="页码"),
+    size: int = Query(10, ge=1, le=100, description="每页条数"),
 ):
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -219,6 +220,9 @@ def get_all_products(
             if status is not None:
                 where_clauses.append("status = %s")
                 params.append(status)
+            if is_member_product is not None:  # ✅ 新增逻辑
+                where_clauses.append("is_member_product = %s")
+                params.append(is_member_product)
 
             where_sql = " WHERE " + " AND ".join(where_clauses) if where_clauses else ""
 
@@ -246,8 +250,7 @@ def get_all_products(
                 # 获取 SKUs
                 cur.execute("SELECT id, sku_code, price, stock FROM product_skus WHERE product_id = %s", (product_id,))
                 skus = cur.fetchall()
-                skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']), "stock": s['stock']} for
-                        s in skus]
+                skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']), "stock": s['stock']} for s in skus]
 
                 # 获取 attributes
                 cur.execute("SELECT name, value FROM product_attributes WHERE product_id = %s", (product_id,))
@@ -363,6 +366,9 @@ def update_product(id: int, payload: ProductUpdate):
                 update_params = []
 
                 update_data = payload.dict(exclude_unset=True, exclude={"attributes"})
+                # ✅ 禁止修改 is_member_product 字段
+                update_data.pop("is_member_product", None)
+
                 for key, value in update_data.items():
                     if key == "freight":
                         value = 0.0

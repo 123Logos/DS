@@ -5,19 +5,14 @@
 """
 import logging
 import sys
-import os
 from pathlib import Path
 from core.config import LOG_FILE, LOG_DIR
 
 # 确保日志目录存在
-Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-# 验证日志文件路径
-if not os.path.isabs(LOG_FILE):
-    # 如果是相对路径，转换为绝对路径
-    LOG_FILE_ABS = os.path.abspath(LOG_FILE)
-else:
-    LOG_FILE_ABS = LOG_FILE
+# 验证日志文件路径（Path对象已经是绝对路径或相对路径）
+LOG_FILE_ABS = LOG_FILE.resolve() if not LOG_FILE.is_absolute() else LOG_FILE
 
 
 def setup_logging(
@@ -45,13 +40,12 @@ def setup_logging(
     # 文件处理器 - 日志存储到 logs/api.log
     if log_to_file:
         # 确保日志文件路径是绝对路径（相对于项目根目录）
-        log_file_path = os.path.abspath(LOG_FILE) if not os.path.isabs(LOG_FILE) else LOG_FILE
+        log_file_path = LOG_FILE.resolve() if not LOG_FILE.is_absolute() else LOG_FILE
         # 确保日志目录存在
-        log_dir = os.path.dirname(log_file_path)
-        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        log_file_path.parent.mkdir(parents=True, exist_ok=True)
         
         # 创建文件处理器，日志写入 logs/api.log
-        file_handler = logging.FileHandler(log_file_path, encoding='utf-8')
+        file_handler = logging.FileHandler(str(log_file_path), encoding='utf-8')
         file_handler.setLevel(level)
         file_handler.setFormatter(logging.Formatter(log_format))
         handlers.append(file_handler)

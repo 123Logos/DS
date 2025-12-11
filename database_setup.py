@@ -54,6 +54,7 @@ class DatabaseManager:
                     referral_code VARCHAR(6) NULL COMMENT '推荐码',
                     withdrawable_balance BIGINT NOT NULL DEFAULT 0 COMMENT '可提现余额',
                     avatar_path VARCHAR(255) NULL DEFAULT NULL COMMENT '头像路径',
+                    is_merchant TINYINT(1) NOT NULL DEFAULT 0 COMMENT '判断是不是商家',
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_mobile (mobile),
@@ -276,27 +277,25 @@ class DatabaseManager:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
             # 注意：Refunds 表的外键约束在表创建后单独添加，避免类型不匹配问题
-            'user_addresses': """
-                CREATE TABLE IF NOT EXISTS user_addresses (
+            'addresses': """
+                CREATE TABLE IF NOT EXISTS addresses (
                     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                     user_id BIGINT UNSIGNED NOT NULL,
-                    label VARCHAR(20) NOT NULL COMMENT '家/公司/朋友',
-                    consignee_name VARCHAR(100) NOT NULL,
-                    consignee_phone VARCHAR(20) NOT NULL,
-                    province VARCHAR(20) NOT NULL DEFAULT '',
-                    city VARCHAR(20) NOT NULL DEFAULT '',
-                    district VARCHAR(20) NOT NULL DEFAULT '',
-                    detail TEXT NOT NULL,
-                    lng DECIMAL(10,6) NULL,
-                    lat DECIMAL(10,6) NULL,
-                    is_default TINYINT(1) DEFAULT 0,
+                    name VARCHAR(100) NOT NULL COMMENT '收货人姓名',
+                    phone VARCHAR(20) NOT NULL COMMENT '收货人电话',
+                    province VARCHAR(20) NOT NULL DEFAULT '' COMMENT '省份',
+                    city VARCHAR(20) NOT NULL DEFAULT '' COMMENT '城市',
+                    district VARCHAR(20) NOT NULL DEFAULT '' COMMENT '区县',
+                    detail TEXT NOT NULL COMMENT '详细地址',
+                    is_default TINYINT(1) DEFAULT 0 COMMENT '是否默认地址',
                     addr_type ENUM('shipping','return') NOT NULL DEFAULT 'shipping' COMMENT '地址类型（分为购物地址和退货地址）',
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                    INDEX idx_user (user_id)
+                    INDEX idx_user (user_id),
+                    INDEX idx_user_default (user_id, is_default)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
-            # 注意：User_Addresses 表的外键约束在表创建后单独添加
+            # 注意：Addresses 表的外键约束在表创建后单独添加
             'merchant_statement': """
                 CREATE TABLE IF NOT EXISTS merchant_statement (
                     merchant_id BIGINT UNSIGNED NOT NULL,
@@ -362,7 +361,7 @@ class DatabaseManager:
         self._add_refunds_foreign_keys(cursor)
         self._add_orders_foreign_keys(cursor)
         self._add_order_items_foreign_keys(cursor)
-        self._add_user_addresses_foreign_keys(cursor)
+        self._add_addresses_foreign_keys(cursor)
         self._add_banner_foreign_keys(cursor)
         self._add_product_attributes_foreign_keys(cursor)
         self._add_product_skus_foreign_keys(cursor)
@@ -516,41 +515,41 @@ class DatabaseManager:
         except Exception as e:
             logger.warning(f"⚠️ order_items 表外键约束添加失败（可忽略）: {e}")
 
-    def _add_user_addresses_foreign_keys(self, cursor):
-        """为 user_addresses 表添加外键约束（如果不存在）"""
+    def _add_addresses_foreign_keys(self, cursor):
+        """为 addresses 表添加外键约束（如果不存在）"""
         try:
-            # 检查 user_addresses 表和 users 表是否存在
+            # 检查 addresses 表和 users 表是否存在
             cursor.execute("""
                 SELECT TABLE_NAME 
                 FROM information_schema.TABLES 
                 WHERE TABLE_SCHEMA = DATABASE() 
-                AND TABLE_NAME IN ('user_addresses', 'users')
+                AND TABLE_NAME IN ('addresses', 'users')
             """)
             existing_tables = {row['TABLE_NAME'] for row in cursor.fetchall()}
             
-            if 'user_addresses' not in existing_tables or 'users' not in existing_tables:
-                logger.debug("⚠️ user_addresses 表或 users 表不存在，跳过外键添加")
+            if 'addresses' not in existing_tables or 'users' not in existing_tables:
+                logger.debug("⚠️ addresses 表或 users 表不存在，跳过外键添加")
                 return
             
             cursor.execute("""
                 SELECT CONSTRAINT_NAME 
                 FROM information_schema.TABLE_CONSTRAINTS 
                 WHERE TABLE_SCHEMA = DATABASE() 
-                AND TABLE_NAME = 'user_addresses' 
+                AND TABLE_NAME = 'addresses' 
                 AND CONSTRAINT_TYPE = 'FOREIGN KEY'
             """)
             existing_fks = [row['CONSTRAINT_NAME'] for row in cursor.fetchall()]
             
-            if 'user_addresses_ibfk_1' not in existing_fks:
+            if 'addresses_ibfk_1' not in existing_fks:
                 cursor.execute("""
-                    ALTER TABLE user_addresses 
-                    ADD CONSTRAINT user_addresses_ibfk_1 
+                    ALTER TABLE addresses 
+                    ADD CONSTRAINT addresses_ibfk_1 
                     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
                 """)
-                logger.info("✅ user_addresses 表外键约束 user_addresses_ibfk_1 已添加")
+                logger.info("✅ addresses 表外键约束 addresses_ibfk_1 已添加")
         except Exception as e:
             # 如果添加外键失败（可能是类型不匹配或表不存在），静默忽略
-            logger.debug(f"⚠️ user_addresses 表外键约束添加失败（已忽略）: {e}")
+            logger.debug(f"⚠️ addresses 表外键约束添加失败（已忽略）: {e}")
 
     def _add_banner_foreign_keys(self, cursor):
         """为 banner 表添加外键约束（如果不存在）"""

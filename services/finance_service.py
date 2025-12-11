@@ -9,6 +9,7 @@ from core.config import (
     PLATFORM_MERCHANT_ID, MAX_PURCHASE_PER_DAY, MAX_TEAM_LAYER,
     LOG_FILE
 )
+from core.database import get_conn
 from core.db_adapter import PyMySQLAdapter
 from core.exceptions import FinanceException, OrderException, InsufficientBalanceException
 from core.logging import get_logger
@@ -16,11 +17,12 @@ from core.logging import get_logger
 # 使用统一的日志配置
 logger = get_logger(__name__)
 
+
 class FinanceService:
     def __init__(self, session: Optional[PyMySQLAdapter] = None):
         """
         初始化 FinanceService
-        
+
         Args:
             session: 数据库会话适配器，如果为 None 则自动创建
         """
@@ -32,49 +34,76 @@ class FinanceService:
             raise InsufficientBalanceException(account_type, required_amount, balance)
         return True
 
-    def _check_user_balance(self, user_id: int, required_amount: Decimal, balance_type: str = 'promotion_balance') -> bool:
+    def _check_user_balance(self, user_id: int, required_amount: Decimal,
+                            balance_type: str = 'promotion_balance') -> bool:
         balance = self.get_user_balance(user_id, balance_type)
         if balance < required_amount:
             raise InsufficientBalanceException(f"user:{user_id}:{balance_type}", required_amount, balance)
         return True
 
     def check_purchase_limit(self, user_id: int) -> bool:
-        result = self.session.execute(
-            "SELECT COUNT(*) as count FROM orders WHERE user_id = %s AND is_member_order = 1 AND created_at >= NOW() - INTERVAL 24 HOUR AND status != 'refunded'",
-            {"user_id": user_id}
-        )
-        row = result.fetchone()
-        return row.count < MAX_PURCHASE_PER_DAY if row else False
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) as count FROM orders WHERE user_id = %s AND is_member_order = 1 AND created_at >= NOW() - INTERVAL 24 HOUR AND status != 'refunded'",
+                    (user_id,)
+                )
+                row = cur.fetchone()
+                return row['count'] < MAX_PURCHASE_PER_DAY if row else False
 
     def get_account_balance(self, account_type: str) -> Decimal:
-        result = self.session.execute(
-            "SELECT balance FROM finance_accounts WHERE account_type = %s",
-            {"type": account_type}
-        )
-        row = result.fetchone()
-        return Decimal(str(row.balance)) if row else Decimal('0')
+        """直接获取连接，绕过 PyMySQLAdapter 的连接管理问题"""
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT balance FROM finance_accounts WHERE account_type = %s",
+                        (account_type,)
+                    )
+                    row = cur.fetchone()
+                    # 使用字典访问方式，避免 RowProxy 的属性访问问题
+                    balance_val = row.get('balance') if row else 0
+                    return Decimal(str(balance_val)) if balance_val is not None else Decimal('0')
+        except Exception as e:
+            logger.error(f"查询账户余额失败: {e}")
+            return Decimal('0')
 
     def get_user_balance(self, user_id: int, balance_type: str = 'promotion_balance') -> Decimal:
-        result = self.session.execute(
-            f"SELECT {balance_type} FROM users WHERE id = %s",
-            {"user_id": user_id}
-        )
-        row = result.fetchone()
-        return Decimal(str(getattr(row, balance_type, 0))) if row else Decimal('0')
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT {balance_type} FROM users WHERE id = %s",
+                        (user_id,)
+                    )
+                    row = cur.fetchone()
+                    val = row.get(balance_type, 0) if row else 0
+                    return Decimal(str(val))
+        except Exception as e:
+            logger.error(f"查询用户余额失败: {e}")
+            return Decimal('0')
 
-    def settle_order(self, order_no: str, user_id: int, product_id: int, quantity: int = 1, points_to_use: Decimal = Decimal('0')) -> int:
+    # ==================== 关键修改1：商品查询使用 LEFT JOIN product_skus ====================
+    def settle_order(self, order_no: str, user_id: int, product_id: int, quantity: int = 1,
+                     points_to_use: Decimal = Decimal('0')) -> int:
         logger.info(f"\n🛒 订单结算开始: {order_no}")
         try:
             with self.session.begin():
+                # 关键修改：从 product_skus 表获取价格，兼容旧数据
                 result = self.session.execute(
-                    "SELECT price, is_member_product, merchant_id FROM products WHERE id = %s AND status = 1 FOR UPDATE",
+                    """SELECT p.is_member_product, p.user_id, 
+                              COALESCE(ps.price, p.price) as price
+                       FROM products p
+                       LEFT JOIN product_skus ps ON p.id = ps.product_id
+                       WHERE p.id = %s AND p.status = 1
+                       LIMIT 1""",
                     {"product_id": product_id}
                 )
                 product = result.fetchone()
-                if not product:
-                    raise OrderException(f"商品不存在或已下架: {product_id}")
+                if not product or product['price'] is None:
+                    raise OrderException(f"商品不存在、已下架或无价格信息: {product_id}")
 
-                merchant_id = product.merchant_id
+                merchant_id = product['user_id']  # 关键修改：字段名改为 user_id
                 if merchant_id != PLATFORM_MERCHANT_ID:
                     result = self.session.execute(
                         "SELECT id FROM users WHERE id = %s",
@@ -83,10 +112,10 @@ class FinanceService:
                     if not result.fetchone():
                         raise OrderException(f"商家不存在: {merchant_id}")
 
-                if product.is_member_product and not self.check_purchase_limit(user_id):
+                if product['is_member_product'] and not self.check_purchase_limit(user_id):
                     raise OrderException("24小时内购买会员商品超过限制（最多2份）")
 
-                unit_price = Decimal(str(product.price))
+                unit_price = Decimal(str(product['price']))
                 original_amount = unit_price * quantity
 
                 result = self.session.execute(
@@ -100,7 +129,7 @@ class FinanceService:
                 points_discount = Decimal('0')
                 final_amount = original_amount
 
-                if not product.is_member_product and points_to_use > Decimal('0'):
+                if not product['is_member_product'] and points_to_use > Decimal('0'):
                     self._apply_points_discount(user_id, user, points_to_use, original_amount)
                     points_discount = points_to_use * POINTS_DISCOUNT_RATE
                     final_amount = original_amount - points_discount
@@ -108,10 +137,10 @@ class FinanceService:
 
                 order_id = self._create_order(
                     order_no, user_id, merchant_id, product_id,
-                    final_amount, original_amount, points_discount, product.is_member_product
+                    final_amount, original_amount, points_discount, product['is_member_product']
                 )
 
-                if product.is_member_product:
+                if product['is_member_product']:
                     self._process_member_order(order_id, user_id, user, unit_price, quantity)
                 else:
                     self._process_normal_order(order_id, user_id, merchant_id, final_amount, user.member_level)
@@ -143,13 +172,18 @@ class FinanceService:
     def _create_order(self, order_no: str, user_id: int, merchant_id: int,
                       product_id: int, total_amount: Decimal, original_amount: Decimal,
                       points_discount: Decimal, is_member: bool) -> int:
+        # 关键修改：字段名 order_number
         result = self.session.execute(
-            """INSERT INTO orders (order_no, order_number, user_id, merchant_id, total_amount, original_amount, points_discount, is_member_order, status)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'completed')""",
+            """INSERT INTO orders (order_number, user_id, merchant_id, total_amount, original_amount, points_discount, is_member_order, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'completed')""",
             {
-                "order_no": order_no, "user_id": user_id, "merchant_id": merchant_id,
-                "total_amount": total_amount, "original_amount": original_amount,
-                "points_discount": points_discount, "is_member": is_member
+                "order_number": order_no,
+                "user_id": user_id,
+                "merchant_id": merchant_id,
+                "total_amount": total_amount,
+                "original_amount": original_amount,
+                "points_discount": points_discount,
+                "is_member": is_member
             }
         )
         order_id = result.lastrowid
@@ -290,7 +324,8 @@ class FinanceService:
             for purpose, percent in ALLOCATIONS.items():
                 alloc_amount = final_amount * percent
                 # 统一通过 helper 更新池子并记录流水
-                self._add_pool_balance(purpose.value, alloc_amount, f"订单#{order_id} 分配到{purpose.value}", related_user=user_id)
+                self._add_pool_balance(purpose.value, alloc_amount, f"订单#{order_id} 分配到{purpose.value}",
+                                       related_user=user_id)
                 if purpose == AllocationKey.PUBLIC_WELFARE:
                     logger.info(f"🎗️ 公益基金获得: ¥{alloc_amount}")
 
@@ -382,39 +417,38 @@ class FinanceService:
             logger.error(f"❌ 审核奖励失败: {e}")
             return False
 
-    def get_rewards_by_status(self, status: str = 'pending', reward_type: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
-        sql = """SELECT pr.id, pr.user_id, u.name as user_name, pr.reward_type, pr.amount, pr.order_id, pr.layer, pr.status, pr.created_at
-                 FROM pending_rewards pr JOIN users u ON pr.user_id = u.id WHERE pr.status = %s"""
-        params = {"status": status}
+    def get_rewards_by_status(self, status: str = 'pending', reward_type: Optional[str] = None, limit: int = 50) -> \
+            List[Dict[str, Any]]:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                params = [status, limit]
+                sql = """SELECT pr.id, pr.user_id, u.name as user_name, pr.reward_type, pr.amount, pr.order_id, pr.layer, pr.status, pr.created_at
+                         FROM pending_rewards pr JOIN users u ON pr.user_id = u.id WHERE pr.status = %s"""
+                if reward_type:
+                    sql += " AND pr.reward_type = %s"
+                    params.insert(1, reward_type)
+                sql += " ORDER BY pr.created_at DESC LIMIT %s"
 
-        if reward_type:
-            sql += " AND pr.reward_type = %s"
-            params["reward_type"] = reward_type
-
-        sql += " ORDER BY pr.created_at DESC LIMIT %s"
-        params["limit"] = limit
-
-        result = self.session.execute(sql, params)
-        rewards = result.fetchall()
-
-        return [{
-            "id": r.id,
-            "user_id": r.user_id,
-            "user_name": r.user_name,
-            "reward_type": r.reward_type,
-            "amount": float(r.amount),
-            "order_id": r.order_id,
-            "layer": r.layer,
-            "status": r.status,
-            "created_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S")
-        } for r in rewards]
+                cur.execute(sql, tuple(params))
+                rewards = cur.fetchall()
+                return [{
+                    "id": r['id'],
+                    "user_id": r['user_id'],
+                    "user_name": r['user_name'],
+                    "reward_type": r['reward_type'],
+                    "amount": float(r['amount']),
+                    "order_id": r['order_id'],
+                    "layer": r['layer'],
+                    "status": r['status'],
+                    "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S")
+                } for r in rewards]
 
     def refund_order(self, order_no: str) -> bool:
         try:
             with self.session.begin():
                 result = self.session.execute(
-                    "SELECT * FROM orders WHERE order_no = %s FOR UPDATE",
-                    {"order_no": order_no}
+                    "SELECT * FROM orders WHERE order_number = %s FOR UPDATE",
+                    {"order_number": order_no}
                 )
                 order = result.fetchone()
 
@@ -507,7 +541,8 @@ class FinanceService:
         result = self.session.execute("SELECT SUM(merchant_points) as total FROM users WHERE merchant_points > 0")
         merchant_points = Decimal(str(result.fetchone().total or 0))
 
-        result = self.session.execute("SELECT balance as total FROM finance_accounts WHERE account_type = 'company_points'")
+        result = self.session.execute(
+            "SELECT balance as total FROM finance_accounts WHERE account_type = 'company_points'")
         company_points = Decimal(str(result.fetchone().total or 0))
 
         total_points = user_points + merchant_points + company_points
@@ -520,7 +555,8 @@ class FinanceService:
         if points_value > MAX_POINTS_VALUE:
             points_value = MAX_POINTS_VALUE
 
-        logger.info(f"补贴池: ¥{pool_balance} | 用户积分: {user_points} | 商家积分: {merchant_points} | 公司积分: {company_points}（仅参与计算） | 积分值: ¥{points_value:.4f}/分")
+        logger.info(
+            f"补贴池: ¥{pool_balance} | 用户积分: {user_points} | 商家积分: {merchant_points} | 公司积分: {company_points}（仅参与计算） | 积分值: ¥{points_value:.4f}/分")
 
         total_distributed = Decimal('0')
         today = datetime.now().date()
@@ -620,7 +656,8 @@ class FinanceService:
 
                 logger.info(f"ℹ️ 公司积分{company_points}未扣除，未发放优惠券")
 
-            logger.info(f"✅ 周补贴完成: 发放¥{total_distributed:.4f}优惠券（补贴池余额不变: ¥{pool_balance}，公司积分不扣除）")
+            logger.info(
+                f"✅ 周补贴完成: 发放¥{total_distributed:.4f}优惠券（补贴池余额不变: ¥{pool_balance}，公司积分不扣除）")
             return True
         except Exception as e:
             logger.error(f"❌ 周补贴发放失败: {e}")
@@ -746,11 +783,11 @@ class FinanceService:
                      remark: str, account_id: Optional[int] = None) -> None:
         # 兼容封装：使用内部统一的 account_flow 插入函数
         self._insert_account_flow(account_type=account_type,
-                                   related_user=related_user,
-                                   change_amount=change_amount,
-                                   flow_type=flow_type,
-                                   remark=remark,
-                                   account_id=account_id)
+                                  related_user=related_user,
+                                  change_amount=change_amount,
+                                  flow_type=flow_type,
+                                  remark=remark,
+                                  account_id=account_id)
 
     def _insert_account_flow(self, account_type: str, related_user: Optional[int],
                              change_amount: Decimal, flow_type: str,
@@ -772,7 +809,8 @@ class FinanceService:
             }
         )
 
-    def _add_pool_balance(self, account_type: str, amount: Decimal, remark: str, related_user: Optional[int] = None) -> Decimal:
+    def _add_pool_balance(self, account_type: str, amount: Decimal, remark: str,
+                          related_user: Optional[int] = None) -> Decimal:
         """对平台/池子类账户 (`finance_accounts`) 增减余额并记录流水。
         返回更新后的余额（Decimal）。"""
         self.session.execute(
@@ -788,13 +826,14 @@ class FinanceService:
         # 记录流水（income/expense 由 amount 正负决定）
         flow_type = 'income' if amount >= 0 else 'expense'
         self._insert_account_flow(account_type=account_type,
-                                   related_user=related_user,
-                                   change_amount=amount,
-                                   flow_type=flow_type,
-                                   remark=remark)
+                                  related_user=related_user,
+                                  change_amount=amount,
+                                  flow_type=flow_type,
+                                  remark=remark)
         return balance_after
 
-    def _insert_points_log(self, user_id: int, change_amount: Decimal, balance_after: Decimal, type: str, reason: str, related_order: Optional[int] = None) -> None:
+    def _insert_points_log(self, user_id: int, change_amount: Decimal, balance_after: Decimal, type: str, reason: str,
+                           related_order: Optional[int] = None) -> None:
         """插入 `points_log` 记录。change_amount 和 balance_after 使用 Decimal 类型，支持小数点后4位精度。"""
         self.session.execute(
             """INSERT INTO points_log (user_id, change_amount, balance_after, points_type, reason, related_order, created_at)
@@ -836,65 +875,77 @@ class FinanceService:
         else:
             return self.get_account_balance(account_type)
 
+    # 在 get_public_welfare_balance 方法中添加
     def get_public_welfare_balance(self) -> Decimal:
-        return self.get_account_balance('public_welfare')
+        # ========== 临时日志开始 ==========
+        logger.info("🔍 DEBUG: get_public_welfare_balance 被调用")
+        result = self.get_account_balance('public_welfare')
+        logger.info(f"🔍 DEBUG: get_account_balance 返回: {result} (类型: {type(result)})")
+        return result
+        # ========== 临时日志结束 ==========
+        # return self.get_account_balance('public_welfare')
 
     def get_public_welfare_flow(self, limit: int = 50) -> List[Dict[str, Any]]:
-        result = self.session.execute(
-            """SELECT id, related_user, change_amount, balance_after, flow_type, remark, created_at
-               FROM account_flow WHERE account_type = 'public_welfare'
-               ORDER BY created_at DESC LIMIT %s""",
-            {"limit": limit}
-        )
-        flows = result.fetchall()
-
-        return [{
-            "id": f.id,
-            "related_user": f.related_user,
-            "change_amount": float(f.change_amount),
-            "balance_after": float(f.balance_after) if f.balance_after else None,
-            "flow_type": f.flow_type,
-            "remark": f.remark,
-            "created_at": f.created_at.strftime("%Y-%m-%d %H:%M:%S")
-        } for f in flows]
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, related_user, change_amount, balance_after, flow_type, remark, created_at
+                       FROM account_flow WHERE account_type = %s
+                       ORDER BY created_at DESC LIMIT %s""",
+                    ("public_welfare", limit)
+                )
+                flows = cur.fetchall()
+                return [{
+                    "id": f['id'],
+                    "related_user": f['related_user'],
+                    "change_amount": float(f['change_amount']),
+                    "balance_after": float(f['balance_after']) if f['balance_after'] else None,
+                    "flow_type": f['flow_type'],
+                    "remark": f['remark'],
+                    "created_at": f['created_at'].strftime("%Y-%m-%d %H:%M:%S")
+                } for f in flows]
 
     def get_public_welfare_report(self, start_date: str, end_date: str) -> Dict[str, Any]:
-        result = self.session.execute(
-            """SELECT COUNT(*) as total_transactions,
-                      SUM(CASE WHEN flow_type = 'income' THEN change_amount ELSE 0 END) as total_income,
-                      SUM(CASE WHEN flow_type = 'expense' THEN change_amount ELSE 0 END) as total_expense
-               FROM account_flow WHERE account_type = 'public_welfare'
-               AND DATE(created_at) BETWEEN %s AND %s""",
-            {"start_date": start_date, "end_date": end_date}
-        )
-        summary = result.fetchone()
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 汇总查询
+                cur.execute(
+                    """SELECT COUNT(*) as total_transactions,
+                              SUM(CASE WHEN flow_type = 'income' THEN change_amount ELSE 0 END) as total_income,
+                              SUM(CASE WHEN flow_type = 'expense' THEN change_amount ELSE 0 END) as total_expense
+                       FROM account_flow WHERE account_type = 'public_welfare'
+                       AND DATE(created_at) BETWEEN %s AND %s""",
+                    (start_date, end_date)
+                )
+                summary = cur.fetchone()
 
-        result = self.session.execute(
-            """SELECT id, related_user, change_amount, balance_after, flow_type, remark, created_at
-               FROM account_flow WHERE account_type = 'public_welfare'
-               AND DATE(created_at) BETWEEN %s AND %s
-               ORDER BY created_at DESC""",
-            {"start_date": start_date, "end_date": end_date}
-        )
-        details = result.fetchall()
+                # 明细查询
+                cur.execute(
+                    """SELECT id, related_user, change_amount, balance_after, flow_type, remark, created_at
+                       FROM account_flow WHERE account_type = 'public_welfare'
+                       AND DATE(created_at) BETWEEN %s AND %s
+                       ORDER BY created_at DESC""",
+                    (start_date, end_date)
+                )
+                details = cur.fetchall()
 
-        return {
-            "summary": {
-                "total_transactions": summary.total_transactions or 0,
-                "total_income": float(summary.total_income or 0),
-                "total_expense": float(summary.total_expense or 0),
-                "net_balance": float((summary.total_income or 0) - (summary.total_expense or 0))
-            },
-            "details": [{
-                "id": d.id,
-                "related_user": d.related_user,
-                "change_amount": float(d.change_amount),
-                "balance_after": float(d.balance_after) if d.balance_after else None,
-                "flow_type": d.flow_type,
-                "remark": d.remark,
-                "created_at": d.created_at.strftime("%Y-%m-%d %H:%M:%S")
-            } for d in details]
-        }
+                return {
+                    "summary": {
+                        "total_transactions": summary['total_transactions'] or 0,
+                        "total_income": float(summary['total_income'] or 0),
+                        "total_expense": float(summary['total_expense'] or 0),
+                        "net_balance": float((summary['total_income'] or 0) - (summary['total_expense'] or 0))
+                    },
+                    "details": [{
+                        "id": d['id'],
+                        "related_user": d['related_user'],
+                        "change_amount": float(d['change_amount']),
+                        "balance_after": float(d['balance_after']) if d['balance_after'] else None,
+                        "flow_type": d['flow_type'],
+                        "remark": d['remark'],
+                        "created_at": d['created_at'].strftime("%Y-%m-%d %H:%M:%S")
+                    } for d in details]
+                }
 
     def set_referrer(self, user_id: int, referrer_id: int) -> bool:
         try:
@@ -931,39 +982,44 @@ class FinanceService:
             return False
 
     def get_user_referrer(self, user_id: int) -> Optional[Dict[str, Any]]:
-        result = self.session.execute(
-            """SELECT ur.referrer_id, u.name, u.member_level
-               FROM user_referrals ur JOIN users u ON ur.referrer_id = u.id
-               WHERE ur.user_id = %s""",
-            {"user_id": user_id}
-        )
-        row = result.fetchone()
-        return {
-            "referrer_id": row.referrer_id,
-            "name": row.name,
-            "member_level": row.member_level
-        } if row else None
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT ur.referrer_id, u.name, u.member_level
+                       FROM user_referrals ur JOIN users u ON ur.referrer_id = u.id
+                       WHERE ur.user_id = %s""",
+                    (user_id,)
+                )
+                row = cur.fetchone()
+                return {
+                    "referrer_id": row['referrer_id'],
+                    "name": row['name'],
+                    "member_level": row['member_level']
+                } if row else None
 
     def get_user_team(self, user_id: int, max_layer: int = MAX_TEAM_LAYER) -> List[Dict[str, Any]]:
-        result = self.session.execute(
-            """WITH RECURSIVE team_tree AS (
-               SELECT user_id, referrer_id, 1 as layer FROM user_referrals WHERE referrer_id = %s
-               UNION ALL
-               SELECT ur.user_id, ur.referrer_id, tt.layer + 1
-               FROM user_referrals ur JOIN team_tree tt ON ur.referrer_id = tt.user_id
-               WHERE tt.layer < %s
-               )
-               SELECT tt.user_id, u.name, u.member_level, tt.layer
-               FROM team_tree tt JOIN users u ON tt.user_id = u.id
-               ORDER BY tt.layer, tt.user_id""",
-            {"user_id": user_id, "max_layer": max_layer}
-        )
-        return [{
-            "user_id": r.user_id,
-            "name": r.name,
-            "member_level": r.member_level,
-            "layer": r.layer
-        } for r in result.fetchall()]
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """WITH RECURSIVE team_tree AS (
+                       SELECT user_id, referrer_id, 1 as layer FROM user_referrals WHERE referrer_id = %s
+                       UNION ALL
+                       SELECT ur.user_id, ur.referrer_id, tt.layer + 1
+                       FROM user_referrals ur JOIN team_tree tt ON ur.referrer_id = tt.user_id
+                       WHERE tt.layer < %s
+                       )
+                       SELECT tt.user_id, u.name, u.member_level, tt.layer
+                       FROM team_tree tt JOIN users u ON tt.user_id = u.id
+                       ORDER BY tt.layer, tt.user_id""",
+                    (user_id, max_layer)
+                )
+                results = cur.fetchall()
+                return [{
+                    "user_id": r['user_id'],
+                    "name": r['name'],
+                    "member_level": r['member_level'],
+                    "layer": r['layer']
+                } for r in results]
 
     def check_director_promotion(self) -> bool:
         try:
@@ -1018,333 +1074,352 @@ class FinanceService:
             return False
 
     def get_user_info(self, user_id: int) -> Dict[str, Any]:
-        result = self.session.execute(
-            """SELECT id, mobile, name, member_level, points, promotion_balance,
-               merchant_points, merchant_balance, status
-               FROM users WHERE id = %s""",
-            {"user_id": user_id}
-        )
-        user = result.fetchone()
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 用户主信息
+                cur.execute(
+                    """SELECT id, mobile, name, member_level, points, promotion_balance,
+                       merchant_points, merchant_balance, status
+                       FROM users WHERE id = %s""",
+                    (user_id,)
+                )
+                user = cur.fetchone()
+                if not user:
+                    raise FinanceException("用户不存在")
 
-        if not user:
-            raise FinanceException("用户不存在")
+                # 优惠券统计
+                cur.execute(
+                    """SELECT COUNT(*) as count, SUM(amount) as total_amount
+                       FROM coupons WHERE user_id = %s AND status = 'unused'""",
+                    (user_id,)
+                )
+                coupons = cur.fetchone()
 
-        roles = []
-        if user.points > 0 or user.promotion_balance > 0:
-            roles.append("普通用户")
-        if user.merchant_points > 0 or user.merchant_balance > 0:
-            roles.append("商家")
+                # 角色判定
+                roles = []
+                if user['points'] > 0 or user['promotion_balance'] > 0:
+                    roles.append("普通用户")
+                if user['merchant_points'] > 0 or user['merchant_balance'] > 0:
+                    roles.append("商家")
 
-        star_level = "荣誉董事" if user.status == 9 else (f"{user.member_level}星级会员" if user.member_level > 0 else "非会员")
+                star_level = "荣誉董事" if user['status'] == 9 else (
+                    f"{user['member_level']}星级会员" if user['member_level'] > 0 else "非会员")
 
-        result = self.session.execute(
-            """SELECT COUNT(*) as count, SUM(amount) as total_amount
-               FROM coupons WHERE user_id = %s AND status = 'unused'""",
-            {"user_id": user_id}
-        )
-        coupons = result.fetchone()
-
-        return {
-            "id": user.id,
-            "mobile": user.mobile,
-            "name": user.name,
-            "member_level": user.member_level,
-            "points": user.points,
-            "promotion_balance": float(user.promotion_balance),
-            "merchant_points": user.merchant_points,
-            "merchant_balance": float(user.merchant_balance),
-            "roles": roles,
-            "star_level": star_level,
-            "status": user.status,
-            "coupons": {
-                "unused_count": coupons.count or 0,
-                "total_amount": float(Decimal(str(coupons.total_amount or 0)))
-            }
-        }
+                return {
+                    "id": user['id'],
+                    "mobile": user['mobile'],
+                    "name": user['name'],
+                    "member_level": user['member_level'],
+                    "points": user['points'],
+                    "promotion_balance": float(user['promotion_balance']),
+                    "merchant_points": user['merchant_points'],
+                    "merchant_balance": float(user['merchant_balance']),
+                    "roles": roles,
+                    "star_level": star_level,
+                    "status": user['status'],
+                    "coupons": {
+                        "unused_count": coupons['count'] or 0,
+                        "total_amount": float(coupons['total_amount'] or 0)
+                    }
+                }
 
     def get_user_coupons(self, user_id: int, status: str = 'unused') -> List[Dict[str, Any]]:
-        result = self.session.execute(
-            """SELECT id, coupon_type, amount, status, valid_from, valid_to, used_at, created_at
-               FROM coupons WHERE user_id = %s AND status = %s
-               ORDER BY created_at DESC""",
-            {"user_id": user_id, "status": status}
-        )
-        coupons = result.fetchall()
-
-        return [{
-            "id": c.id,
-            "coupon_type": c.coupon_type,
-            "amount": float(Decimal(str(c.amount))),
-            "status": c.status,
-            "valid_from": c.valid_from.strftime("%Y-%m-%d"),
-            "valid_to": c.valid_to.strftime("%Y-%m-%d"),
-            "used_at": c.used_at.strftime("%Y-%m-%d %H:%M:%S") if c.used_at else None,
-            "created_at": c.created_at.strftime("%Y-%m-%d %H:%M:%S")
-        } for c in coupons]
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, coupon_type, amount, status, valid_from, valid_to, used_at, created_at
+                       FROM coupons WHERE user_id = %s AND status = %s
+                       ORDER BY created_at DESC""",
+                    (user_id, status)
+                )
+                coupons = cur.fetchall()
+                return [{
+                    "id": c['id'],
+                    "coupon_type": c['coupon_type'],
+                    "amount": float(c['amount']),
+                    "status": c['status'],
+                    "valid_from": c['valid_from'].strftime("%Y-%m-%d"),
+                    "valid_to": c['valid_to'].strftime("%Y-%m-%d"),
+                    "used_at": c['used_at'].strftime("%Y-%m-%d %H:%M:%S") if c['used_at'] else None,
+                    "created_at": c['created_at'].strftime("%Y-%m-%d %H:%M:%S")
+                } for c in coupons]
 
     def get_finance_report(self) -> Dict[str, Any]:
-        result = self.session.execute("""SELECT SUM(points) as points, SUM(promotion_balance) as balance FROM users""")
-        user = result.fetchone()
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 用户资产
+                cur.execute("SELECT SUM(points) as points, SUM(promotion_balance) as balance FROM users")
+                user = cur.fetchone()
 
-        result = self.session.execute("""SELECT SUM(merchant_points) as points, SUM(merchant_balance) as balance
-                                         FROM users WHERE merchant_points > 0 OR merchant_balance > 0""")
-        merchant = result.fetchone()
+                # 商家资产
+                cur.execute("""SELECT SUM(merchant_points) as points, SUM(merchant_balance) as balance
+                              FROM users WHERE merchant_points > 0 OR merchant_balance > 0""")
+                merchant = cur.fetchone()
 
-        result = self.session.execute("SELECT account_name, account_type, balance FROM finance_accounts")
-        pools = result.fetchall()
+                # 平台资金池
+                cur.execute("SELECT account_name, account_type, balance FROM finance_accounts")
+                pools = cur.fetchall()
 
-        public_welfare_balance = self.get_public_welfare_balance()
+                # 优惠券统计
+                cur.execute("""SELECT COUNT(*) as count, SUM(amount) as total_amount
+                              FROM coupons WHERE status = 'unused'""")
+                coupons = cur.fetchone()
 
-        result = self.session.execute("""SELECT COUNT(*) as count, SUM(amount) as total_amount
-                                         FROM coupons WHERE status = 'unused'""")
-        coupons = result.fetchone()
+                public_welfare_balance = self.get_public_welfare_balance()
 
-        platform_pools = []
-        for pool in pools:
-            if pool.balance > 0:
-                balance = int(pool.balance) if 'points' in pool.account_type else float(pool.balance)
-                platform_pools.append({
-                    "name": pool.account_name,
-                    "type": pool.account_type,
-                    "balance": balance
-                })
+                platform_pools = []
+                for pool in pools:
+                    if pool['balance'] > 0:
+                        balance = int(pool['balance']) if 'points' in pool['account_type'] else float(pool['balance'])
+                        platform_pools.append({
+                            "name": pool['account_name'],
+                            "type": pool['account_type'],
+                            "balance": balance
+                        })
 
-        return {
-            "user_assets": {
-                "total_points": float(Decimal(str(user.points or 0))),
-                "total_balance": float(user.balance or 0)
-            },
-            "merchant_assets": {
-                "total_points": float(Decimal(str(merchant.points or 0))),
-                "total_balance": float(merchant.balance or 0)
-            },
-            "platform_pools": platform_pools,
-            "public_welfare_fund": {
-                "account_name": "公益基金",
-                "account_type": "public_welfare",
-                "balance": float(public_welfare_balance),
-                "reserved": 0.0,
-                "remark": "该账户自动汇入1%交易额"
-            },
-            "coupons_summary": {
-                "unused_count": coupons.count or 0,
-                "total_amount": float(Decimal(str(coupons.total_amount or 0))),
-                "remark": "周补贴改为发放优惠券"
-            }
-        }
+                return {
+                    "user_assets": {
+                        "total_points": int(user['points'] or 0),
+                        "total_balance": float(user['balance'] or 0)
+                    },
+                    "merchant_assets": {
+                        "total_points": int(merchant['points'] or 0),
+                        "total_balance": float(merchant['balance'] or 0)
+                    },
+                    "platform_pools": platform_pools,
+                    "public_welfare_fund": {
+                        "account_name": "公益基金",
+                        "account_type": "public_welfare",
+                        "balance": float(public_welfare_balance),
+                        "reserved": 0.0,
+                        "remark": "该账户自动汇入1%交易额"
+                    },
+                    "coupons_summary": {
+                        "unused_count": coupons['count'] or 0,
+                        "total_amount": float(coupons['total_amount'] or 0),
+                        "remark": "周补贴改为发放优惠券"
+                    }
+                }
 
     def get_account_flow_report(self, limit: int = 50) -> List[Dict[str, Any]]:
-        result = self.session.execute(
-            """SELECT id, account_id, account_type, related_user, change_amount, balance_after, flow_type, remark, created_at
-               FROM account_flow ORDER BY created_at DESC LIMIT %s""",
-            {"limit": limit}
-        )
-        flows = result.fetchall()
-
-        return [{
-            "id": f.id,
-            "account_id": f.account_id,
-            "account_type": f.account_type,
-            "related_user": f.related_user,
-            "change_amount": float(f.change_amount),
-            "balance_after": float(f.balance_after) if f.balance_after else None,
-            "flow_type": f.flow_type,
-            "remark": f.remark,
-            "created_at": f.created_at.strftime("%Y-%m-%d %H:%M:%S")
-        } for f in flows]
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, account_id, account_type, related_user, change_amount, balance_after, flow_type, remark, created_at
+                       FROM account_flow ORDER BY created_at DESC LIMIT %s""",
+                    (limit,)
+                )
+                flows = cur.fetchall()
+                return [{
+                    "id": f['id'],
+                    "account_id": f['account_id'],
+                    "account_type": f['account_type'],
+                    "related_user": f['related_user'],
+                    "change_amount": float(f['change_amount']),
+                    "balance_after": float(f['balance_after']) if f['balance_after'] else None,
+                    "flow_type": f['flow_type'],
+                    "remark": f['remark'],
+                    "created_at": f['created_at'].strftime("%Y-%m-%d %H:%M:%S")
+                } for f in flows]
 
     def get_points_flow_report(self, user_id: Optional[int] = None, limit: int = 50) -> List[Dict[str, Any]]:
-        params = {"limit": limit}
-        sql = """SELECT id, user_id, change_amount, balance_after, type, reason, related_order, created_at
-                 FROM points_log"""
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                params = [limit]
+                sql = """SELECT id, user_id, change_amount, balance_after, type, reason, related_order, created_at
+                         FROM points_log"""
+                if user_id:
+                    sql += " WHERE user_id = %s"
+                    params.insert(0, user_id)
+                sql += " ORDER BY created_at DESC LIMIT %s"
 
-        if user_id:
-            sql += " WHERE user_id = %s"
-            params["user_id"] = user_id
+                cur.execute(sql, tuple(params))
+                flows = cur.fetchall()
+                return [{
+                    "id": f['id'],
+                    "user_id": f['user_id'],
+                    "change_amount": float(f['change_amount']),
+                    "balance_after": float(f['balance_after']),
+                    "type": f['type'],
+                    "reason": f['reason'],
+                    "related_order": f['related_order'],
+                    "created_at": f['created_at'].strftime("%Y-%m-%d %H:%M:%S")
+                } for f in flows]
 
-        sql += " ORDER BY created_at DESC LIMIT %s"
+    # ==================== 关键修改2 & 3：修复返回字段名 ====================
+    def get_points_deduction_report(self, start_date: str, end_date: str, page: int = 1, page_size: int = 20) -> Dict[
+        str, Any]:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                offset = (page - 1) * page_size
 
-        result = self.session.execute(sql, params)
-        flows = result.fetchall()
-
-        return [{
-            "id": f.id,
-            "user_id": f.user_id,
-            "change_amount": float(Decimal(str(f.change_amount))),
-            "balance_after": float(Decimal(str(f.balance_after))),
-            "type": f.type,
-            "reason": f.reason,
-            "related_order": f.related_order,
-            "created_at": f.created_at.strftime("%Y-%m-%d %H:%M:%S")
-        } for f in flows]
-
-    def get_points_deduction_report(self, start_date: str, end_date: str, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
-        offset = (page - 1) * page_size
-        result = self.session.execute(
-            """SELECT COUNT(*) as total
-               FROM orders o JOIN points_log pl ON o.id = pl.related_order
-               WHERE o.points_discount > 0 AND pl.points_type = 'member' AND pl.reason = '积分抵扣支付'
-               AND DATE(o.created_at) BETWEEN %s AND %s""",
-            {"start_date": start_date, "end_date": end_date}
-        )
-        row = result.fetchone()
-        total_count = row.total if row else 0
-
-        result = self.session.execute(
-            """SELECT o.id as order_id, o.order_no, o.user_id, u.name as user_name, u.member_level,
-                      o.original_amount, o.points_discount, o.total_amount, ABS(pl.change_amount) as points_used, o.created_at
-               FROM orders o JOIN points_log pl ON o.id = pl.related_order JOIN users u ON o.user_id = u.id
-               WHERE o.points_discount > 0 AND pl.points_type = 'member' AND pl.reason = '积分抵扣支付'
-               AND DATE(o.created_at) BETWEEN %s AND %s
-               ORDER BY o.created_at DESC LIMIT %s OFFSET %s""",
-            {
-                "start_date": start_date,
-                "end_date": end_date,
-                "page_size": page_size,
-                "offset": offset
-            }
-        )
-        records = result.fetchall()
-
-        result = self.session.execute(
-            """SELECT COUNT(*) as total_orders, SUM(ABS(pl.change_amount)) as total_points,
-                      SUM(o.points_discount) as total_discount_amount
-               FROM orders o JOIN points_log pl ON o.id = pl.related_order
-               WHERE o.points_discount > 0 AND pl.points_type = 'member' AND pl.reason = '积分抵扣支付'
-               AND DATE(o.created_at) BETWEEN %s AND %s""",
-            {"start_date": start_date, "end_date": end_date}
-        )
-        summary = result.fetchone()
-
-        return {
-            "summary": {
-                "total_orders": summary.total_orders or 0,
-                "total_points_used": float(Decimal(str(summary.total_points or 0))),
-                "total_discount_amount": float(summary.total_discount_amount or 0)
-            },
-            "pagination": {
-                "page": page,
-                "page_size": page_size,
-                "total": total_count,
-                "total_pages": (total_count + page_size - 1) // page_size
-            },
-            "records": [{
-                "order_id": r.order_id,
-                "order_no": r.order_no,
-                "user_id": r.user_id,
-                "user_name": r.user_name,
-                "member_level": r.member_level,
-                "original_amount": float(r.original_amount),
-                "points_discount": float(r.points_discount),
-                "total_amount": float(r.total_amount),
-                "points_used": float(Decimal(str(r.points_used or 0))),
-                "created_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S")
-            } for r in records]
-        }
-
-    def get_transaction_chain_report(self, user_id: int, order_no: Optional[str] = None) -> Dict[str, Any]:
-        if order_no:
-            result = self.session.execute(
-                """SELECT id, order_no, total_amount, original_amount, is_member_order
-                   FROM orders WHERE order_no = %s AND user_id = %s""",
-                {"order_no": order_no, "user_id": user_id}
-            )
-        else:
-            result = self.session.execute(
-                """SELECT id, order_no, total_amount, original_amount, is_member_order
-                   FROM orders WHERE user_id = %s
-                   ORDER BY created_at DESC LIMIT 1""",
-                {"user_id": user_id}
-            )
-
-        order = result.fetchone()
-        if not order:
-            raise FinanceException("未找到订单")
-
-        chain = []
-        current_id = user_id
-        level = 0
-
-        while current_id and level < MAX_TEAM_LAYER:
-            result = self.session.execute(
-                """SELECT u.id, u.name, u.member_level, ur.referrer_id
-                   FROM users u LEFT JOIN user_referrals ur ON u.id = ur.user_id
-                   WHERE u.id = %s""",
-                {"user_id": current_id}
-            )
-            user_info = result.fetchone()
-
-            if not user_info:
-                break
-
-            level += 1
-
-            result = self.session.execute(
-                """SELECT reward_amount, created_at FROM team_rewards
-                   WHERE order_id = %s AND layer = %s""",
-                {"order_id": order.id, "layer": level}
-            )
-            team_reward = result.fetchone()
-
-            referral_reward = None
-            if level == 1:
-                result = self.session.execute(
-                    """SELECT amount FROM pending_rewards
-                       WHERE order_id = %s AND reward_type = 'referral' AND status = 'approved'""",
-                    {"order_id": order.id}
+                # 总数查询
+                cur.execute(
+                    """SELECT COUNT(*) as total
+                       FROM orders o JOIN points_log pl ON o.id = pl.related_order
+                       WHERE o.points_discount > 0 AND pl.type = 'member' AND pl.reason = '积分抵扣支付'
+                       AND DATE(o.created_at) BETWEEN %s AND %s""",
+                    (start_date, end_date)
                 )
-                ref_reward = result.fetchone()
-                if ref_reward:
-                    referral_reward = float(ref_reward.amount)
+                total_count = cur.fetchone()['total']
 
-            chain.append({
-                "layer": level,
-                "user_id": user_info.id,
-                "name": user_info.name,
-                "member_level": user_info.member_level,
-                "is_referrer": (level == 1),
-                "referral_reward": referral_reward,
-                "team_reward": {
-                    "amount": float(team_reward.reward_amount) if team_reward else 0.00,
-                    "has_reward": team_reward is not None
-                },
-                "referrer_id": user_info.referrer_id
-            })
+                # 明细查询
+                cur.execute(
+                    """SELECT o.id as order_id, o.order_number, o.user_id, u.name as user_name, u.member_level,
+                              o.original_amount, o.points_discount, o.total_amount, ABS(pl.change_amount) as points_used, o.created_at
+                       FROM orders o JOIN points_log pl ON o.id = pl.related_order JOIN users u ON o.user_id = u.id
+                       WHERE o.points_discount > 0 AND pl.type = 'member' AND pl.reason = '积分抵扣支付'
+                       AND DATE(o.created_at) BETWEEN %s AND %s
+                       ORDER BY o.created_at DESC LIMIT %s OFFSET %s""",
+                    (start_date, end_date, page_size, offset)
+                )
+                records = cur.fetchall()
 
-            if not user_info.referrer_id:
-                break
-            current_id = user_info.referrer_id
+                # 汇总查询
+                cur.execute(
+                    """SELECT COUNT(*) as total_orders, SUM(ABS(pl.change_amount)) as total_points,
+                              SUM(o.points_discount) as total_discount_amount
+                       FROM orders o JOIN points_log pl ON o.id = pl.related_order
+                       WHERE o.points_discount > 0 AND pl.type = 'member' AND pl.reason = '积分抵扣支付'
+                       AND DATE(o.created_at) BETWEEN %s AND %s""",
+                    (start_date, end_date)
+                )
+                summary = cur.fetchone()
 
-        total_referral = chain[0]['referral_reward'] if chain and chain[0]['referral_reward'] else 0.00
-        total_team = sum(item['team_reward']['amount'] for item in chain)
+                return {
+                    "summary": {
+                        "total_orders": summary['total_orders'] or 0,
+                        "total_points_used": float(summary['total_points'] or 0),
+                        "total_discount_amount": float(summary['total_discount_amount'] or 0)
+                    },
+                    "pagination": {
+                        "page": page,
+                        "page_size": page_size,
+                        "total": total_count,
+                        "total_pages": (total_count + page_size - 1) // page_size
+                    },
+                    # 关键修改：将 order_no 改为 order_number
+                    "records": [{
+                        "order_id": r['order_id'],
+                        "order_no": r['order_number'],  # 修复字段名
+                        "user_id": r['user_id'],
+                        "user_name": r['user_name'],
+                        "member_level": r['member_level'],
+                        "original_amount": float(r['original_amount']),
+                        "points_discount": float(r['points_discount']),
+                        "total_amount": float(r['total_amount']),
+                        "points_used": float(r['points_used'] or 0),
+                        "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S")
+                    } for r in records]
+                }
 
-        return {
-            "order_id": order.id,
-            "order_no": order.order_no,
-            "is_member_order": bool(order.is_member_order),
-            "total_amount": float(order.total_amount),
-            "original_amount": float(order.original_amount),
-            "reward_summary": {
-                "total_referral_reward": total_referral,
-                "total_team_reward": total_team,
-                "grand_total": total_referral + total_team
-            },
-            "chain": chain
-        }
+    # ==================== 关键修改4：修复返回字段名 ====================
+    def get_transaction_chain_report(self, user_id: int, order_no: Optional[str] = None) -> Dict[str, Any]:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 订单查询
+                if order_no:
+                    cur.execute(
+                        """SELECT id, order_number, total_amount, original_amount, is_member_order
+                           FROM orders WHERE order_number = %s AND user_id = %s""",
+                        (order_no, user_id)
+                    )
+                else:
+                    cur.execute(
+                        """SELECT id, order_number, total_amount, original_amount, is_member_order
+                           FROM orders WHERE user_id = %s
+                           ORDER BY created_at DESC LIMIT 1""",
+                        (user_id,)
+                    )
+                order = cur.fetchone()
+                if not order:
+                    raise FinanceException("未找到订单")
+
+                # 构建推荐链
+                chain = []
+                current_id = user_id
+                level = 0
+
+                while current_id and level < MAX_TEAM_LAYER:
+                    cur.execute(
+                        """SELECT u.id, u.name, u.member_level, ur.referrer_id
+                           FROM users u LEFT JOIN user_referrals ur ON u.id = ur.user_id
+                           WHERE u.id = %s""",
+                        (current_id,)
+                    )
+                    user_info = cur.fetchone()
+                    if not user_info:
+                        break
+
+                    level += 1
+
+                    cur.execute(
+                        """SELECT reward_amount, created_at FROM team_rewards
+                           WHERE order_id = %s AND layer = %s""",
+                        (order['id'], level)
+                    )
+                    team_reward = cur.fetchone()
+
+                    referral_reward = None
+                    if level == 1:
+                        cur.execute(
+                            """SELECT amount FROM pending_rewards
+                               WHERE order_id = %s AND reward_type = 'referral' AND status = 'approved'""",
+                            (order['id'],)
+                        )
+                        ref_reward = cur.fetchone()
+                        if ref_reward:
+                            referral_reward = float(ref_reward['amount'])
+
+                    chain.append({
+                        "layer": level,
+                        "user_id": user_info['id'],
+                        "name": user_info['name'],
+                        "member_level": user_info['member_level'],
+                        "is_referrer": (level == 1),
+                        "referral_reward": referral_reward,
+                        "team_reward": {
+                            "amount": float(team_reward['reward_amount']) if team_reward else 0.00,
+                            "has_reward": team_reward is not None
+                        },
+                        "referrer_id": user_info['referrer_id']
+                    })
+
+                    if not user_info['referrer_id']:
+                        break
+                    current_id = user_info['referrer_id']
+
+                total_referral = chain[0]['referral_reward'] if chain and chain[0]['referral_reward'] else 0.00
+                total_team = sum(item['team_reward']['amount'] for item in chain)
+
+                # 关键修改：将 order_no 改为 order_number
+                return {
+                    "order_id": order['id'],
+                    "order_no": order['order_number'],  # 修复字段名
+                    "is_member_order": bool(order['is_member_order']),
+                    "total_amount": float(order['total_amount']),
+                    "original_amount": float(order['original_amount']),
+                    "reward_summary": {
+                        "total_referral_reward": total_referral,
+                        "total_team_reward": total_team,
+                        "grand_total": total_referral + total_team
+                    },
+                    "chain": chain
+                }
 
 
 # ==================== 订单系统财务功能（来自 order/finance.py） ====================
 
 def split_order_funds(order_number: str, total: Decimal, is_vip: bool):
     """订单分账：将订单金额分配给商家和各个资金池
-    
+
     参数:
         order_number: 订单号
         total: 订单总金额
         is_vip: 是否为会员订单
     """
     from core.database import get_conn
-    
+
     with get_conn() as conn:
         with conn.cursor() as cur:
             # 商家分得 80%
@@ -1353,18 +1428,18 @@ def split_order_funds(order_number: str, total: Decimal, is_vip: bool):
                 "INSERT INTO order_split(order_number,item_type,amount) VALUES(%s,'merchant',%s)",
                 (order_number, merchant)
             )
-            
+
             # 平台分得 20%，再分配到各个资金池
             pool_total = total * Decimal("0.2")
             pools = {
-                "public": 0.01,      # 公益基金
-                "maintain": 0.01,   # 平台维护
-                "subsidy": 0.12,    # 周补贴池
-                "director": 0.02,   # 荣誉董事分红
-                "shop": 0.01,       # 社区店
-                "city": 0.01,       # 城市运营中心
-                "branch": 0.005,    # 大区分公司
-                "fund": 0.015       # 事业发展基金
+                "public": 0.01,  # 公益基金
+                "maintain": 0.01,  # 平台维护
+                "subsidy": 0.12,  # 周补贴池
+                "director": 0.02,  # 荣誉董事分红
+                "shop": 0.01,  # 社区店
+                "city": 0.01,  # 城市运营中心
+                "branch": 0.005,  # 大区分公司
+                "fund": 0.015  # 事业发展基金
             }
             for k, v in pools.items():
                 amt = pool_total * Decimal(str(v))
@@ -1377,12 +1452,12 @@ def split_order_funds(order_number: str, total: Decimal, is_vip: bool):
 
 def reverse_split_on_refund(order_number: str):
     """退款回冲：撤销订单分账
-    
+
     参数:
         order_number: 订单号
     """
     from core.database import get_conn
-    
+
     with get_conn() as conn:
         with conn.cursor() as cur:
             # 回冲商家余额
@@ -1401,15 +1476,15 @@ def reverse_split_on_refund(order_number: str):
 
 def get_balance(merchant_id: int = 1):
     """获取商家余额信息
-    
+
     参数:
         merchant_id: 商家ID，默认为1
-        
+
     返回:
         dict: 包含 balance, bank_name, bank_account 的字典
     """
     from core.database import get_conn
-    
+
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1430,14 +1505,14 @@ def get_balance(merchant_id: int = 1):
 
 def bind_bank(bank_name: str, bank_account: str, merchant_id: int = 1):
     """绑定商家银行信息
-    
+
     参数:
         bank_name: 银行名称
         bank_account: 银行账号
         merchant_id: 商家ID，默认为1
     """
     from core.database import get_conn
-    
+
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1449,16 +1524,16 @@ def bind_bank(bank_name: str, bank_account: str, merchant_id: int = 1):
 
 def withdraw(amount: Decimal, merchant_id: int = 1) -> bool:
     """商家提现
-    
+
     参数:
         amount: 提现金额
         merchant_id: 商家ID，默认为1
-        
+
     返回:
         bool: 提现是否成功
     """
     from core.database import get_conn
-    
+
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1478,13 +1553,13 @@ def withdraw(amount: Decimal, merchant_id: int = 1) -> bool:
 
 def settle_to_merchant(amount: Decimal, merchant_id: int = 1):
     """结算给商家（订单完成后）
-    
+
     参数:
         amount: 结算金额
         merchant_id: 商家ID，默认为1
     """
     from core.database import get_conn
-    
+
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1498,11 +1573,11 @@ def generate_statement():
     """生成商家日账单"""
     from core.database import get_conn
     from datetime import date, timedelta
-    
+
     with get_conn() as conn:
         with conn.cursor() as cur:
             yesterday = date.today() - timedelta(days=1)
-            
+
             # 获取期初余额
             cur.execute(
                 "SELECT closing_balance FROM merchant_statement WHERE merchant_id=1 AND date<%s ORDER BY date DESC LIMIT 1",
@@ -1510,20 +1585,20 @@ def generate_statement():
             )
             row = cur.fetchone()
             opening = row["closing_balance"] if row else Decimal("0")
-            
+
             # 获取当日收入
             cur.execute(
                 "SELECT SUM(amount) AS income FROM order_split WHERE item_type='merchant' AND DATE(created_at)=%s",
                 (yesterday,)
             )
             income = cur.fetchone()["income"] or Decimal("0")
-            
+
             # 当日提现（简化处理，实际应从提现表中查询）
             withdraw_amount = Decimal("0")
-            
+
             # 计算期末余额
             closing = opening + income - withdraw_amount
-            
+
             # 插入或更新账单
             cur.execute(
                 """INSERT INTO merchant_statement(merchant_id,date,opening_balance,income,withdraw,closing_balance)
@@ -1544,14 +1619,14 @@ from fastapi import HTTPException, UploadFile
 
 def save_image(file: UploadFile, folder: Path, max_size: tuple, max_mb: int, quality: int) -> str:
     """保存图片文件
-    
+
     参数:
         file: 上传的文件对象
         folder: 保存目录
         max_size: 最大尺寸 (width, height)
         max_mb: 最大文件大小（MB）
         quality: JPEG 质量 (1-100)
-        
+
     返回:
         str: 图片URL路径
     """
@@ -1572,11 +1647,11 @@ def save_image(file: UploadFile, folder: Path, max_size: tuple, max_mb: int, qua
 
 def calc_max_points_per_item(unit_price_yuan: float, max_points_set: int) -> int:
     """计算每个商品的最大可用积分
-    
+
     参数:
         unit_price_yuan: 商品单价（元）
         max_points_set: 系统设置的最大积分值
-        
+
     返回:
         int: 最大可用积分数
     """

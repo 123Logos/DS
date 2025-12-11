@@ -5,6 +5,7 @@ from enum import IntEnum
 from core.database import get_conn
 import string
 import random  # 在文件头部加这两行
+from enum import IntEnum
 
 
 
@@ -174,12 +175,11 @@ class UserService:
                 old_level = row["member_level"]
                 if old_level == new_level:
                     return old_level
-                cur.execute(
-                    "INSERT INTO audit_log(user_id, op_type, old_val, new_val, reason) VALUES (%s,'SET_LEVEL',%s,%s,%s)",
-                    (row["id"], old_level, new_level, reason)
-                )
+
+                # 更新用户等级
                 cur.execute("UPDATE users SET member_level=%s, level_changed_at=NOW() WHERE mobile=%s",
                             (new_level, mobile))
+                conn.commit()
                 return new_level
 
     @staticmethod
@@ -213,14 +213,9 @@ class UserService:
                     raise ValueError("用户不存在")
 
                 old_status = row["status"]
-                if old_status == new_status:
+                if old_status == int(new_status):
                     return False  # 无变化
 
-                # 写审计（重点：把枚举转 int）
-                cur.execute(
-                    "INSERT INTO audit_log(user_id, op_type, old_val, new_val, reason) VALUES (%s,'SET_STATUS',%s,%s,%s)",
-                    (row["id"], int(old_status), int(new_status), reason)
-                )
                 # 更新状态（重点：把枚举转 int）
                 cur.execute(
                     "UPDATE users SET status=%s WHERE mobile=%s",
