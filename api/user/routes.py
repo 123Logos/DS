@@ -631,13 +631,8 @@ def refer_direct(mobile: str, page: int = 1, size: int = 10):
             u = cur.fetchone()
             if not u:
                 _err("用户不存在")
-            select_sql = build_dynamic_select(
-                cur,
-                "user_referrals",
-                where_clause="referrer_id=%s",
-                select_fields=["COUNT(*) AS c"]
-            )
-            cur.execute(select_sql, (u["id"],))
+            # COUNT(*) 是聚合函数，不能使用 build_dynamic_select，直接使用 SQL
+            cur.execute("SELECT COUNT(*) AS c FROM user_referrals WHERE referrer_id=%s", (u["id"],))
             total = cur.fetchone()["c"]
             cur.execute("""
                 SELECT u.id, u.mobile, u.name, u.member_level, u.created_at
