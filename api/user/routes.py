@@ -5,7 +5,7 @@ import datetime
 from models.schemas.user import (
     SetStatusReq, AuthReq, AuthResp, UpdateProfileReq, SelfDeleteReq,
     FreezeReq, ResetPwdReq, AdminResetPwdReq, SetLevelReq, AddressReq,
-    PointsReq, UserInfoResp
+    PointsReq, UserInfoResp, BindReferrerReq
 )
 
 from core.database import get_conn
@@ -558,36 +558,43 @@ def user_list(
             total = cur.fetchone()["c"]
             return {"rows": rows, "total": total, "page": page, "size": size}
 
-@router.post("/user/bind-referrer", summary="绑定推荐人（动态字段/自动建表）")
-def bind_referrer(mobile: str, referrer_mobile: str):
+@router.post("/user/bind-referrer", summary="绑定推荐人（支持推荐码或手机号）")
+def bind_referrer(body: BindReferrerReq):
+    """
+    优先级：referrer_code > referrer_mobile > 跳过
+    """
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # 1. 被推荐人 & 推荐人 id
-            select_sql = build_dynamic_select(
-                cur,
-                "users",
-                where_clause="mobile=%s",
-                select_fields=["id"]
-            )
-            cur.execute(select_sql, (mobile,))
+            # 1. 被推荐人必须存在
+            select_sql = build_dynamic_select(cur, "users", where_clause="mobile=%s", select_fields=["id"])
+            cur.execute(select_sql, (body.mobile,))
             u = cur.fetchone()
             if not u:
                 raise HTTPException(status_code=404, detail="被推荐人不存在")
             user_id = u["id"]
 
-            select_sql = build_dynamic_select(
-                cur,
-                "users",
-                where_clause="mobile=%s",
-                select_fields=["id"]
-            )
-            cur.execute(select_sql, (referrer_mobile,))
-            ref = cur.fetchone()
-            if not ref:
-                raise HTTPException(status_code=404, detail="推荐人不存在")
-            referrer_id = ref["id"]
+            # 2. 确定推荐人 ID
+            referrer_id = None
+            if body.referrer_code:                      # ① 优先用推荐码
+                select_sql = build_dynamic_select(cur, "users", where_clause="referral_code=%s", select_fields=["id"])
+                cur.execute(select_sql, (body.referrer_code.upper(),))  # 推荐码统一大写
+                ref = cur.fetchone()
+                if not ref:
+                    raise HTTPException(status_code=404, detail="推荐码不存在")
+                referrer_id = ref["id"]
+            elif body.referrer_mobile:                  # ② 其次用手机号
+                select_sql = build_dynamic_select(cur, "users", where_clause="mobile=%s", select_fields=["id"])
+                cur.execute(select_sql, (body.referrer_mobile,))
+                ref = cur.fetchone()
+                if not ref:
+                    raise HTTPException(status_code=404, detail="推荐人手机号不存在")
+                referrer_id = ref["id"]
 
-            # 2. 若 user_referrals 表不存在则自动创建（最简版）
+            # 3. 无推荐人直接返回成功（跳过绑定）
+            if referrer_id is None:
+                return {"msg": "ok"}
+
+            # 4. 自动建表 & 幂等写入（ON DUPLICATE KEY UPDATE）
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS user_referrals (
                     id INT AUTO_INCREMENT PRIMARY KEY,
@@ -597,26 +604,11 @@ def bind_referrer(mobile: str, referrer_mobile: str):
                     UNIQUE KEY uk_uid (user_id)
                 )
             """)
-
-            # 3. 嗅探真实字段
-            cur.execute("SHOW COLUMNS FROM user_referrals")
-            cols = [r["Field"] for r in cur.fetchall()]
-
-            # 4. 准备写入字典
-            data = {"user_id": user_id, "referrer_id": referrer_id}
-            if "created_at" in cols:
-                data["created_at"] = "NOW()"   # 特殊处理 SQL 函数
-
-            # 5. 动态构造 SQL
-            insert_cols = ",".join(data.keys())
-            placeholders = ",".join(["%s" if k != "created_at" else "NOW()" for k in data.keys()])
-            updates = ",".join([f"{k}=VALUES({k})" for k in data.keys() if k != "created_at"])
-            sql = f"""
-                INSERT INTO user_referrals ({insert_cols})
-                VALUES ({placeholders})
-                ON DUPLICATE KEY UPDATE {updates}
-            """
-            cur.execute(sql, tuple(v for k, v in data.items() if k != "created_at"))
+            cur.execute(
+                "INSERT INTO user_referrals(user_id, referrer_id) VALUES (%s,%s) "
+                "ON DUPLICATE KEY UPDATE referrer_id=%s",
+                (user_id, referrer_id, referrer_id)
+            )
             conn.commit()
             return {"msg": "ok"}
 
@@ -675,13 +667,8 @@ def refer_team(mobile: str, max_layer: int = 6):
 def address_add(body: AddressReq):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # 1. 取用户 id
-            select_sql = build_dynamic_select(
-                cur,
-                "users",
-                where_clause="mobile=%s",
-                select_fields=["id"]
-            )
+            # 1. 取用户id
+            select_sql = build_dynamic_select(cur, "users", where_clause="mobile=%s", select_fields=["id"])
             cur.execute(select_sql, (body.mobile,))
             u = cur.fetchone()
             if not u:
@@ -689,69 +676,64 @@ def address_add(body: AddressReq):
             user_id = u["id"]
 
             # 2. 嗅探真实字段
-            cur.execute("SHOW COLUMNS FROM user_addresses")
-            cols = [r["Field"] for r in cur.fetchall()]  # 真实字段名列表
+            cur.execute("SHOW COLUMNS FROM addresses")
+            cols = [r["Field"] for r in cur.fetchall()]
 
-            # 3. 准备待写入字典（键为数据库真实字段）
+            # 3. 只保留表里存在的字段
             data = {
                 "user_id": user_id,
-                "consignee_name": body.name,
-                "consignee_phone": body.phone,
+                "name": body.name,           # 表里字段
+                "phone": body.phone,         # 表里字段
                 "province": body.province,
                 "city": body.city,
                 "district": body.district,
                 "detail": body.detail,
-                "label": body.label,
                 "is_default": body.is_default,
                 "addr_type": body.addr_type,
             }
-            # 可选坐标字段
-            if body.lng is not None:
-                data["lng"] = body.lng
-            if body.lat is not None:
-                data["lat"] = body.lat
-
-            # 4. 过滤掉表不存在的字段
             insert_data = {k: v for k, v in data.items() if k in cols}
             if not insert_data:
-                raise RuntimeError("user_addresses 表无可用字段，请检查表结构")
+                raise RuntimeError("addresses表无可用字段")
 
-            # 5. 构造动态 SQL
+            # 4. 插入
             sql_cols = ",".join(insert_data.keys())
             placeholders = ",".join(["%s"] * len(insert_data))
-            sql = f"INSERT INTO user_addresses({sql_cols}) VALUES ({placeholders})"
+            sql = f"INSERT INTO addresses({sql_cols}) VALUES ({placeholders})"
             cur.execute(sql, tuple(insert_data.values()))
             addr_id = cur.lastrowid
 
-            # 6. 如果新地址设为默认，把同用户其他地址取消默认
+            # 5. 取消其它默认
             if body.is_default:
                 cur.execute(
-                    "UPDATE user_addresses SET is_default=0 WHERE user_id=%s AND id!=%s",
+                    "UPDATE addresses SET is_default=0 WHERE user_id=%s AND id!=%s",
                     (user_id, addr_id)
                 )
             conn.commit()
             return {"addr_id": addr_id}
-@router.put("/address/default", summary="把已有地址设为默认")
+@router.put("/address/default", summary="设为默认地址")
 def set_default_addr(addr_id: int, mobile: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            select_sql = build_dynamic_select(
-                cur,
-                "user_addresses",
-                where_clause="id=%s",
-                select_fields=["user_id"]
-            )
-            cur.execute(select_sql, (addr_id,))
+            # 校验地址存在且属于当前用户
+            cur.execute("SELECT user_id FROM addresses WHERE id=%s", (addr_id,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="地址不存在")
-            user_id = row["user_id"]
-            cur.execute("UPDATE user_addresses SET is_default=0 WHERE user_id=%s", (user_id,))
-            cur.execute("UPDATE user_addresses SET is_default=1 WHERE id=%s", (addr_id,))
+            addr_user_id = row["user_id"]
+
+            select_sql = build_dynamic_select(cur, "users", where_clause="mobile=%s", select_fields=["id"])
+            cur.execute(select_sql, (mobile,))
+            u = cur.fetchone()
+            if not u or u["id"] != addr_user_id:
+                raise HTTPException(status_code=403, detail="地址不属于当前用户")
+
+            # 取消同用户其它默认
+            cur.execute("UPDATE addresses SET is_default=0 WHERE user_id=%s", (addr_user_id,))
+            cur.execute("UPDATE addresses SET is_default=1 WHERE id=%s", (addr_id,))
             conn.commit()
     return {"msg": "ok"}
 
-@router.delete("/address/{addr_id}", summary="删除地址", operation_id="delete_user_address")
+@router.delete("/address/{addr_id}", summary="删除地址")
 def delete_addr(addr_id: int, mobile: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -759,18 +741,15 @@ def delete_addr(addr_id: int, mobile: str):
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="地址不存在")
-            select_sql = build_dynamic_select(
-                cur,
-                "users",
-                where_clause="mobile=%s",
-                select_fields=["id"]
-            )
+            addr_user_id = row["user_id"]
+
+            select_sql = build_dynamic_select(cur, "users", where_clause="mobile=%s", select_fields=["id"])
             cur.execute(select_sql, (mobile,))
             u = cur.fetchone()
-            if not u or u["id"] != row["user_id"]:
+            if not u or u["id"] != addr_user_id:
                 raise HTTPException(status_code=403, detail="地址不属于当前用户")
 
-            cur.execute("DELETE FROM user_addresses WHERE id=%s", (addr_id,))
+            cur.execute("DELETE FROM addresses WHERE id=%s", (addr_id,))
             conn.commit()
     return {"msg": "ok"}
 
@@ -778,103 +757,69 @@ def delete_addr(addr_id: int, mobile: str):
 def address_list(mobile: str, page: int = 1, size: int = 5):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            select_sql = build_dynamic_select(
-                cur,
-                "users",
-                where_clause="mobile=%s",
-                select_fields=["id"]
-            )
+            select_sql = build_dynamic_select(cur, "users", where_clause="mobile=%s", select_fields=["id"])
             cur.execute(select_sql, (mobile,))
             u = cur.fetchone()
             if not u:
-                _err("用户不存在")
+                raise HTTPException(status_code=404, detail="用户不存在")
             rows = AddressService.get_address_list(u["id"], page, size)
             return {"rows": rows}
 
-@router.post("/address/return", summary="商家新增退货地址（可多条，最新一条为默认）")
+@router.post("/address/return", summary="商家新增退货地址")
 def return_addr_set(body: AddressReq):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # 1. 校验商家身份（兼容老表可能缺少 is_merchant 字段）
-            select_sql = build_dynamic_select(
-                cur,
-                "users",
-                where_clause="mobile=%s",
-                select_fields=["id"]
-            )
-            cur.execute(select_sql, (body.mobile,))
-            u = cur.fetchone()
-            if not u:
-                raise HTTPException(status_code=404, detail="商家不存在或未被授予商户身份")
-
-            # 检查是否存在 is_merchant 字段并判断是否为商家
-            cur.execute("SHOW COLUMNS FROM users LIKE 'is_merchant'")
-            col = cur.fetchone()
-            if not col:
-                # 表中没有 is_merchant 字段，视为未被授予商户身份
-                raise HTTPException(status_code=404, detail="商家不存在或未被授予商户身份")
-
-            # 使用动态表访问读取用户的 is_merchant 字段以确认身份
-            select_sql = build_dynamic_select(
-                cur,
-                "users",
-                where_clause="mobile=%s",
-                select_fields=["id", "is_merchant"]
-            )
+            # 1. 校验商家身份
+            select_sql = build_dynamic_select(cur, "users", where_clause="mobile=%s", select_fields=["id", "is_merchant"])
             cur.execute(select_sql, (body.mobile,))
             u2 = cur.fetchone()
             if not u2 or u2.get("is_merchant") != 1:
                 raise HTTPException(status_code=404, detail="商家不存在或未被授予商户身份")
-
             user_id = u2["id"]
 
-            # 2. 嗅探真实字段
-            cur.execute("SHOW COLUMNS FROM user_addresses")
+            # 2. 嗅探字段
+            cur.execute("SHOW COLUMNS FROM addresses")
             cols = [r["Field"] for r in cur.fetchall()]
 
-            # 3. 准备写入字典
+            # 3. 写入数据（仅保留表存在的字段）
             data = {
                 "user_id": user_id,
-                "consignee_name": body.name,
-                "consignee_phone": body.phone,
+                "name": body.name,
+                "phone": body.phone,
                 "province": body.province,
                 "city": body.city,
                 "district": body.district,
                 "detail": body.detail,
-                "label": body.label,
-                "is_default": True,   # 新地址设为默认
+                "is_default": True,
                 "addr_type": "return",
             }
-            if body.lng is not None:
-                data["lng"] = body.lng
-            if body.lat is not None:
-                data["lat"] = body.lat
-
-            # 4. 过滤掉表不存在的字段
             insert_data = {k: v for k, v in data.items() if k in cols}
-            if not insert_data:
-                raise RuntimeError("user_addresses 表无可用字段，请检查表结构")
 
-            # 5. 把该商家其他退货地址取消默认
-            if "addr_type" in cols:
-                cur.execute(
-                    "UPDATE user_addresses SET is_default=0 WHERE user_id=%s AND addr_type='return'",
-                    (user_id,)
-                )
-            else:
-                cur.execute(
-                    "UPDATE user_addresses SET is_default=0 WHERE user_id=%s",
-                    (user_id,)
-                )
-
-            # 6. 插入新退货地址
+            # 4. 取消其它退货默认
+            cur.execute("UPDATE addresses SET is_default=0 WHERE user_id=%s AND addr_type='return'", (user_id,))
+            # 5. 插入
             sql_cols = ",".join(insert_data.keys())
             placeholders = ",".join(["%s"] * len(insert_data))
-            sql = f"INSERT INTO user_addresses({sql_cols}) VALUES ({placeholders})"
+            sql = f"INSERT INTO addresses({sql_cols}) VALUES ({placeholders})"
             cur.execute(sql, tuple(insert_data.values()))
             addr_id = cur.lastrowid
             conn.commit()
             return {"addr_id": addr_id}
+
+
+@router.get("/address/return", summary="查看退货地址")
+def return_addr_get(mobile: str):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            select_sql = build_dynamic_select(cur, "users", where_clause="mobile=%s", select_fields=["id"])
+            cur.execute(select_sql, (mobile,))
+            u = cur.fetchone()
+            if not u:
+                raise HTTPException(status_code=404, detail="商家不存在")
+            addr = AddressService.get_default_address(u["id"])
+            if not addr:
+                raise HTTPException(status_code=404, detail="未设置退货地址")
+            return addr
 
 @router.get("/address/return", summary="查看退货地址")
 def return_addr_get(mobile: str):
@@ -1005,54 +950,54 @@ def reward_by_order(order_id: int):
     return {"rows": rows}
 
 # 董事模块
-@router.post("/director/try-promote", summary="晋升荣誉董事")
-def director_try_promote(user_id: int):
-    ok = DirectorService.try_promote(user_id)
-    return {"success": ok}
-
-@router.get("/director/is", summary="是否荣誉董事")
-def director_is(user_id: int):
-    return {"is_director": DirectorService.is_director(user_id)}
-
-@router.get("/director/dividend", summary="分红明细")
-def director_dividend(user_id: int, page: int = 1, size: int = 10):
-    rows = DirectorService.get_dividend_detail(user_id, page, size)
-    return {"rows": rows}
-
-@router.get("/director/list", summary="所有活跃董事")
-def director_list(page: int = 1, size: int = 10):
-    rows = DirectorService.list_all_directors(page, size)
-    return {"rows": rows}
-
-@router.post("/director/calc-week", summary="手动触发周分红（仅内部）")
-def director_calc_week(period: datetime.date):
-    total_paid = DirectorService.calc_week_dividend(period)
-    return {"total_paid": total_paid}
-
-# 审计日志
-@router.get("/audit", summary="等级变动审计")
-def audit_list(mobile: str = None, page: int = 1, size: int = 10):
-    where, args = "", []
-    if mobile:
-        where = "WHERE u.mobile=%s"
-        args.append(mobile)
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            count_sql = f"SELECT COUNT(*) AS c FROM audit_log a JOIN users u ON u.id=a.user_id {where}"
-            cur.execute(count_sql, tuple(args))
-            total = cur.fetchone()["c"]
-            sql = f"""
-                SELECT u.mobile, a.old_val, a.new_val, a.reason, a.created_at
-                FROM audit_log a
-                JOIN users u ON u.id=a.user_id
-                {where}
-                ORDER BY a.created_at DESC
-                LIMIT %s OFFSET %s
-            """
-            args.extend([size, (page - 1) * size])
-            cur.execute(sql, tuple(args))
-            rows = cur.fetchall()
-            return {"rows": rows, "total": total, "page": page, "size": size}
+# @router.post("/director/try-promote", summary="晋升荣誉董事")
+# def director_try_promote(user_id: int):
+#     ok = DirectorService.try_promote(user_id)
+#     return {"success": ok}
+#
+# @router.get("/director/is", summary="是否荣誉董事")
+# def director_is(user_id: int):
+#     return {"is_director": DirectorService.is_director(user_id)}
+#
+# @router.get("/director/dividend", summary="分红明细")
+# def director_dividend(user_id: int, page: int = 1, size: int = 10):
+#     rows = DirectorService.get_dividend_detail(user_id, page, size)
+#     return {"rows": rows}
+#
+# @router.get("/director/list", summary="所有活跃董事")
+# def director_list(page: int = 1, size: int = 10):
+#     rows = DirectorService.list_all_directors(page, size)
+#     return {"rows": rows}
+#
+# @router.post("/director/calc-week", summary="手动触发周分红（仅内部）")
+# def director_calc_week(period: datetime.date):
+#     total_paid = DirectorService.calc_week_dividend(period)
+#     return {"total_paid": total_paid}
+#
+# # 审计日志
+# @router.get("/audit", summary="等级变动审计")
+# def audit_list(mobile: str = None, page: int = 1, size: int = 10):
+#     where, args = "", []
+#     if mobile:
+#         where = "WHERE u.mobile=%s"
+#         args.append(mobile)
+#     with get_conn() as conn:
+#         with conn.cursor() as cur:
+#             count_sql = f"SELECT COUNT(*) AS c FROM audit_log a JOIN users u ON u.id=a.user_id {where}"
+#             cur.execute(count_sql, tuple(args))
+#             total = cur.fetchone()["c"]
+#             sql = f"""
+#                 SELECT u.mobile, a.old_val, a.new_val, a.reason, a.created_at
+#                 FROM audit_log a
+#                 JOIN users u ON u.id=a.user_id
+#                 {where}
+#                 ORDER BY a.created_at DESC
+#                 LIMIT %s OFFSET %s
+#             """
+#             args.extend([size, (page - 1) * size])
+#             cur.execute(sql, tuple(args))
+#             rows = cur.fetchall()
+#             return {"rows": rows, "total": total, "page": page, "size": size}
 
 @router.post("/user/grant-merchant", summary="后台赋予商户身份（动态字段/自动升级表）")
 def grant_merchant(mobile: str, admin_key: str):
