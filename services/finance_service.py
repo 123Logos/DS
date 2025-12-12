@@ -1,4 +1,9 @@
-# finance_service.py - 业务逻辑与项目2完全一致
+# finance_service.py - 已同步database_setup字段变更
+# **重要变更说明**：
+# 1. 原points字段不再参与积分运算，所有积分逻辑改用member_points（会员积分）
+# 2. 所有积分字段类型为DECIMAL(12,4)，需使用Decimal类型处理，禁止int()转换
+# 3. merchant_points同步支持小数精度处理
+
 import logging
 from decimal import Decimal
 from datetime import datetime, timedelta
@@ -15,7 +20,6 @@ from core.exceptions import FinanceException, OrderException, InsufficientBalanc
 from core.logging import get_logger
 from core.table_access import build_dynamic_select, get_table_structure
 
-# 使用统一的日志配置
 logger = get_logger(__name__)
 
 
@@ -88,7 +92,7 @@ class FinanceService:
             logger.error(f"查询用户余额失败: {e}")
             return Decimal('0')
 
-    # ==================== 关键修改1：商品查询使用 LEFT JOIN product_skus ====================
+    # ==================== 关键修改1：积分字段从points改为member_points ====================
     def settle_order(self, order_no: str, user_id: int, product_id: int, quantity: int = 1,
                      points_to_use: Decimal = Decimal('0')) -> int:
         logger.debug(f"订单结算开始: {order_no}")
@@ -124,13 +128,14 @@ class FinanceService:
                 original_amount = unit_price * quantity
 
                 # 使用动态表访问获取用户信息，使用 FOR UPDATE 锁定行
+                # 关键修改：查询member_points而非points，使用Decimal类型
                 with get_conn() as conn:
                     with conn.cursor() as cur:
                         select_sql = build_dynamic_select(
                             cur,
                             "users",
                             where_clause="id=%s",
-                            select_fields=["member_level", "points"]
+                            select_fields=["member_level", "member_points"]  # 修改：member_points替代points
                         )
                         select_sql += " FOR UPDATE"
                         cur.execute(select_sql, (user_id,))
@@ -140,12 +145,13 @@ class FinanceService:
                         # 创建类似的对象以保持兼容性
                         user = type('obj', (object,), {
                             'member_level': row.get('member_level', 0) or 0,
-                            'points': Decimal(str(row.get('points', 0) or 0))
+                            'member_points': Decimal(str(row.get('member_points', 0) or 0))  # 修改：DECIMAL类型
                         })()
 
                 points_discount = Decimal('0')
                 final_amount = original_amount
 
+                # 关键修改：使用member_points进行积分抵扣计算
                 if not product['is_member_product'] and points_to_use > Decimal('0'):
                     self._apply_points_discount(user_id, user, points_to_use, original_amount)
                     points_discount = points_to_use * POINTS_DISCOUNT_RATE
@@ -168,8 +174,10 @@ class FinanceService:
             logger.error(f"订单结算失败: {e}")
             raise
 
+    # ==================== 关键修改2：member_points积分抵扣逻辑 ====================
     def _apply_points_discount(self, user_id: int, user, points_to_use: Decimal, amount: Decimal) -> None:
-        user_points = Decimal(str(user.points))
+        # 关键修改：使用member_points字段进行积分校验
+        user_points = Decimal(str(user.member_points))
         if user_points < points_to_use:
             raise OrderException(f"积分不足，当前{user_points:.4f}分")
 
@@ -177,8 +185,9 @@ class FinanceService:
         if points_to_use > max_discount_points:
             raise OrderException(f"积分抵扣不能超过订单金额的50%（最多{max_discount_points:.4f}分）")
 
+        # 关键修改：扣减member_points，并更新company_points池
         self.session.execute(
-            "UPDATE users SET points = points - %s WHERE id = %s",
+            "UPDATE users SET member_points = member_points - %s WHERE id = %s",
             {"points": points_to_use, "user_id": user_id}
         )
         self.session.execute(
@@ -217,6 +226,7 @@ class FinanceService:
         )
         return order_id
 
+    # ==================== 关键修改3：member_points积分发放 ====================
     def _process_member_order(self, order_id: int, user_id: int, user,
                               unit_price: Decimal, quantity: int) -> None:
         total_amount = unit_price * quantity
@@ -230,8 +240,9 @@ class FinanceService:
             {"level": new_level, "user_id": user_id}
         )
 
+        # 关键修改：发放member_points积分（DECIMAL类型）
         points_earned = unit_price * quantity
-        new_points_dec = self._update_user_balance(user_id, 'points', points_earned)
+        new_points_dec = self._update_user_balance(user_id, 'member_points', points_earned)
         # 使用 helper 插入 points_log
         self._insert_points_log(user_id=user_id,
                                 change_amount=points_earned,
@@ -353,10 +364,11 @@ class FinanceService:
                 if purpose == AllocationKey.PUBLIC_WELFARE:
                     logger.debug(f"公益基金获得: ¥{alloc_amount}")
 
+        # 关键修改：member_level>=1的用户发放member_points积分
         if member_level >= 1:
             points_earned = final_amount
-            # 使用 helper 更新用户积分并返回新积分
-            new_points_dec = self._update_user_balance(user_id, 'points', points_earned)
+            # 使用 helper 更新用户member_points并返回新积分
+            new_points_dec = self._update_user_balance(user_id, 'member_points', points_earned)
             self._insert_points_log(user_id=user_id,
                                     change_amount=points_earned,
                                     balance_after=new_points_dec,
@@ -365,6 +377,7 @@ class FinanceService:
                                     related_order=order_id)
             logger.debug(f"用户获得积分: {points_earned:.4f}")
 
+        # 关键修改：处理商家的merchant_points（DECIMAL精度）
         if merchant_id != PLATFORM_MERCHANT_ID:
             merchant_points = final_amount * Decimal('0.20')
             if merchant_points > Decimal('0'):
@@ -449,10 +462,10 @@ class FinanceService:
                 cur.execute("SHOW COLUMNS FROM pending_rewards")
                 columns = cur.fetchall()
                 column_names = [col['Field'] for col in columns]
-                
+
                 # 资产字段列表（需要降级默认值的字段）
                 asset_fields = ['amount']
-                
+
                 # 动态构造 SELECT 字段列表，对资产字段做降级默认值处理
                 select_fields = []
                 for col_name in column_names:
@@ -461,10 +474,10 @@ class FinanceService:
                         select_fields.append(f"COALESCE(pr.{col_name}, 0) AS {col_name}")
                     else:
                         select_fields.append(f"pr.{col_name}")
-                
+
                 # 添加用户名称字段
                 select_fields.append("u.name AS user_name")
-                
+
                 # 构造完整的 SELECT 语句
                 params = [status, limit]
                 sql = f"""SELECT {', '.join(select_fields)}
@@ -476,7 +489,7 @@ class FinanceService:
 
                 cur.execute(sql, tuple(params))
                 rewards = cur.fetchall()
-                
+
                 # 动态构造返回结果
                 result = []
                 for r in rewards:
@@ -487,15 +500,18 @@ class FinanceService:
                         if col_name in asset_fields:
                             reward_dict[col_name] = float(value) if value is not None else 0.0
                         elif col_name == 'created_at' and value:
-                            reward_dict[col_name] = value.strftime("%Y-%m-%d %H:%M:%S") if hasattr(value, 'strftime') else str(value)
+                            reward_dict[col_name] = value.strftime("%Y-%m-%d %H:%M:%S") if hasattr(value,
+                                                                                                   'strftime') else str(
+                                value)
                         else:
                             reward_dict[col_name] = value
                     # 添加用户名称
                     reward_dict['user_name'] = r.get('user_name')
                     result.append(reward_dict)
-                
+
                 return result
 
+    # ==================== 关键修改4：退款逻辑使用member_points ====================
     def refund_order(self, order_no: str) -> bool:
         try:
             with self.session.begin():
@@ -540,9 +556,10 @@ class FinanceService:
                                 # 如果 user_id 存在，确保它在最前面
                                 fields_list = [f.strip() for f in select_fields.split(",")]
                                 # 移除 user_id（如果存在）
-                                fields_list = [f for f in fields_list if f != 'user_id' and not f.startswith('user_id ')]
+                                fields_list = [f for f in fields_list if
+                                               f != 'user_id' and not f.startswith('user_id ')]
                                 select_fields = "user_id, " + ", ".join(fields_list)
-                    
+
                     result = self.session.execute(
                         f"SELECT {select_fields} FROM team_rewards WHERE order_id = %s",
                         {"order_id": order.id}
@@ -555,9 +572,10 @@ class FinanceService:
                             {"amount": reward.reward_amount, "user_id": reward.user_id}
                         )
 
+                    # 关键修改：退款时扣减member_points（不再是points）
                     user_points = Decimal(str(order.original_amount))
                     self.session.execute(
-                        "UPDATE users SET points = GREATEST(points - %s, 0) WHERE id = %s",
+                        "UPDATE users SET member_points = GREATEST(member_points - %s, 0) WHERE id = %s",
                         {"points": user_points, "user_id": user_id}
                     )
                     self.session.execute(
@@ -594,6 +612,7 @@ class FinanceService:
             logger.error(f"❌ 退款失败: {e}")
             return False
 
+    # ==================== 关键修改5：周补贴使用member_points和merchant_points ====================
     def distribute_weekly_subsidy(self) -> bool:
         logger.info("周补贴发放开始（优惠券形式）")
 
@@ -603,20 +622,23 @@ class FinanceService:
             return False
 
         # 使用动态表访问检查字段是否存在，然后使用 SUM 聚合
+        # 关键修改：member_points替代points
         with get_conn() as conn:
             with conn.cursor() as cur:
                 structure = get_table_structure(cur, "users", use_cache=False)
-                # 检查 points 字段是否存在
-                if "points" in structure['fields']:
-                    cur.execute("SELECT SUM(COALESCE(points, 0)) as total FROM users WHERE COALESCE(points, 0) > 0")
+                # 检查 member_points 字段是否存在
+                if "member_points" in structure['fields']:
+                    cur.execute(
+                        "SELECT SUM(COALESCE(member_points, 0)) as total FROM users WHERE COALESCE(member_points, 0) > 0")
                     row = cur.fetchone()
                     user_points = Decimal(str(row.get('total', 0) or 0))
                 else:
                     user_points = Decimal('0')
-                
+
                 # 检查 merchant_points 字段是否存在
                 if "merchant_points" in structure['fields']:
-                    cur.execute("SELECT SUM(COALESCE(merchant_points, 0)) as total FROM users WHERE COALESCE(merchant_points, 0) > 0")
+                    cur.execute(
+                        "SELECT SUM(COALESCE(merchant_points, 0)) as total FROM users WHERE COALESCE(merchant_points, 0) > 0")
                     row = cur.fetchone()
                     merchant_points = Decimal(str(row.get('total', 0) or 0))
                 else:
@@ -643,28 +665,30 @@ class FinanceService:
         today = datetime.now().date()
         valid_to = today + timedelta(days=COUPON_VALID_DAYS)
 
-        # 使用动态表访问获取用户积分信息
+        # 使用动态表访问获取用户member_points积分信息
         with get_conn() as conn:
             with conn.cursor() as cur:
                 structure = get_table_structure(cur, "users", use_cache=False)
-                if "points" in structure['fields']:
+                if "member_points" in structure['fields']:
                     select_sql = build_dynamic_select(
                         cur,
                         "users",
-                        where_clause="COALESCE(points, 0) > 0",
-                        select_fields=["id", "points"]
+                        where_clause="COALESCE(member_points, 0) > 0",
+                        select_fields=["id", "member_points"]
                     )
                     cur.execute(select_sql)
                     users_data = cur.fetchall()
                     # 转换为类似的对象列表以保持兼容性
-                    users = [type('obj', (object,), {'id': row['id'], 'points': Decimal(str(row.get('points', 0) or 0))})() for row in users_data]
+                    users = [type('obj', (object,),
+                                  {'id': row['id'], 'member_points': Decimal(str(row.get('member_points', 0) or 0))})()
+                             for row in users_data]
                 else:
                     users = []
 
         try:
             with self.session.begin():
                 for user in users:
-                    user_points = Decimal(str(user.points))
+                    user_points = Decimal(str(user.member_points))
                     subsidy_amount = user_points * points_value
                     deduct_points = subsidy_amount / points_value if points_value > 0 else Decimal('0')
 
@@ -684,8 +708,9 @@ class FinanceService:
                     coupon_id = result.lastrowid
 
                     new_points = user_points - deduct_points
+                    # 关键修改：扣减member_points
                     self.session.execute(
-                        "UPDATE users SET points = %s WHERE id = %s",
+                        "UPDATE users SET member_points = %s WHERE id = %s",
                         {"points": new_points, "user_id": user.id}
                     )
 
@@ -705,6 +730,7 @@ class FinanceService:
                     total_distributed += subsidy_amount
                     logger.info(f"用户{user.id}: 优惠券¥{subsidy_amount:.4f}, 扣积分{deduct_points:.4f}")
 
+                # 处理商家的merchant_points
                 result = self.session.execute("SELECT id, merchant_points FROM users WHERE merchant_points > 0")
                 merchants = result.fetchall()
 
@@ -729,6 +755,7 @@ class FinanceService:
                     coupon_id = result.lastrowid
 
                     new_points = merchant_points - deduct_points
+                    # 关键修改：扣减merchant_points
                     self.session.execute(
                         "UPDATE users SET merchant_points = %s WHERE id = %s",
                         {"points": new_points, "user_id": merchant.id}
@@ -826,7 +853,7 @@ class FinanceService:
                 with conn.cursor() as cur:
                     cur.execute("SHOW COLUMNS FROM withdrawals")
                     columns = cur.fetchall()
-            
+
             # 识别资产字段关键词（数值类型字段）
             asset_keywords = ['balance', 'points', 'amount', 'total', 'frozen', 'available', 'tax']
             select_fields = []
@@ -836,13 +863,13 @@ class FinanceService:
                 # 如果是资产相关字段（字段名包含资产关键词）且为数值类型，添加降级默认值
                 is_asset_field = any(keyword in field_name.lower() for keyword in asset_keywords)
                 is_numeric_type = 'DECIMAL' in field_type or 'INT' in field_type or 'FLOAT' in field_type or 'DOUBLE' in field_type
-                
+
                 if is_asset_field and is_numeric_type:
                     # 对资产字段做降级默认值（不存在或为NULL时返回0）
                     select_fields.append(f"COALESCE({field_name}, 0) AS {field_name}")
                 else:
                     select_fields.append(field_name)
-            
+
             # 动态构造 SELECT 语句，使用 self.session 执行（确保在同一事务中）
             select_sql = f"SELECT {', '.join(select_fields)} FROM withdrawals WHERE id = :withdrawal_id FOR UPDATE"
             result = self.session.execute(select_sql, {"withdrawal_id": withdrawal_id})
@@ -949,11 +976,12 @@ class FinanceService:
                                   remark=remark)
         return balance_after
 
+    # 关键修改：points_log插入支持DECIMAL(12,4)精度
     def _insert_points_log(self, user_id: int, change_amount: Decimal, balance_after: Decimal, type: str, reason: str,
                            related_order: Optional[int] = None) -> None:
         """插入 `points_log` 记录。change_amount 和 balance_after 使用 Decimal 类型，支持小数点后4位精度。"""
         self.session.execute(
-            """INSERT INTO points_log (user_id, change_amount, balance_after, points_type, reason, related_order, created_at)
+            """INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at)
                VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
             {
                 "user_id": user_id,
@@ -965,10 +993,12 @@ class FinanceService:
             }
         )
 
+    # 关键修改：使用COALESCE处理DECIMAL字段
     def _update_user_balance(self, user_id: int, field: str, delta: Decimal) -> Decimal:
         """对 `users` 表的指定余额字段做增减，并返回更新后的值。
         注意：`field` 必须是受信任的字段名（由调用处保证）。"""
         # 使用字符串插值构造字段位置（确保调用方只传入受控字段名）
+        # 关键修改：使用COALESCE处理DECIMAL字段，避免NULL值
         self.session.execute(
             f"UPDATE users SET {field} = COALESCE({field}, 0) + %s WHERE id = %s",
             {"delta": delta, "user_id": user_id}
@@ -1089,7 +1119,8 @@ class FinanceService:
                     )
                     cur.execute(select_sql, (referrer_id,))
                     row = cur.fetchone()
-                    referrer = type('obj', (object,), {'member_level': row.get('member_level', 0) or 0 if row else 0})() if row else None
+                    referrer = type('obj', (object,),
+                                    {'member_level': row.get('member_level', 0) or 0 if row else 0})() if row else None
             if not referrer:
                 raise FinanceException(f"推荐人不存在: {referrer_id}")
 
@@ -1209,12 +1240,14 @@ class FinanceService:
             logger.error(f"❌ 荣誉董事审核失败: {e}")
             return False
 
+    # ==================== 关键修改6：get_user_info使用member_points ====================
     def get_user_info(self, user_id: int) -> Dict[str, Any]:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 # 用户主信息
+                # 关键修改：查询member_points而非points
                 cur.execute(
-                    """SELECT id, mobile, name, member_level, points, promotion_balance,
+                    """SELECT id, mobile, name, member_level, member_points, promotion_balance,
                        merchant_points, merchant_balance, status
                        FROM users WHERE id = %s""",
                     (user_id,)
@@ -1233,7 +1266,8 @@ class FinanceService:
 
                 # 角色判定
                 roles = []
-                if user['points'] > 0 or user['promotion_balance'] > 0:
+                # 关键修改：使用member_points判断用户角色
+                if user['member_points'] > 0 or user['promotion_balance'] > 0:
                     roles.append("普通用户")
                 if user['merchant_points'] > 0 or user['merchant_balance'] > 0:
                     roles.append("商家")
@@ -1246,7 +1280,7 @@ class FinanceService:
                     "mobile": user['mobile'],
                     "name": user['name'],
                     "member_level": user['member_level'],
-                    "points": user['points'],
+                    "member_points": user['member_points'],  # 修改：返回member_points
                     "promotion_balance": float(user['promotion_balance']),
                     "merchant_points": user['merchant_points'],
                     "merchant_balance": float(user['merchant_balance']),
@@ -1280,11 +1314,13 @@ class FinanceService:
                     "created_at": c['created_at'].strftime("%Y-%m-%d %H:%M:%S")
                 } for c in coupons]
 
+    # ==================== 关键修改7：财务报告使用member_points ====================
     def get_finance_report(self) -> Dict[str, Any]:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 # 用户资产
-                cur.execute("SELECT SUM(points) as points, SUM(promotion_balance) as balance FROM users")
+                # 关键修改：SUM(member_points)替代SUM(points)
+                cur.execute("SELECT SUM(member_points) as points, SUM(promotion_balance) as balance FROM users")
                 user = cur.fetchone()
 
                 # 商家资产
@@ -1296,7 +1332,7 @@ class FinanceService:
                 # 先获取表结构
                 cur.execute("SHOW COLUMNS FROM finance_accounts")
                 columns = cur.fetchall()
-                
+
                 # 识别资产字段关键词（数值类型字段）
                 asset_keywords = ['balance', 'points', 'amount', 'total', 'frozen', 'available']
                 select_fields = []
@@ -1306,13 +1342,13 @@ class FinanceService:
                     # 如果是资产相关字段（字段名包含资产关键词）且为数值类型，添加降级默认值
                     is_asset_field = any(keyword in field_name.lower() for keyword in asset_keywords)
                     is_numeric_type = 'DECIMAL' in field_type or 'INT' in field_type or 'FLOAT' in field_type or 'DOUBLE' in field_type
-                    
+
                     if is_asset_field and is_numeric_type:
                         # 对资产字段做降级默认值（不存在或为NULL时返回0）
                         select_fields.append(f"COALESCE({field_name}, 0) AS {field_name}")
                     else:
                         select_fields.append(field_name)
-                
+
                 # 动态构造 SELECT 语句
                 select_sql = f"SELECT {', '.join(select_fields)} FROM finance_accounts"
                 cur.execute(select_sql)
@@ -1337,11 +1373,13 @@ class FinanceService:
 
                 return {
                     "user_assets": {
-                        "total_points": int(user['points'] or 0),
+                        # 关键修改：返回member_points
+                        "total_member_points": float(user['points'] or 0),  # 修改：明确member_points
+                        "total_points": float(user['points'] or 0),  # 兼容旧接口
                         "total_balance": float(user['balance'] or 0)
                     },
                     "merchant_assets": {
-                        "total_points": int(merchant['points'] or 0),
+                        "total_merchant_points": float(merchant['points'] or 0),
                         "total_balance": float(merchant['balance'] or 0)
                     },
                     "platform_pools": platform_pools,
@@ -1365,7 +1403,7 @@ class FinanceService:
                 # 获取表结构
                 cur.execute("SHOW COLUMNS FROM account_flow")
                 columns = cur.fetchall()
-                
+
                 # 识别资产字段（DECIMAL 类型字段）
                 asset_fields = set()
                 all_fields = []
@@ -1376,7 +1414,7 @@ class FinanceService:
                     # 判断是否为资产字段（DECIMAL 类型）
                     if 'DECIMAL' in field_type or 'FLOAT' in field_type or 'DOUBLE' in field_type:
                         asset_fields.add(field_name)
-                
+
                 # 动态构造 SELECT 语句，对资产字段做降级默认值处理
                 select_parts = []
                 for field in all_fields:
@@ -1385,11 +1423,11 @@ class FinanceService:
                         select_parts.append(f"COALESCE({field}, 0) AS {field}")
                     else:
                         select_parts.append(field)
-                
+
                 sql = f"SELECT {', '.join(select_parts)} FROM account_flow ORDER BY created_at DESC LIMIT %s"
                 cur.execute(sql, (limit,))
                 flows = cur.fetchall()
-                
+
                 # 格式化返回结果
                 result = []
                 for f in flows:
@@ -1408,17 +1446,19 @@ class FinanceService:
                         else:
                             item[field] = value
                     result.append(item)
-                
+
                 return result
 
+    # ==================== 关键修改8：积分流水报告使用member_points ====================
     def get_points_flow_report(self, user_id: Optional[int] = None, limit: int = 50) -> List[Dict[str, Any]]:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 params = [limit]
                 sql = """SELECT id, user_id, change_amount, balance_after, type, reason, related_order, created_at
-                         FROM points_log"""
+                         FROM points_log WHERE type = 'member'"""
+                # 修改：只查询member类型的积分流水
                 if user_id:
-                    sql += " WHERE user_id = %s"
+                    sql += " AND user_id = %s"
                     params.insert(0, user_id)
                 sql += " ORDER BY created_at DESC LIMIT %s"
 
@@ -1443,7 +1483,7 @@ class FinanceService:
                 cur.execute("SHOW COLUMNS FROM weekly_subsidy_records")
                 columns = cur.fetchall()
                 column_names = [col['Field'] for col in columns]
-                
+
                 # 识别资产字段关键词（数值类型字段）
                 asset_keywords = ['amount', 'points', 'balance', 'total', 'frozen', 'available']
                 select_fields = []
@@ -1454,17 +1494,17 @@ class FinanceService:
                     # 如果是资产相关字段（字段名包含资产关键词）且为数值类型，添加降级默认值
                     is_asset_field = any(keyword in field_name.lower() for keyword in asset_keywords)
                     is_numeric_type = 'DECIMAL' in field_type or 'INT' in field_type or 'FLOAT' in field_type or 'DOUBLE' in field_type
-                    
+
                     if is_asset_field and is_numeric_type:
                         # 对资产字段做降级默认值（不存在或为NULL时返回0）
                         select_fields.append(f"COALESCE(wsr.{field_name}, 0) AS {field_name}")
                         asset_fields.append(field_name)
                     else:
                         select_fields.append(f"wsr.{field_name}")
-                
+
                 # 添加用户名称字段
                 select_fields.append("u.name AS user_name")
-                
+
                 # 构造完整的 SELECT 语句
                 params = [limit]
                 sql = f"""SELECT {', '.join(select_fields)}
@@ -1477,7 +1517,7 @@ class FinanceService:
 
                 cur.execute(sql, tuple(params))
                 records = cur.fetchall()
-                
+
                 # 动态构造返回结果
                 result = []
                 for r in records:
@@ -1488,16 +1528,17 @@ class FinanceService:
                         if col_name in asset_fields:
                             record_dict[col_name] = float(value) if value is not None else 0.0
                         elif col_name == 'week_start' and value:
-                            record_dict[col_name] = value.strftime("%Y-%m-%d") if hasattr(value, 'strftime') else str(value)
+                            record_dict[col_name] = value.strftime("%Y-%m-%d") if hasattr(value, 'strftime') else str(
+                                value)
                         else:
                             record_dict[col_name] = value
                     # 添加用户名称
                     record_dict['user_name'] = r.get('user_name')
                     result.append(record_dict)
-                
+
                 return result
 
-    # ==================== 关键修改2 & 3：修复返回字段名 ====================
+    # ==================== 关键修改9：积分抵扣报表使用member_points ====================
     def get_points_deduction_report(self, start_date: str, end_date: str, page: int = 1, page_size: int = 20) -> Dict[
         str, Any]:
         with get_conn() as conn:
@@ -1540,6 +1581,7 @@ class FinanceService:
                 return {
                     "summary": {
                         "total_orders": summary['total_orders'] or 0,
+                        # 关键修改：返回float类型的积分总量
                         "total_points_used": float(summary['total_points'] or 0),
                         "total_discount_amount": float(summary['total_discount_amount'] or 0)
                     },
@@ -1564,7 +1606,7 @@ class FinanceService:
                     } for r in records]
                 }
 
-    # ==================== 关键修改4：修复返回字段名 ====================
+    # ==================== 关键修改10：交易链报表 ====================
     def get_transaction_chain_report(self, user_id: int, order_no: Optional[str] = None) -> Dict[str, Any]:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -1584,8 +1626,20 @@ class FinanceService:
                     )
                 order = cur.fetchone()
                 if not order:
-                    raise FinanceException("未找到订单")
-
+                    logger.info(f"用户 {user_id} 无订单记录，返回空交易链")
+                    return {
+                        "order_id": None,
+                        "order_no": None,
+                        "is_member_order": False,
+                        "total_amount": 0.0,
+                        "original_amount": 0.0,
+                        "reward_summary": {
+                            "total_referral_reward": 0.0,
+                            "total_team_reward": 0.0,
+                            "grand_total": 0.0
+                        },
+                        "chain": []  # 空链
+                    }
                 # 构建推荐链
                 chain = []
                 current_id = user_id
@@ -1609,7 +1663,7 @@ class FinanceService:
                     # 确保包含 created_at 字段（如果不存在则使用 NULL）
                     if 'created_at' not in existing_columns:
                         select_fields = select_fields + ", NULL AS created_at"
-                    
+
                     cur.execute(
                         f"SELECT {select_fields} FROM team_rewards WHERE order_id = %s AND layer = %s",
                         (order['id'], level)
@@ -1669,11 +1723,11 @@ class FinanceService:
 def _build_team_rewards_select(cursor, asset_fields: List[str] = None) -> tuple:
     """
     动态构造 team_rewards 表的 SELECT 语句
-    
+
     Args:
         cursor: 数据库游标
         asset_fields: 资产字段列表，如果字段不存在则使用默认值 0
-    
+
     Returns:
         (select_fields_str, existing_columns_set) 元组
         - select_fields_str: 构造的 SELECT 语句（不包含 FROM 子句）
@@ -1681,23 +1735,23 @@ def _build_team_rewards_select(cursor, asset_fields: List[str] = None) -> tuple:
     """
     if asset_fields is None:
         asset_fields = ['reward_amount']
-    
+
     # 获取表结构
     cursor.execute("SHOW COLUMNS FROM team_rewards")
     columns = cursor.fetchall()
     existing_columns = {col['Field'] for col in columns}
-    
+
     # 构造 SELECT 字段列表
     select_fields = []
     for col in columns:
         field_name = col['Field']
         select_fields.append(field_name)
-    
+
     # 对于资产字段，如果不存在则添加默认值
     for asset_field in asset_fields:
         if asset_field not in existing_columns:
             select_fields.append(f"0 AS {asset_field}")
-    
+
     return ", ".join(select_fields), existing_columns
 
 
@@ -1734,7 +1788,7 @@ def split_order_funds(order_number: str, total: Decimal, is_vip: bool, cursor=No
 
 def _execute_split(cur, order_number: str, total: Decimal):
     """执行订单分账逻辑（内部函数）
-    
+
     参数:
         cur: 数据库游标
         order_number: 订单号
@@ -1742,13 +1796,13 @@ def _execute_split(cur, order_number: str, total: Decimal):
     """
     # 商家分得 80%
     merchant = total * Decimal("0.8")
-    
+
     # 更新商家余额（使用 merchant_balance 表）
     cur.execute(
         "UPDATE merchant_balance SET balance=balance+%s WHERE merchant_id=1",
         (merchant,)
     )
-    
+
     # 获取商家余额
     select_sql = build_dynamic_select(
         cur,
@@ -1759,14 +1813,14 @@ def _execute_split(cur, order_number: str, total: Decimal):
     cur.execute(select_sql)
     merchant_balance_row = cur.fetchone()
     merchant_balance_after = merchant_balance_row["balance"] if merchant_balance_row else merchant
-    
+
     # 记录商家流水到 account_flow
     cur.execute(
         """INSERT INTO account_flow (account_type, change_amount, balance_after, flow_type, remark, created_at)
            VALUES (%s, %s, %s, %s, %s, NOW())""",
         ("merchant_balance", merchant, merchant_balance_after, "income", f"订单分账: {order_number}")
     )
-    
+
     # 平台分得 20%，再分配到各个资金池
     pool_total = total * Decimal("0.2")
     # 池子类型到账户类型的映射
@@ -1790,23 +1844,23 @@ def _execute_split(cur, order_number: str, total: Decimal):
         "branch": 0.005,  # 大区分公司
         "fund": 0.015  # 事业发展基金
     }
-    
+
     for pool_key, pool_ratio in pools.items():
         amt = pool_total * Decimal(str(pool_ratio))
         account_type = pool_mapping[pool_key]
-        
+
         # 确保 finance_accounts 中存在该账户类型
         cur.execute(
             "INSERT INTO finance_accounts (account_name, account_type, balance) VALUES (%s, %s, 0) ON DUPLICATE KEY UPDATE account_name=VALUES(account_name)",
             (pool_key, account_type)
         )
-        
+
         # 更新资金池余额
         cur.execute(
             "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = %s",
             (amt, account_type)
         )
-        
+
         # 获取更新后的余额
         select_sql = build_dynamic_select(
             cur,
@@ -1817,7 +1871,7 @@ def _execute_split(cur, order_number: str, total: Decimal):
         cur.execute(select_sql, (account_type,))
         balance_row = cur.fetchone()
         balance_after = balance_row["balance"] if balance_row else amt
-        
+
         # 记录流水到 account_flow
         cur.execute(
             """INSERT INTO account_flow (account_type, change_amount, balance_after, flow_type, remark, created_at)
@@ -1843,14 +1897,14 @@ def reverse_split_on_refund(order_number: str):
                 (f"订单分账: {order_number}%",)
             )
             m = cur.fetchone()["m"] or Decimal("0")
-            
+
             if m > 0:
                 # 回冲商家余额
                 cur.execute(
                     "UPDATE merchant_balance SET balance=balance-%s WHERE merchant_id=1",
                     (m,)
                 )
-                
+
                 # 获取回冲后的余额
                 select_sql = build_dynamic_select(
                     cur,
@@ -1861,14 +1915,14 @@ def reverse_split_on_refund(order_number: str):
                 cur.execute(select_sql)
                 merchant_balance_row = cur.fetchone()
                 merchant_balance_after = merchant_balance_row["balance"] if merchant_balance_row else Decimal("0")
-                
+
                 # 记录回冲流水
                 cur.execute(
                     """INSERT INTO account_flow (account_type, change_amount, balance_after, flow_type, remark, created_at)
                        VALUES (%s, %s, %s, %s, %s, NOW())""",
                     ("merchant_balance", -m, merchant_balance_after, "expense", f"退款回冲: {order_number}")
                 )
-            
+
             # 回冲各个资金池
             pool_mapping = {
                 "public": "public_welfare",
@@ -1880,7 +1934,7 @@ def reverse_split_on_refund(order_number: str):
                 "branch": "branch_pool",
                 "fund": "fund_pool"
             }
-            
+
             for pool_key, account_type in pool_mapping.items():
                 # 查询该池子的分账金额
                 cur.execute(
@@ -1889,14 +1943,14 @@ def reverse_split_on_refund(order_number: str):
                     (account_type, f"订单分账: {order_number}%")
                 )
                 pool_amt = cur.fetchone()["amt"] or Decimal("0")
-                
+
                 if pool_amt > 0:
                     # 回冲资金池余额
                     cur.execute(
                         "UPDATE finance_accounts SET balance = balance - %s WHERE account_type = %s",
                         (pool_amt, account_type)
                     )
-                    
+
                     # 获取回冲后的余额
                     select_sql = build_dynamic_select(
                         cur,
@@ -1907,14 +1961,14 @@ def reverse_split_on_refund(order_number: str):
                     cur.execute(select_sql, (account_type,))
                     balance_row = cur.fetchone()
                     balance_after = balance_row["balance"] if balance_row else Decimal("0")
-                    
+
                     # 记录回冲流水
                     cur.execute(
                         """INSERT INTO account_flow (account_type, change_amount, balance_after, flow_type, remark, created_at)
                            VALUES (%s, %s, %s, %s, %s, NOW())""",
                         (account_type, -pool_amt, balance_after, "expense", f"退款回冲: {order_number}")
                     )
-            
+
             conn.commit()
 
 
@@ -2024,17 +2078,18 @@ def generate_statement():
 
             # 动态构造 SELECT 语句
             select_sql = build_dynamic_select(
-                cur, 
+                cur,
                 "merchant_statement",
                 where_clause="merchant_id=1 AND date<%s",
                 order_by="date DESC",
                 limit="1"
             )
-            
+
             # 获取期初余额
             cur.execute(select_sql, (yesterday,))
             row = cur.fetchone()
-            opening = Decimal(str(row["closing_balance"])) if row and row.get("closing_balance") is not None else Decimal("0")
+            opening = Decimal(str(row["closing_balance"])) if row and row.get(
+                "closing_balance") is not None else Decimal("0")
 
             # 获取当日收入（从 account_flow 表查询）
             cur.execute(

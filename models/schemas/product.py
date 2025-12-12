@@ -1,6 +1,6 @@
 # models/schemas/product.py - 商品系统 Pydantic 模型
 from pydantic import BaseModel, Field, ConfigDict
-from typing import Optional, List
+from typing import Optional, List, Dict, Any  # ✅ 新增：导入 Dict, Any
 from decimal import Decimal
 from datetime import datetime
 
@@ -18,8 +18,12 @@ class ProductSkuModel(BaseModel):
     id: Optional[int] = None
     product_id: Optional[int] = None
     sku_code: str
-    price: Decimal = Field(default=Decimal("0.00"), ge=0)
+    price: Decimal = Field(default=Decimal("0.00"), ge=0)  # 商品现价
+    # ✅ 新增字段：商品原价
+    original_price: Optional[Decimal] = Field(None, ge=0)
     stock: int = Field(default=0, ge=0)
+    # ✅ 新增字段：商品规格（JSON格式）
+    specifications: Optional[Dict[str, Any]] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -63,6 +67,8 @@ class ProductModel(BaseModel):
     is_member_product: bool = Field(default=False)
     buy_rule: Optional[str] = None
     freight: Decimal = Field(default=Decimal("0.00"), ge=0)
+    # ✅ 新增字段：积分抵扣上限
+    max_points_discount: Optional[Decimal] = Field(None, ge=0)
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -85,6 +91,8 @@ class ProductCreateRequest(BaseModel):
     is_member_product: bool = Field(default=False)
     buy_rule: Optional[str] = None
     freight: Decimal = Field(default=Decimal("0.00"), ge=0)
+    # ✅ 新增字段：积分抵扣上限
+    max_points_discount: Optional[Decimal] = Field(None, ge=0)
     skus: Optional[List[ProductSkuModel]] = None
     attributes: Optional[List[ProductAttributeModel]] = None
 
@@ -100,6 +108,8 @@ class ProductUpdateRequest(BaseModel):
     is_member_product: Optional[bool] = None
     buy_rule: Optional[str] = None
     freight: Optional[Decimal] = Field(None, ge=0)
+    # ✅ 新增字段：积分抵扣上限
+    max_points_discount: Optional[Decimal] = Field(None, ge=0)
     skus: Optional[List[ProductSkuModel]] = None
     attributes: Optional[List[ProductAttributeModel]] = None
 
@@ -118,6 +128,8 @@ class ProductResponse(BaseModel):
     is_member_product: bool
     buy_rule: Optional[str] = None
     freight: Decimal
+    # ✅ 新增字段：积分抵扣上限
+    max_points_discount: Optional[Decimal] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     skus: Optional[List[ProductSkuModel]] = None

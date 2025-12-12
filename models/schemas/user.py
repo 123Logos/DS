@@ -35,16 +35,13 @@ class SetLevelReq(BaseModel):
 
 
 class AddressReq(BaseModel):
-    mobile: str                # 用来查 user_id
-    label: str
-    name: str                  # 即 consignee_name
-    phone: str                 # 即 consignee_phone
+    mobile: str
+    name: str
+    phone: str
     province: str
     city: str
     district: str
     detail: str
-    lng: Optional[float] = None
-    lat: Optional[float] = None
     is_default: bool = False
     addr_type: str = "shipping"
 
@@ -136,3 +133,9 @@ class ResetPasswordReq(BaseModel):
     mobile: str
     sms_code: str
     new_password: str
+
+
+class BindReferrerReq(BaseModel):
+    mobile: str                       # 被推荐人手机号
+    referrer_mobile: Optional[str] = None  # 推荐人手机号（老逻辑保留）
+    referrer_code: Optional[str] = None    # 新增：推荐码（优先用）

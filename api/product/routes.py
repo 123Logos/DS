@@ -52,17 +52,41 @@ def build_product_dict(product: Dict[str, Any], skus: List[Dict[str, Any]] = Non
                 base["detail_images"] = json.loads(base["detail_images"])
             except:
                 base["detail_images"] = []
+
+    # ✅ 新增：处理SKU的specifications字段
+    if base.get("skus"):
+        for sku in base["skus"]:
+            if sku.get("specifications") and isinstance(sku["specifications"], str):
+                try:
+                    sku["specifications"] = json.loads(sku["specifications"])
+                except:
+                    sku["specifications"] = {}
+
     return base
 
 
 class SkuCreate(BaseModel):
     sku_code: str
-    price: float = Field(..., ge=0)
+    price: float = Field(..., ge=0)  # 商品现价
+    # ✅ 新增字段：商品原价
+    original_price: Optional[float] = Field(None, ge=0)
+    # ✅ 新增字段：商品规格
+    specifications: Optional[Dict[str, Any]] = None
     stock: int = Field(..., ge=0)
 
     @field_validator("price")
     def force_member_price(cls, v: float, info):
         return v
+
+
+# ✅ 新增：SKU更新模型（必须提供id）
+class SkuUpdate(BaseModel):
+    id: int  # 必须提供SKU的ID来定位记录
+    sku_code: Optional[str] = None
+    price: Optional[float] = Field(None, ge=0)
+    original_price: Optional[float] = Field(None, ge=0)
+    stock: Optional[int] = Field(None, ge=0)
+    specifications: Optional[Dict[str, Any]] = None
 
 
 class ProductCreate(BaseModel):
@@ -73,6 +97,8 @@ class ProductCreate(BaseModel):
     is_member_product: bool = False
     buy_rule: Optional[str] = None
     freight: Optional[float] = Field(0.0, ge=0, le=0, description="运费，系统强制0")
+    # ✅ 新增字段：积分抵扣上限
+    max_points_discount: Optional[float] = Field(None, ge=0, description="积分抵扣上限")
     skus: List[SkuCreate]
     attributes: Optional[List[Dict[str, str]]] = None
     status: int = Field(default=ProductStatus.DRAFT)
@@ -90,6 +116,7 @@ class ProductCreate(BaseModel):
         return v
 
 
+# ✅ 修改：ProductUpdate 添加 skus 字段
 class ProductUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
@@ -99,6 +126,10 @@ class ProductUpdate(BaseModel):
     is_member_product: Optional[bool] = None
     buy_rule: Optional[str] = None
     freight: Optional[float] = Field(None, ge=0, le=0, description="运费，系统强制0")
+    # ✅ 新增字段：积分抵扣上限
+    max_points_discount: Optional[float] = Field(None, ge=0, description="积分抵扣上限")
+    # ✅ 新增：支持更新SKU列表
+    skus: Optional[List[SkuUpdate]] = None
     attributes: Optional[List[Dict[str, str]]] = None
 
     @field_validator("category")
@@ -113,6 +144,7 @@ class ProductUpdate(BaseModel):
                                        ProductStatus.OUT_OF_STOCK}:
             raise ValueError(f"状态非法")
         return v
+
 
 # ---------------- 中文路由摘要 + 修复上下文 ----------------
 
@@ -190,12 +222,15 @@ def search_products(
                     cur,
                     "product_skus",
                     where_clause="product_id = %s",
-                    select_fields=["id", "sku_code", "price", "stock"]
+                    # ✅ 修改：查询新增字段 original_price 和 specifications
+                    select_fields=["id", "sku_code", "price", "original_price", "stock", "specifications"]
                 )
                 cur.execute(select_sql, (product_id,))
                 skus = cur.fetchall()
-                skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']), "stock": s['stock']} for
-                        s in skus]
+                # ✅ 修改：格式化新增字段
+                skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']),
+                         "original_price": float(s['original_price']) if s['original_price'] else None,
+                         "stock": s['stock'], "specifications": s['specifications']} for s in skus]
 
                 # 获取 attributes
                 select_sql = build_dynamic_select(
@@ -215,11 +250,11 @@ def search_products(
 
 @router.get("/products", summary="📄 商品列表分页")
 def get_all_products(
-    category: Optional[str] = Query(None, description="分类筛选"),
-    status: Optional[int] = Query(None, description="状态筛选"),
-    is_member_product: Optional[int] = Query(None, description="会员商品筛选，0=非会员，1=会员", ge=0, le=1),  # ✅ 新增
-    page: int = Query(1, ge=1, description="页码"),
-    size: int = Query(10, ge=1, le=100, description="每页条数"),
+        category: Optional[str] = Query(None, description="分类筛选"),
+        status: Optional[int] = Query(None, description="状态筛选"),
+        is_member_product: Optional[int] = Query(None, description="会员商品筛选，0=非会员，1=会员", ge=0, le=1),
+        page: int = Query(1, ge=1, description="页码"),
+        size: int = Query(10, ge=1, le=100, description="每页条数"),
 ):
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -233,7 +268,7 @@ def get_all_products(
             if status is not None:
                 where_clauses.append("status = %s")
                 params.append(status)
-            if is_member_product is not None:  # ✅ 新增逻辑
+            if is_member_product is not None:
                 where_clauses.append("is_member_product = %s")
                 params.append(is_member_product)
 
@@ -246,7 +281,7 @@ def get_all_products(
 
             # 查询商品列表 - 使用动态表访问
             offset = (page - 1) * size
-            where_clause_clean = where_sql.replace("WHERE ", "") if where_sql.startswith("WHERE ") else None
+            where_clause_clean = " AND ".join(where_clauses) if where_clauses else None
             # 构建基础 SQL（不包含 LIMIT）
             select_sql_base = build_dynamic_select(
                 cur,
@@ -269,11 +304,15 @@ def get_all_products(
                     cur,
                     "product_skus",
                     where_clause="product_id = %s",
-                    select_fields=["id", "sku_code", "price", "stock"]
+                    # ✅ 修改：查询新增字段 original_price 和 specifications
+                    select_fields=["id", "sku_code", "price", "original_price", "stock", "specifications"]
                 )
                 cur.execute(select_sql, (product_id,))
                 skus = cur.fetchall()
-                skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']), "stock": s['stock']} for s in skus]
+                # ✅ 修改：格式化新增字段
+                skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']),
+                         "original_price": float(s['original_price']) if s['original_price'] else None,
+                         "stock": s['stock'], "specifications": s['specifications']} for s in skus]
 
                 # 获取 attributes
                 select_sql = build_dynamic_select(
@@ -311,12 +350,15 @@ def get_product(id: int):
                 cur,
                 "product_skus",
                 where_clause="product_id = %s",
-                select_fields=["id", "sku_code", "price", "stock"]
+                # ✅ 修改：查询新增字段 original_price 和 specifications
+                select_fields=["id", "sku_code", "price", "original_price", "stock", "specifications"]
             )
             cur.execute(select_sql, (id,))
             skus = cur.fetchall()
-            skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']), "stock": s['stock']} for s in
-                    skus]
+            # ✅ 修改：格式化新增字段
+            skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']),
+                     "original_price": float(s['original_price']) if s['original_price'] else None,
+                     "stock": s['stock'], "specifications": s['specifications']} for s in skus]
 
             # 获取 attributes
             select_sql = build_dynamic_select(
@@ -359,10 +401,18 @@ def add_product(payload: ProductCreate):
 
                 # 插入 SKUs
                 for sku, price in zip(payload.skus, sku_prices):
+                    # ✅ 修改：插入新增字段 original_price 和 specifications
                     cur.execute("""
-                        INSERT INTO product_skus (product_id, sku_code, price, stock)
-                        VALUES (%s, %s, %s, %s)
-                    """, (product_id, sku.sku_code, price, sku.stock))
+                        INSERT INTO product_skus (product_id, sku_code, price, original_price, stock, specifications)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (
+                        product_id,
+                        sku.sku_code,
+                        price,
+                        sku.original_price,  # ✅ 新增字段
+                        sku.stock,
+                        json.dumps(sku.specifications, ensure_ascii=False) if sku.specifications else None  # ✅ 新增字段
+                    ))
 
                 # 插入 attributes
                 if payload.attributes:
@@ -388,12 +438,15 @@ def add_product(payload: ProductCreate):
                     cur,
                     "product_skus",
                     where_clause="product_id = %s",
-                    select_fields=["id", "sku_code", "price", "stock"]
+                    # ✅ 修改：查询新增字段 original_price 和 specifications
+                    select_fields=["id", "sku_code", "price", "original_price", "stock", "specifications"]
                 )
                 cur.execute(select_sql, (product_id,))
                 skus = cur.fetchall()
-                skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']), "stock": s['stock']} for
-                        s in skus]
+                # ✅ 修改：格式化新增字段
+                skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']),
+                         "original_price": float(s['original_price']) if s['original_price'] else None,
+                         "stock": s['stock'], "specifications": s['specifications']} for s in skus]
 
                 # 获取 attributes
                 select_sql = build_dynamic_select(
@@ -413,6 +466,7 @@ def add_product(payload: ProductCreate):
                 raise HTTPException(status_code=400, detail=f"创建商品失败: {str(e)}")
 
 
+# ✅ 重写：支持SKU更新的商品更新接口
 @router.put("/products/{id}", summary="✏️ 更新商品")
 def update_product(id: int, payload: ProductUpdate):
     with get_conn() as conn:
@@ -429,12 +483,11 @@ def update_product(id: int, payload: ProductUpdate):
                 if not product:
                     raise HTTPException(status_code=404, detail="商品不存在")
 
-                
-                # 构建更新字段
+                # 构建商品更新字段
                 update_fields = []
                 update_params = []
 
-                update_data = payload.dict(exclude_unset=True, exclude={"attributes"})
+                update_data = payload.dict(exclude_unset=True, exclude={"attributes", "skus"})
                 # ✅ 禁止修改 is_member_product 字段
                 update_data.pop("is_member_product", None)
 
@@ -445,7 +498,7 @@ def update_product(id: int, payload: ProductUpdate):
                         update_fields.append(f"{key} = %s")
                         update_params.append(value)
 
-                # 更新商品
+                # 更新商品基本信息
                 if update_fields:
                     update_params.append(id)
                     cur.execute(f"""
@@ -453,6 +506,46 @@ def update_product(id: int, payload: ProductUpdate):
                         SET {', '.join(update_fields)}, updated_at = NOW()
                         WHERE id = %s
                     """, tuple(update_params))
+
+                # ✅ 新增：更新 SKU 信息
+                if payload.skus is not None:
+                    for sku_update in payload.skus:
+                        # 没有id无法定位SKU，跳过
+                        if not sku_update.id:
+                            continue
+
+                        sku_fields = []
+                        sku_params = []
+
+                        if sku_update.sku_code is not None:
+                            sku_fields.append("sku_code = %s")
+                            sku_params.append(sku_update.sku_code)
+                        if sku_update.price is not None:
+                            sku_fields.append("price = %s")
+                            sku_params.append(sku_update.price)
+                        if sku_update.original_price is not None:
+                            sku_fields.append("original_price = %s")
+                            sku_params.append(sku_update.original_price)
+                        if sku_update.stock is not None:
+                            sku_fields.append("stock = %s")
+                            sku_params.append(sku_update.stock)
+                        if sku_update.specifications is not None:
+                            sku_fields.append("specifications = %s")
+                            sku_params.append(json.dumps(sku_update.specifications, ensure_ascii=False))
+
+                        if sku_fields:
+                            # 验证SKU属于该商品
+                            cur.execute("SELECT 1 FROM product_skus WHERE id = %s AND product_id = %s",
+                                        (sku_update.id, id))
+                            if not cur.fetchone():
+                                raise HTTPException(status_code=400, detail=f"SKU ID {sku_update.id} 不属于商品 {id}")
+
+                            sku_params.extend([sku_update.id, id])
+                            cur.execute(f"""
+                                UPDATE product_skus 
+                                SET {', '.join(sku_fields)}, updated_at = NOW()
+                                WHERE id = %s AND product_id = %s
+                            """, tuple(sku_params))
 
                 # 更新 attributes
                 if payload.attributes is not None:
@@ -476,17 +569,20 @@ def update_product(id: int, payload: ProductUpdate):
                 cur.execute(select_sql, (id,))
                 updated_product = cur.fetchone()
 
-                # 获取 SKUs
+                # 获取所有 SKUs
                 select_sql = build_dynamic_select(
                     cur,
                     "product_skus",
                     where_clause="product_id = %s",
-                    select_fields=["id", "sku_code", "price", "stock"]
+                    # ✅ 修改：查询新增字段 original_price 和 specifications
+                    select_fields=["id", "sku_code", "price", "original_price", "stock", "specifications"]
                 )
                 cur.execute(select_sql, (id,))
                 skus = cur.fetchall()
-                skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']), "stock": s['stock']} for
-                        s in skus]
+                # ✅ 修改：格式化新增字段
+                skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']),
+                         "original_price": float(s['original_price']) if s['original_price'] else None,
+                         "stock": s['stock'], "specifications": s['specifications']} for s in skus]
 
                 # 获取 attributes
                 select_sql = build_dynamic_select(
@@ -499,7 +595,7 @@ def update_product(id: int, payload: ProductUpdate):
                 attributes = cur.fetchall()
                 attributes = [{"name": a['name'], "value": a['value']} for a in attributes]
 
-                return {"status": "success", "message": "商品已更新",
+                return {"status": "success", "message": "商品及SKU已更新",
                         "data": build_product_dict(updated_product, skus, attributes)}
             except HTTPException:
                 raise
@@ -627,12 +723,15 @@ def upload_images(
                     cur,
                     "product_skus",
                     where_clause="product_id = %s",
-                    select_fields=["id", "sku_code", "price", "stock"]
+                    # ✅ 修改：查询新增字段 original_price 和 specifications
+                    select_fields=["id", "sku_code", "price", "original_price", "stock", "specifications"]
                 )
                 cur.execute(select_sql, (id,))
                 skus = cur.fetchall()
-                skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']), "stock": s['stock']} for
-                        s in skus]
+                # ✅ 修改：格式化新增字段
+                skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']),
+                         "original_price": float(s['original_price']) if s['original_price'] else None,
+                         "stock": s['stock'], "specifications": s['specifications']} for s in skus]
 
                 # 获取 attributes
                 select_sql = build_dynamic_select(
