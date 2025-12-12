@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 from pydantic import BaseModel
 from core.database import get_conn
+from core.table_access import build_dynamic_select
 from typing import List, Dict, Any
 
 router = APIRouter()
@@ -24,7 +25,13 @@ class CartManager:
     def add(user_id: int, product_id: int, quantity: int = 1) -> bool:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT quantity FROM cart WHERE user_id=%s AND product_id=%s", (user_id, product_id))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "cart",
+                    where_clause="user_id=%s AND product_id=%s",
+                    select_fields=["quantity"]
+                )
+                cur.execute(select_sql, (user_id, product_id))
                 row = cur.fetchone()
                 if row:
                     cur.execute("UPDATE cart SET quantity=quantity+%s WHERE user_id=%s AND product_id=%s",

@@ -1,5 +1,6 @@
 from decimal import Decimal
 from core.database import get_conn
+from core.table_access import build_dynamic_select
 
 
 def add_points(user_id: int, type: str, amount: Decimal, reason: str = "系统赠送"):
@@ -18,10 +19,22 @@ def add_points(user_id: int, type: str, amount: Decimal, reason: str = "系统�
             # 1. 更新余额并获取更新后的余额
             if type == "member":
                 cur.execute("UPDATE users SET member_points=member_points+%s WHERE id=%s", (amount, user_id))
-                cur.execute("SELECT member_points FROM users WHERE id=%s", (user_id,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "users",
+                    where_clause="id=%s",
+                    select_fields=["member_points"]
+                )
+                cur.execute(select_sql, (user_id,))
             else:
                 cur.execute("UPDATE users SET merchant_points=merchant_points+%s WHERE id=%s", (amount, user_id))
-                cur.execute("SELECT merchant_points FROM users WHERE id=%s", (user_id,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "users",
+                    where_clause="id=%s",
+                    select_fields=["merchant_points"]
+                )
+                cur.execute(select_sql, (user_id,))
             balance_after = Decimal(str(cur.fetchone()[0]))
             # 2. 写流水
             cur.execute(

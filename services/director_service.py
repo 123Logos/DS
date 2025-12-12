@@ -1,6 +1,7 @@
 import datetime
 
 from core.database import get_conn
+from core.table_access import build_dynamic_select
 from decimal import Decimal
 from typing import List, Dict
 
@@ -109,7 +110,13 @@ class DirectorService:
                 rows = []
                 for d in directors:
                     uid = d['user_id']
-                    cur.execute("SELECT six_team FROM users WHERE id=%s", (uid,))
+                    select_sql = build_dynamic_select(
+                        cur,
+                        "users",
+                        where_clause="id=%s",
+                        select_fields=["six_team"]
+                    )
+                    cur.execute(select_sql, (uid,))
                     six_team = cur.fetchone()['six_team']
                     weight = max(1, six_team)   # 至少为 1
                     rows.append((uid, weight))

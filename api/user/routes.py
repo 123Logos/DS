@@ -10,6 +10,7 @@ from models.schemas.user import (
 
 from core.database import get_conn
 from core.logging import get_logger
+from core.table_access import build_dynamic_select, get_table_structure
 from services.user_service import UserService, UserStatus, verify_pwd, hash_pwd
 from services.address_service import AddressService
 from services.points_service import add_points
@@ -50,7 +51,13 @@ def set_user_status(body: SetStatusReq):
                 conn.commit()
 
             # 2. 校验用户是否存在
-            cur.execute("SELECT id, status FROM users WHERE mobile=%s", (body.mobile,))
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="mobile=%s",
+                select_fields=["id", "status"]
+            )
+            cur.execute(select_sql, (body.mobile,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="用户不存在")
@@ -89,7 +96,13 @@ def set_user_status(body: SetStatusReq):
 def user_auth(body: AuthReq):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, password_hash, member_level, status FROM users WHERE mobile=%s", (body.mobile,))
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="mobile=%s",
+                select_fields=["id", "password_hash", "member_level", "status"]
+            )
+            cur.execute(select_sql, (body.mobile,))
             row = cur.fetchone()
 
             if row:
@@ -121,7 +134,13 @@ def update_profile(body: UpdateProfileReq):
     with get_conn() as conn:
         with conn.cursor() as cur:
             # 1. 取用户 id & 当前密码哈希
-            cur.execute("SELECT id, password_hash FROM users WHERE mobile=%s", (body.mobile,))
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="mobile=%s",
+                select_fields=["id", "password_hash"]
+            )
+            cur.execute(select_sql, (body.mobile,))
             u = cur.fetchone()
             if not u:
                 raise HTTPException(status_code=404, detail="用户不存在")
@@ -172,7 +191,13 @@ def self_delete(body: SelfDeleteReq):
                 conn.commit()
 
             # 2. 取用户 id & 密码哈希
-            cur.execute("SELECT id, password_hash, status FROM users WHERE mobile=%s", (body.mobile,))
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="mobile=%s",
+                select_fields=["id", "password_hash", "status"]
+            )
+            cur.execute(select_sql, (body.mobile,))
             u = cur.fetchone()
             if not u:
                 raise HTTPException(status_code=404, detail="用户不存在")
@@ -214,7 +239,13 @@ def freeze_user(body: FreezeReq):
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, status FROM users WHERE mobile=%s", (body.mobile,))
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="mobile=%s",
+                select_fields=["id", "status"]
+            )
+            cur.execute(select_sql, (body.mobile,))
             u = cur.fetchone()
             if not u:
                 raise HTTPException(status_code=404, detail="用户不存在")
@@ -236,7 +267,13 @@ def unfreeze_user(body: FreezeReq):
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, status FROM users WHERE mobile=%s", (body.mobile,))
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="mobile=%s",
+                select_fields=["id", "status"]
+            )
+            cur.execute(select_sql, (body.mobile,))
             u = cur.fetchone()
             if not u:
                 raise HTTPException(status_code=404, detail="用户不存在")
@@ -256,7 +293,13 @@ def reset_password(body: ResetPwdReq):
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id FROM users WHERE mobile=%s", (body.mobile,))
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="mobile=%s",
+                select_fields=["id"]
+            )
+            cur.execute(select_sql, (body.mobile,))
             u = cur.fetchone()
             if not u:
                 raise HTTPException(status_code=404, detail="手机号未注册")
@@ -273,7 +316,13 @@ def admin_reset_password(body: AdminResetPwdReq):
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id FROM users WHERE mobile=%s", (body.mobile,))
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="mobile=%s",
+                select_fields=["id"]
+            )
+            cur.execute(select_sql, (body.mobile,))
             u = cur.fetchone()
             if not u:
                 raise HTTPException(status_code=404, detail="用户不存在")
@@ -297,7 +346,13 @@ def upgrade(mobile: str):
                 conn.commit()
 
             # 2. 取当前星级
-            cur.execute("SELECT id, member_level FROM users WHERE mobile=%s", (mobile,))
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="mobile=%s",
+                select_fields=["id", "member_level"]
+            )
+            cur.execute(select_sql, (mobile,))
             u = cur.fetchone()
             if not u:
                 raise HTTPException(status_code=404, detail="用户不存在")
@@ -345,7 +400,13 @@ def set_level(body: SetLevelReq):
                 conn.commit()
 
             # 2. 取当前星级
-            cur.execute("SELECT id, member_level FROM users WHERE mobile=%s", (body.mobile,))
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="mobile=%s",
+                select_fields=["id", "member_level"]
+            )
+            cur.execute(select_sql, (body.mobile,))
             u = cur.fetchone()
             if not u:
                 raise HTTPException(status_code=404, detail="用户不存在")
@@ -389,10 +450,43 @@ def set_level(body: SetLevelReq):
 def user_info(mobile: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # 动态检查表结构
+            cur.execute("SHOW COLUMNS FROM users")
+            columns = {row["Field"] for row in cur.fetchall()}
+            
+            # 动态构造 SELECT 字段
+            select_fields = ["id", "mobile", "name", "member_level", "referral_code"]
+            if "avatar_path" in columns:
+                select_fields.append("avatar_path")
+            else:
+                select_fields.append("NULL AS avatar_path")
+            
+            # 动态构造 WHERE 条件（兼容缺少 status 字段的老表）
+            where_clause = "WHERE mobile=%s"
+            params = [mobile]
+            if "status" in columns:
+                where_clause += " AND status != %s"
+                params.append(UserStatus.DELETED.value)
+            
+            # 使用动态表访问构造查询
+            structure = get_table_structure(cur, "users")
+            # 处理资产字段
+            final_select_fields = []
+            for field in select_fields:
+                if field in structure['fields']:
+                    if field in structure['asset_fields']:
+                        final_select_fields.append(f"COALESCE({field}, 0) AS {field}")
+                    else:
+                        final_select_fields.append(field)
+                elif "NULL AS" in field or "AS" in field:
+                    # 已经是别名字段，直接使用
+                    final_select_fields.append(field)
+                else:
+                    final_select_fields.append(field)
+            
             cur.execute(
-                "SELECT id, mobile, name, avatar_path, member_level, referral_code "
-                "FROM users WHERE mobile=%s AND status != %s",
-                (mobile, UserStatus.DELETED.value)
+                f"SELECT {', '.join(final_select_fields)} FROM users {where_clause}",
+                tuple(params)
             )
             u = cur.fetchone()
             if not u:
@@ -428,26 +522,37 @@ def user_info(mobile: str):
             )
             team_total = cur.fetchone()["c"]
 
-            cur.execute(
-                "SELECT member_points, merchant_points, withdrawable_balance "
-                "FROM users WHERE id=%s",
-                (u["id"],)
-            )
+            # 动态构造资产字段查询（兼容缺少字段的老表，默认值为 0）
+            structure = get_table_structure(cur, "users")
+            asset_fields_to_select = ["member_points", "merchant_points", "withdrawable_balance"]
+            select_fields = []
+            for field in asset_fields_to_select:
+                if field in structure['fields']:
+                    if field in structure['asset_fields']:
+                        select_fields.append(f"COALESCE({field}, 0) AS {field}")
+                    else:
+                        select_fields.append(field)
+                else:
+                    # 字段不存在，使用默认值
+                    select_fields.append(f"0 AS {field}")
+            
+            select_sql = f"SELECT {', '.join(select_fields)} FROM users WHERE id=%s"
+            cur.execute(select_sql, (u["id"],))
             assets = cur.fetchone()
 
     return UserInfoResp(
         uid=u["id"],
         mobile=u["mobile"],
         name=u["name"],
-        avatar_path=u["avatar_path"],
+        avatar_path=u.get("avatar_path"),
         member_level=u["member_level"],
         referral_code=u["referral_code"],
         direct_count=direct_count,
         team_total=team_total,
         assets={
-            "member_points": assets["member_points"],
-            "merchant_points": assets["merchant_points"],
-            "withdrawable_balance": assets["withdrawable_balance"]
+            "member_points": assets.get("member_points", 0) or 0,
+            "merchant_points": assets.get("merchant_points", 0) or 0,
+            "withdrawable_balance": assets.get("withdrawable_balance", 0) or 0
         },
         referrer=referrer
     )
@@ -477,9 +582,20 @@ def user_list(
     args.extend([size, (page - 1) * size])
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(f"SELECT id, mobile, name, member_level, created_at FROM users {sql_where} ORDER BY id {limit_sql}", tuple(args))
+            # 使用动态表访问构造查询
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause=sql_where.replace("WHERE ", "") if sql_where else None,
+                order_by="id",
+                limit=limit_sql.replace("LIMIT ", "") if limit_sql else None,
+                select_fields=["id", "mobile", "name", "member_level", "created_at"]
+            )
+            cur.execute(select_sql, tuple(args))
             rows = cur.fetchall()
-            cur.execute(f"SELECT COUNT(*) AS c FROM users {sql_where}", tuple(args[:-2]))
+            # COUNT 查询
+            count_sql = f"SELECT COUNT(*) AS c FROM users {sql_where}"
+            cur.execute(count_sql, tuple(args[:-2]))
             total = cur.fetchone()["c"]
             return {"rows": rows, "total": total, "page": page, "size": size}
 
@@ -488,13 +604,25 @@ def bind_referrer(mobile: str, referrer_mobile: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
             # 1. 被推荐人 & 推荐人 id
-            cur.execute("SELECT id FROM users WHERE mobile=%s", (mobile,))
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="mobile=%s",
+                select_fields=["id"]
+            )
+            cur.execute(select_sql, (mobile,))
             u = cur.fetchone()
             if not u:
                 raise HTTPException(status_code=404, detail="被推荐人不存在")
             user_id = u["id"]
 
-            cur.execute("SELECT id FROM users WHERE mobile=%s", (referrer_mobile,))
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="mobile=%s",
+                select_fields=["id"]
+            )
+            cur.execute(select_sql, (referrer_mobile,))
             ref = cur.fetchone()
             if not ref:
                 raise HTTPException(status_code=404, detail="推荐人不存在")
@@ -537,11 +665,23 @@ def bind_referrer(mobile: str, referrer_mobile: str):
 def refer_direct(mobile: str, page: int = 1, size: int = 10):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id FROM users WHERE mobile=%s", (mobile,))
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="mobile=%s",
+                select_fields=["id"]
+            )
+            cur.execute(select_sql, (mobile,))
             u = cur.fetchone()
             if not u:
                 _err("用户不存在")
-            cur.execute("SELECT COUNT(*) AS c FROM user_referrals WHERE referrer_id=%s", (u["id"],))
+            select_sql = build_dynamic_select(
+                cur,
+                "user_referrals",
+                where_clause="referrer_id=%s",
+                select_fields=["COUNT(*) AS c"]
+            )
+            cur.execute(select_sql, (u["id"],))
             total = cur.fetchone()["c"]
             cur.execute("""
                 SELECT u.id, u.mobile, u.name, u.member_level, u.created_at
@@ -582,7 +722,13 @@ def address_add(body: AddressReq):
     with get_conn() as conn:
         with conn.cursor() as cur:
             # 1. 取用户 id
-            cur.execute("SELECT id FROM users WHERE mobile=%s", (body.mobile,))
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="mobile=%s",
+                select_fields=["id"]
+            )
+            cur.execute(select_sql, (body.mobile,))
             u = cur.fetchone()
             if not u:
                 raise HTTPException(status_code=404, detail="用户不存在")
@@ -635,7 +781,13 @@ def address_add(body: AddressReq):
 def set_default_addr(addr_id: int, mobile: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT user_id FROM user_addresses WHERE id=%s", (addr_id,))
+            select_sql = build_dynamic_select(
+                cur,
+                "user_addresses",
+                where_clause="id=%s",
+                select_fields=["user_id"]
+            )
+            cur.execute(select_sql, (addr_id,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="地址不存在")
@@ -649,11 +801,23 @@ def set_default_addr(addr_id: int, mobile: str):
 def delete_addr(addr_id: int, mobile: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT user_id FROM addresses WHERE id=%s", (addr_id,))
+            select_sql = build_dynamic_select(
+                cur,
+                "addresses",
+                where_clause="id=%s",
+                select_fields=["user_id"]
+            )
+            cur.execute(select_sql, (addr_id,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="地址不存在")
-            cur.execute("SELECT id FROM users WHERE mobile=%s", (mobile,))
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="mobile=%s",
+                select_fields=["id"]
+            )
+            cur.execute(select_sql, (mobile,))
             u = cur.fetchone()
             if not u or u["id"] != row["user_id"]:
                 raise HTTPException(status_code=403, detail="地址不属于当前用户")
@@ -666,7 +830,13 @@ def delete_addr(addr_id: int, mobile: str):
 def address_list(mobile: str, page: int = 1, size: int = 5):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id FROM users WHERE mobile=%s", (mobile,))
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="mobile=%s",
+                select_fields=["id"]
+            )
+            cur.execute(select_sql, (mobile,))
             u = cur.fetchone()
             if not u:
                 _err("用户不存在")
@@ -678,7 +848,13 @@ def return_addr_set(body: AddressReq):
     with get_conn() as conn:
         with conn.cursor() as cur:
             # 1. 校验商家身份（兼容老表可能缺少 is_merchant 字段）
-            cur.execute("SELECT id FROM users WHERE mobile=%s", (body.mobile,))
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="mobile=%s",
+                select_fields=["id"]
+            )
+            cur.execute(select_sql, (body.mobile,))
             u = cur.fetchone()
             if not u:
                 raise HTTPException(status_code=404, detail="商家不存在或未被授予商户身份")
@@ -736,7 +912,13 @@ def return_addr_set(body: AddressReq):
 def return_addr_get(mobile: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id FROM users WHERE mobile=%s", (mobile,))
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="mobile=%s",
+                select_fields=["id"]
+            )
+            cur.execute(select_sql, (mobile,))
             u = cur.fetchone()
             if not u:
                 _err("商家不存在")
@@ -752,7 +934,13 @@ def points(body: PointsReq):
         from decimal import Decimal
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM users WHERE mobile=%s", (body.mobile,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "users",
+                    where_clause="mobile=%s",
+                    select_fields=["id"]
+                )
+                cur.execute(select_sql, (body.mobile,))
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="用户不存在")
@@ -766,24 +954,71 @@ def points(body: PointsReq):
 def points_balance(mobile: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT member_points, merchant_points, withdrawable_balance FROM users WHERE mobile=%s", (mobile,))
+            # 动态检查表结构
+            cur.execute("SHOW COLUMNS FROM users")
+            columns = {row["Field"] for row in cur.fetchall()}
+            
+            # 动态构造资产字段查询（兼容缺少字段的老表，默认值为 0）
+            asset_fields = []
+            asset_defaults = {
+                "member_points": 0,
+                "merchant_points": 0,
+                "withdrawable_balance": 0
+            }
+            for field in asset_defaults.keys():
+                if field in columns:
+                    asset_fields.append(field)
+                else:
+                    asset_fields.append(f"{asset_defaults[field]} AS {field}")
+            
+            cur.execute(
+                f"SELECT {', '.join(asset_fields)} FROM users WHERE mobile=%s",
+                (mobile,)
+            )
             row = cur.fetchone()
             if not row:
                 _err("用户不存在")
-            return row
+            # 确保返回的字段都有默认值
+            return {
+                "member_points": row.get("member_points", 0) or 0,
+                "merchant_points": row.get("merchant_points", 0) or 0,
+                "withdrawable_balance": row.get("withdrawable_balance", 0) or 0
+            }
 
 @router.get("/points/log", summary="积分流水")
 def points_log(mobile: str, points_type: str = "member", page: int = 1, size: int = 10):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id FROM users WHERE mobile=%s", (mobile,))
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="mobile=%s",
+                select_fields=["id"]
+            )
+            cur.execute(select_sql, (mobile,))
             u = cur.fetchone()
             if not u:
                 _err("用户不存在")
+            
+            # 动态获取 points_log 表结构并构造 SELECT
+            structure = get_table_structure(cur, "points_log")
+            select_fields = []
+            for field in structure['fields']:
+                if field in structure['asset_fields']:
+                    select_fields.append(f"COALESCE({field}, 0) AS {field}")
+                else:
+                    select_fields.append(field)
+            
+            # 处理可能不存在的资产字段（如果表结构中没有这些字段，添加默认值）
+            required_asset_fields = ['change_amount', 'balance_after']
+            for asset_field in required_asset_fields:
+                if asset_field not in structure['fields']:
+                    select_fields.append(f"0 AS {asset_field}")
+            
             where, args = ["user_id=%s", "type=%s"], [u["id"], points_type]  # 修改为正确的列名 type
             sql_where = " AND ".join(where)
             sql = f"""
-                SELECT change_amount, reason, related_order, created_at
+                SELECT {', '.join(select_fields)}
                 FROM points_log
                 WHERE {sql_where}
                 ORDER BY created_at DESC
@@ -801,7 +1036,13 @@ def points_log(mobile: str, points_type: str = "member", page: int = 1, size: in
 def reward_list(mobile: str, page: int = 1, size: int = 10):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id FROM users WHERE mobile=%s", (mobile,))
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="mobile=%s",
+                select_fields=["id"]
+            )
+            cur.execute(select_sql, (mobile,))
             u = cur.fetchone()
             if not u:
                 _err("用户不存在")
@@ -888,7 +1129,13 @@ def grant_merchant(mobile: str, admin_key: str):
             )
             if cur.rowcount == 0:
                 # 要么手机号不存在，要么已经是商户
-                cur.execute("SELECT 1 FROM users WHERE mobile=%s", (mobile,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "users",
+                    where_clause="mobile=%s",
+                    select_fields=["1"]
+                )
+                cur.execute(select_sql, (mobile,))
                 if not cur.fetchone():
                     raise HTTPException(status_code=404, detail="用户不存在")
                 return {"msg": "已拥有商户身份，无需重复赋予"}

@@ -3,6 +3,7 @@ import bcrypt
 from typing import Optional
 from enum import IntEnum
 from core.database import get_conn
+from core.table_access import build_dynamic_select
 import string
 import random  # 在文件头部加这两行
 from enum import IntEnum
@@ -40,7 +41,13 @@ class UserService:
         """用户注册"""
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM users WHERE mobile=%s", (mobile,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "users",
+                    where_clause="mobile=%s",
+                    select_fields=["id"]
+                )
+                cur.execute(select_sql, (mobile,))
                 if cur.fetchone():
                     raise ValueError("手机号已注册")
                 pwd_hash = hash_pwd(pwd)
@@ -64,10 +71,22 @@ class UserService:
                 code = None
                 if "referral_code" in insert_cols:
                     code = _generate_code()
-                    cur.execute("SELECT 1 FROM users WHERE referral_code=%s", (code,))
+                    select_sql = build_dynamic_select(
+                        cur,
+                        "users",
+                        where_clause="referral_code=%s",
+                        select_fields=["1"]
+                    )
+                    cur.execute(select_sql, (code,))
                     while cur.fetchone():
                         code = _generate_code()
-                        cur.execute("SELECT 1 FROM users WHERE referral_code=%s", (code,))
+                        select_sql = build_dynamic_select(
+                        cur,
+                        "users",
+                        where_clause="referral_code=%s",
+                        select_fields=["1"]
+                    )
+                    cur.execute(select_sql, (code,))
 
                 # 为每个插入列准备对应的值
                 vals = []
@@ -98,7 +117,13 @@ class UserService:
 
                 # 3. 绑定推荐人（原逻辑不变）
                 if referrer_mobile:
-                    cur.execute("SELECT id FROM users WHERE mobile=%s", (referrer_mobile,))
+                    select_sql = build_dynamic_select(
+                        cur,
+                        "users",
+                        where_clause="mobile=%s",
+                        select_fields=["id"]
+                    )
+                    cur.execute(select_sql, (referrer_mobile,))
                     ref = cur.fetchone()
                     if ref:
                         cur.execute("INSERT INTO user_referrals(user_id, referrer_id) VALUES (%s,%s)",
@@ -110,10 +135,13 @@ class UserService:
         """用户登录"""
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id, password_hash, member_level, status FROM users WHERE mobile=%s",
-                    (mobile,)
+                select_sql = build_dynamic_select(
+                    cur,
+                    "users",
+                    where_clause="mobile=%s",
+                    select_fields=["id", "password_hash", "member_level", "status"]
                 )
+                cur.execute(select_sql, (mobile,))
                 row = cur.fetchone()
                 if not row or not verify_pwd(pwd, row["password_hash"]):
                     raise ValueError("手机号或密码错误")
@@ -133,7 +161,13 @@ class UserService:
         """用户升级一星"""
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT id, member_level FROM users WHERE mobile=%s", (mobile,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "users",
+                    where_clause="mobile=%s",
+                    select_fields=["id", "member_level"]
+                )
+                cur.execute(select_sql, (mobile,))
                 row = cur.fetchone()
                 if not row:
                     raise ValueError("用户不存在")
@@ -150,11 +184,23 @@ class UserService:
         """绑定推荐人"""
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM users WHERE mobile=%s", (mobile,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "users",
+                    where_clause="mobile=%s",
+                    select_fields=["id"]
+                )
+                cur.execute(select_sql, (mobile,))
                 u = cur.fetchone()
                 if not u:
                     raise ValueError("被推荐人不存在")
-                cur.execute("SELECT id FROM users WHERE mobile=%s", (referrer_mobile,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "users",
+                    where_clause="mobile=%s",
+                    select_fields=["id"]
+                )
+                cur.execute(select_sql, (referrer_mobile,))
                 ref = cur.fetchone()
                 if not ref:
                     raise ValueError("推荐人不存在")
@@ -168,7 +214,13 @@ class UserService:
         """设置会员等级"""
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT id, member_level FROM users WHERE mobile=%s", (mobile,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "users",
+                    where_clause="mobile=%s",
+                    select_fields=["id", "member_level"]
+                )
+                cur.execute(select_sql, (mobile,))
                 row = cur.fetchone()
                 if not row:
                     raise ValueError("用户不存在")
@@ -210,7 +262,13 @@ class UserService:
                 cur.execute("SHOW COLUMNS FROM users LIKE 'is_merchant'")
                 if not cur.fetchone():
                     return False
-                cur.execute("SELECT is_merchant FROM users WHERE mobile=%s", (mobile,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "users",
+                    where_clause="mobile=%s",
+                    select_fields=["is_merchant"]
+                )
+                cur.execute(select_sql, (mobile,))
                 row = cur.fetchone()
                 return bool(row and row.get('is_merchant'))
 
@@ -222,7 +280,13 @@ class UserService:
 
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT id, status FROM users WHERE mobile=%s", (mobile,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "users",
+                    where_clause="mobile=%s",
+                    select_fields=["id", "status"]
+                )
+                cur.execute(select_sql, (mobile,))
                 row = cur.fetchone()
                 if not row:
                     raise ValueError("用户不存在")

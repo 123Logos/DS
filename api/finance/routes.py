@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from core.database import get_conn
 from core.logging import get_logger
+from core.table_access import build_dynamic_select
 from database_setup import DatabaseManager
 from services.finance_service import FinanceService
 from core.exceptions import FinanceException, OrderException
@@ -168,7 +169,13 @@ async def create_product(
             # 普通商家发布的商品，检查商家是否存在
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    cur.execute("SELECT id FROM users WHERE id = %s", (product.merchant_id,))
+                    select_sql = build_dynamic_select(
+                        cur,
+                        "users",
+                        where_clause="id = %s",
+                        select_fields=["id"]
+                    )
+                    cur.execute(select_sql, (product.merchant_id,))
                     if not cur.fetchone():
                         raise HTTPException(status_code=400, detail=f"商家不存在: {product.merchant_id}")
 
@@ -268,18 +275,36 @@ async def use_coupon(
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """SELECT * FROM coupons 
+                # 先获取表结构
+                cur.execute("SHOW COLUMNS FROM coupons")
+                columns = cur.fetchall()
+                
+                # 资产字段列表（金额相关字段）
+                asset_fields = {'amount'}
+                
+                # 动态构造 SELECT 语句，对资产字段设置降级默认值
+                select_parts = []
+                for col in columns:
+                    field_name = col['Field']
+                    if field_name in asset_fields:
+                        # 资产字段：如果不存在或为 NULL，返回 0
+                        select_parts.append(f"COALESCE({field_name}, 0) AS {field_name}")
+                    else:
+                        # 普通字段：直接选择
+                        select_parts.append(field_name)
+                
+                select_sql = "SELECT " + ", ".join(select_parts)
+                query_sql = f"""{select_sql} FROM coupons 
                        WHERE id = %s AND user_id = %s AND status = 'unused'
-                       AND valid_from <= CURDATE() AND valid_to >= CURDATE()""",
-                    (request.coupon_id, request.user_id)
-                )
+                       AND valid_from <= CURDATE() AND valid_to >= CURDATE()"""
+                
+                cur.execute(query_sql, (request.coupon_id, request.user_id))
                 coupon = cur.fetchone()
 
                 if not coupon:
                     raise HTTPException(status_code=400, detail="优惠券无效或已过期")
 
-                discount_amount = Decimal(str(coupon['amount']))
+                discount_amount = Decimal(str(coupon['amount'] or 0))
                 final_amount = max(Decimal('0.00'), Decimal(str(request.order_amount)) - discount_amount)
 
                 cur.execute(
@@ -340,13 +365,6 @@ async def submit_test_order(
 
         order_no = f"TEST{datetime.now().strftime('%Y%m%d%H%M%S')}"
 
-        # order_id = service.settle_order(
-        #     order_no=order_no,
-        #     user_id=user_id,
-        #     product_id=product_id,
-        #     quantity=quantity,
-        #     points_to_use=points_to_use
-        # )
 
         return ResponseModel(
             success=True,
@@ -434,7 +452,13 @@ async def get_public_welfare_flow(
             try:
                 with get_conn() as conn:
                     with conn.cursor() as cur:
-                        cur.execute("SELECT name FROM users WHERE id = %s", (uid,))
+                        select_sql = build_dynamic_select(
+                            cur,
+                            "users",
+                            where_clause="id = %s",
+                            select_fields=["name"]
+                        )
+                        cur.execute(select_sql, (uid,))
                         row = cur.fetchone()
                         return row["name"] if row else "未知用户"
             except Exception as e:
@@ -472,7 +496,13 @@ async def get_public_welfare_report(
             try:
                 with get_conn() as conn:
                     with conn.cursor() as cur:
-                        cur.execute("SELECT name FROM users WHERE id = %s", (uid,))
+                        select_sql = build_dynamic_select(
+                            cur,
+                            "users",
+                            where_clause="id = %s",
+                            select_fields=["name"]
+                        )
+                        cur.execute(select_sql, (uid,))
                         row = cur.fetchone()
                         return row["name"] if row else "未知用户"
             except Exception as e:
@@ -493,24 +523,6 @@ async def get_public_welfare_report(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-# @router.post("/api/withdrawals", response_model=ResponseModel, summary="申请提现")
-# async def apply_withdrawal(
-#         request: WithdrawalRequest,
-#         service: FinanceService = Depends(get_finance_service)
-# ):
-#     try:
-#         withdrawal_id = service.apply_withdrawal(**request.model_dump())
-#         if withdrawal_id:
-#             return ResponseModel(success=True, message="提现申请提交成功", data={"withdrawal_id": withdrawal_id})
-#         else:
-#             raise HTTPException(status_code=400, detail="提现申请失败")
-#     except FinanceException as e:
-#         raise HTTPException(status_code=400, detail=str(e))
-#     except Exception as e:
-#         logger.error(f"提现申请失败: {e}")
-#         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.patch("/api/withdrawals/audit", response_model=ResponseModel, summary="审核提现")
@@ -557,20 +569,6 @@ async def get_pending_rewards(
     except Exception as e:
         logger.error(f"查询奖励列表失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-# @router.get("/api/coupons/{user_id}", response_model=ResponseModel, summary="查询用户优惠券")
-# async def get_user_coupons(
-#         user_id: int,
-#         service: FinanceService = Depends(get_finance_service),
-#         status: str = Query('unused', pattern=r'^(unused|used|expired)$')
-# ):
-#     try:
-#         coupons = service.get_user_coupons(user_id, status)
-#         return ResponseModel(success=True, message="优惠券查询成功", data={"coupons": coupons})
-#     except Exception as e:
-#         logger.error(f"查询优惠券失败: {e}")
-#         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/api/reports/finance", response_model=ResponseModel, summary="财务总览报告")
@@ -628,18 +626,6 @@ async def get_points_deduction_report(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# @router.post("/api/directors/check-promotion", response_model=ResponseModel, summary="执行荣誉董事晋升")
-# async def check_director_promotion(
-#         service: FinanceService = Depends(get_finance_service)
-# ):
-#     try:
-#         service.check_director_promotion()
-#         return ResponseModel(success=True, message="荣誉董事晋升审核完成")
-#     except Exception as e:
-#         logger.error(f"荣誉董事晋升失败: {e}")
-#         raise HTTPException(status_code=500, detail=str(e))
-
-
 @router.get("/api/admin/reports/transaction-chain", response_model=ResponseModel, summary="交易推荐链报表")
 async def get_transaction_chain_report(
         user_id: int = Query(..., gt=0, description="购买者ID"),
@@ -654,82 +640,6 @@ async def get_transaction_chain_report(
     except Exception as e:
         logger.error(f"查询交易链报表失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-# @router.post("/api/orders/test-reward-chain", response_model=ResponseModel, summary="测试层级返利")
-# async def test_reward_chain(
-#         service: FinanceService = Depends(get_finance_service),
-#         buyer_id: int = Query(..., gt=0, description="购买者ID")
-# ):
-#     try:
-#         with get_conn() as conn:
-#             with conn.cursor() as cur:
-#                 cur.execute("SELECT referrer_id FROM user_referrals WHERE user_id = %s", (buyer_id,))
-#                 ref = cur.fetchone()
-
-#                 if not ref or not ref.get("referrer_id"):
-#                     return ResponseModel(success=True, message="该用户无推荐人", data={"has_referrer": False})
-
-#                 chain = []
-#                 current_id = buyer_id
-
-#                 for layer in range(1, MAX_TEAM_LAYER + 1):
-#                     cur.execute("SELECT referrer_id FROM user_referrals WHERE user_id = %s", (current_id,))
-#                     ref_info = cur.fetchone()
-#                     if not ref_info or not ref_info.get("referrer_id"):
-#                         break
-
-#                     referrer_id = ref_info["referrer_id"]
-#                     cur.execute("SELECT name, member_level FROM users WHERE id = %s", (referrer_id,))
-#                     user_info = cur.fetchone()
-
-#                     chain.append({
-#                         "layer": layer,
-#                         "user_id": referrer_id,
-#                         "name": user_info["name"],
-#                         "member_level": user_info["member_level"],
-#                         "eligible": user_info["member_level"] >= layer
-#                     })
-
-#                     current_id = referrer_id
-
-#         return ResponseModel(success=True, message="查询成功", data={
-#             "buyer_id": buyer_id,
-#             "has_referrer": True,
-#             "reward_chain": chain
-#         })
-#     except Exception as e:
-#         logger.error(f"测试奖励链失败: {e}")
-#         raise HTTPException(status_code=500, detail=str(e))
-
-
-# @router.delete("/api/cleanup", response_model=ResponseModel, summary="清理测试数据")
-# async def cleanup_database(
-#         confirm: str = Query(..., description="确认参数，必须传入'YES'"),
-#         service: FinanceService = Depends(get_finance_service)
-# ):
-#     try:
-#         if confirm != 'YES':
-#             raise HTTPException(status_code=400, detail="请确认参数'confirm=YES'以执行清理")
-
-#         tables = [
-#             'director_dividends', 'weekly_subsidy_records', 'account_flow',
-#             'points_log', 'order_items', 'orders', 'products',
-#             'team_rewards', 'user_referrals', 'withdrawals', 'coupons',
-#             'pending_rewards', 'finance_accounts', 'users'
-#         ]
-
-#         with get_conn() as conn:
-#             with conn.cursor() as cur:
-#                 for table in tables:
-#                     cur.execute(f"DROP TABLE IF EXISTS {table}")
-#                 conn.commit()
-#         return ResponseModel(success=True, message="测试环境清理完成")
-#     except HTTPException:
-#         raise
-#     except Exception as e:
-#         logger.error(f"清理测试环境失败: {e}")
-#         raise HTTPException(status_code=500, detail=str(e))
 
 
 def register_finance_routes(app: FastAPI):

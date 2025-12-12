@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from core.database import get_conn
 from core.config import BASE_PIC_DIR, CATEGORY_CHOICES
+from core.table_access import build_dynamic_select, get_table_structure
 from pypinyin import lazy_pinyin, Style
 
 
@@ -185,13 +186,25 @@ def search_products(
                 product_id = product['id']
 
                 # 获取 SKUs
-                cur.execute("SELECT id, sku_code, price, stock FROM product_skus WHERE product_id = %s", (product_id,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "product_skus",
+                    where_clause="product_id = %s",
+                    select_fields=["id", "sku_code", "price", "stock"]
+                )
+                cur.execute(select_sql, (product_id,))
                 skus = cur.fetchall()
                 skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']), "stock": s['stock']} for
                         s in skus]
 
                 # 获取 attributes
-                cur.execute("SELECT name, value FROM product_attributes WHERE product_id = %s", (product_id,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "product_attributes",
+                    where_clause="product_id = %s",
+                    select_fields=["name", "value"]
+                )
+                cur.execute(select_sql, (product_id,))
                 attributes = cur.fetchall()
                 attributes = [{"name": a['name'], "value": a['value']} for a in attributes]
 
@@ -248,12 +261,24 @@ def get_all_products(
                 product_id = product['id']
 
                 # 获取 SKUs
-                cur.execute("SELECT id, sku_code, price, stock FROM product_skus WHERE product_id = %s", (product_id,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "product_skus",
+                    where_clause="product_id = %s",
+                    select_fields=["id", "sku_code", "price", "stock"]
+                )
+                cur.execute(select_sql, (product_id,))
                 skus = cur.fetchall()
                 skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']), "stock": s['stock']} for s in skus]
 
                 # 获取 attributes
-                cur.execute("SELECT name, value FROM product_attributes WHERE product_id = %s", (product_id,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "product_attributes",
+                    where_clause="product_id = %s",
+                    select_fields=["name", "value"]
+                )
+                cur.execute(select_sql, (product_id,))
                 attributes = cur.fetchall()
                 attributes = [{"name": a['name'], "value": a['value']} for a in attributes]
 
@@ -267,19 +292,36 @@ def get_product(id: int):
     with get_conn() as conn:
         with conn.cursor() as cur:
             # 查询商品
-            cur.execute("SELECT * FROM products WHERE id = %s", (id,))
+            select_sql = build_dynamic_select(
+                cur,
+                "products",
+                where_clause="id = %s"
+            )
+            cur.execute(select_sql, (id,))
             product = cur.fetchone()
             if not product:
                 raise HTTPException(status_code=404, detail="商品不存在")
 
             # 获取 SKUs
-            cur.execute("SELECT id, sku_code, price, stock FROM product_skus WHERE product_id = %s", (id,))
+            select_sql = build_dynamic_select(
+                cur,
+                "product_skus",
+                where_clause="product_id = %s",
+                select_fields=["id", "sku_code", "price", "stock"]
+            )
+            cur.execute(select_sql, (id,))
             skus = cur.fetchall()
             skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']), "stock": s['stock']} for s in
                     skus]
 
             # 获取 attributes
-            cur.execute("SELECT name, value FROM product_attributes WHERE product_id = %s", (id,))
+            select_sql = build_dynamic_select(
+                cur,
+                "product_attributes",
+                where_clause="product_id = %s",
+                select_fields=["name", "value"]
+            )
+            cur.execute(select_sql, (id,))
             attributes = cur.fetchall()
             attributes = [{"name": a['name'], "value": a['value']} for a in attributes]
 
@@ -329,17 +371,34 @@ def add_product(payload: ProductCreate):
                 conn.commit()
 
                 # 查询创建的商品
-                cur.execute("SELECT * FROM products WHERE id = %s", (product_id,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "products",
+                    where_clause="id = %s"
+                )
+                cur.execute(select_sql, (product_id,))
                 product = cur.fetchone()
 
                 # 获取 SKUs
-                cur.execute("SELECT id, sku_code, price, stock FROM product_skus WHERE product_id = %s", (product_id,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "product_skus",
+                    where_clause="product_id = %s",
+                    select_fields=["id", "sku_code", "price", "stock"]
+                )
+                cur.execute(select_sql, (product_id,))
                 skus = cur.fetchall()
                 skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']), "stock": s['stock']} for
                         s in skus]
 
                 # 获取 attributes
-                cur.execute("SELECT name, value FROM product_attributes WHERE product_id = %s", (product_id,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "product_attributes",
+                    where_clause="product_id = %s",
+                    select_fields=["name", "value"]
+                )
+                cur.execute(select_sql, (product_id,))
                 attributes = cur.fetchall()
                 attributes = [{"name": a['name'], "value": a['value']} for a in attributes]
 
@@ -356,7 +415,12 @@ def update_product(id: int, payload: ProductUpdate):
         with conn.cursor() as cur:
             try:
                 # 检查商品是否存在
-                cur.execute("SELECT * FROM products WHERE id = %s", (id,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "products",
+                    where_clause="id = %s"
+                )
+                cur.execute(select_sql, (id,))
                 product = cur.fetchone()
                 if not product:
                     raise HTTPException(status_code=404, detail="商品不存在")
@@ -399,17 +463,34 @@ def update_product(id: int, payload: ProductUpdate):
                 conn.commit()
 
                 # 查询更新后的商品
-                cur.execute("SELECT * FROM products WHERE id = %s", (id,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "products",
+                    where_clause="id = %s"
+                )
+                cur.execute(select_sql, (id,))
                 updated_product = cur.fetchone()
 
                 # 获取 SKUs
-                cur.execute("SELECT id, sku_code, price, stock FROM product_skus WHERE product_id = %s", (id,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "product_skus",
+                    where_clause="product_id = %s",
+                    select_fields=["id", "sku_code", "price", "stock"]
+                )
+                cur.execute(select_sql, (id,))
                 skus = cur.fetchall()
                 skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']), "stock": s['stock']} for
                         s in skus]
 
                 # 获取 attributes
-                cur.execute("SELECT name, value FROM product_attributes WHERE product_id = %s", (id,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "product_attributes",
+                    where_clause="product_id = %s",
+                    select_fields=["name", "value"]
+                )
+                cur.execute(select_sql, (id,))
                 attributes = cur.fetchall()
                 attributes = [{"name": a['name'], "value": a['value']} for a in attributes]
 
@@ -435,7 +516,12 @@ def upload_images(
         with conn.cursor() as cur:
             try:
                 # 查询商品
-                cur.execute("SELECT * FROM products WHERE id = %s", (id,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "products",
+                    where_clause="id = %s"
+                )
+                cur.execute(select_sql, (id,))
                 product = cur.fetchone()
                 if not product:
                     raise HTTPException(status_code=404, detail="商品不存在")
@@ -501,17 +587,34 @@ def upload_images(
                 conn.commit()
 
                 # 查询更新后的商品
-                cur.execute("SELECT * FROM products WHERE id = %s", (id,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "products",
+                    where_clause="id = %s"
+                )
+                cur.execute(select_sql, (id,))
                 updated_product = cur.fetchone()
 
                 # 获取 SKUs
-                cur.execute("SELECT id, sku_code, price, stock FROM product_skus WHERE product_id = %s", (id,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "product_skus",
+                    where_clause="product_id = %s",
+                    select_fields=["id", "sku_code", "price", "stock"]
+                )
+                cur.execute(select_sql, (id,))
                 skus = cur.fetchall()
                 skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']), "stock": s['stock']} for
                         s in skus]
 
                 # 获取 attributes
-                cur.execute("SELECT name, value FROM product_attributes WHERE product_id = %s", (id,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "product_attributes",
+                    where_clause="product_id = %s",
+                    select_fields=["name", "value"]
+                )
+                cur.execute(select_sql, (id,))
                 attributes = cur.fetchall()
                 attributes = [{"name": a['name'], "value": a['value']} for a in attributes]
 

@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 from core.database import get_conn
+from core.table_access import build_dynamic_select
 from services.finance_service import reverse_split_on_refund
 from typing import Dict, Any
 
@@ -12,7 +13,13 @@ class RefundManager:
     def apply(order_number: str, refund_type: str, reason_code: str) -> bool:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM refunds WHERE order_number=%s", (order_number,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "refunds",
+                    where_clause="order_number=%s",
+                    select_fields=["id"]
+                )
+                cur.execute(select_sql, (order_number,))
                 if cur.fetchone():
                     return False
                 cur.execute("""INSERT INTO refunds(order_number,refund_type,reason,status)
@@ -37,7 +44,12 @@ class RefundManager:
     def progress(order_number: str) -> Optional[Dict[str, Any]]:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT * FROM refunds WHERE order_number=%s", (order_number,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "refunds",
+                    where_clause="order_number=%s"
+                )
+                cur.execute(select_sql, (order_number,))
                 return cur.fetchone()
 
 # ---------------- 路由 ----------------

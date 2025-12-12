@@ -23,7 +23,6 @@ from api.finance.routes import register_finance_routes
 from api.user.routes import register_routes as register_user_routes
 from api.order import register_routes as register_order_routes
 from api.product.routes import register_routes as register_product_routes
-from api.order import register_routes as register_order_routes
 
 
 def ensure_database():
@@ -130,8 +129,6 @@ def custom_openapi():
 
 
 app.openapi = custom_openapi
-
-# 已在上方完成静态挂载与路由注册，下面重复的挂载/注册已移除以避免副作用
 
 
 if __name__ == "__main__":

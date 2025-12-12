@@ -2,6 +2,7 @@
 from fastapi import APIRouter, HTTPException
 from typing import Optional, Dict, Any
 from core.database import get_conn
+from core.table_access import build_dynamic_select
 
 router = APIRouter(tags=["商品管理"], responses={404: {"description": "未找到"}})
 
@@ -13,7 +14,13 @@ router = APIRouter(tags=["商品管理"], responses={404: {"description": "未�
 def get_product_rules(id: int):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, is_member_product, buy_rule FROM products WHERE id = %s", (id,))
+            select_sql = build_dynamic_select(
+                cur,
+                "products",
+                where_clause="id = %s",
+                select_fields=["id", "is_member_product", "buy_rule"]
+            )
+            cur.execute(select_sql, (id,))
             prod = cur.fetchone()
             if not prod:
                 raise HTTPException(status_code=404, detail="商品不存在")

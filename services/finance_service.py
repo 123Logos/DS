@@ -13,6 +13,7 @@ from core.database import get_conn
 from core.db_adapter import PyMySQLAdapter
 from core.exceptions import FinanceException, OrderException, InsufficientBalanceException
 from core.logging import get_logger
+from core.table_access import build_dynamic_select, get_table_structure
 
 # 使用统一的日志配置
 logger = get_logger(__name__)
@@ -421,8 +422,29 @@ class FinanceService:
             List[Dict[str, Any]]:
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # 动态获取 pending_rewards 表的所有列
+                cur.execute("SHOW COLUMNS FROM pending_rewards")
+                columns = cur.fetchall()
+                column_names = [col['Field'] for col in columns]
+                
+                # 资产字段列表（需要降级默认值的字段）
+                asset_fields = ['amount']
+                
+                # 动态构造 SELECT 字段列表，对资产字段做降级默认值处理
+                select_fields = []
+                for col_name in column_names:
+                    if col_name in asset_fields:
+                        # 对资产字段使用 COALESCE 提供默认值 0
+                        select_fields.append(f"COALESCE(pr.{col_name}, 0) AS {col_name}")
+                    else:
+                        select_fields.append(f"pr.{col_name}")
+                
+                # 添加用户名称字段
+                select_fields.append("u.name AS user_name")
+                
+                # 构造完整的 SELECT 语句
                 params = [status, limit]
-                sql = """SELECT pr.id, pr.user_id, u.name as user_name, pr.reward_type, pr.amount, pr.order_id, pr.layer, pr.status, pr.created_at
+                sql = f"""SELECT {', '.join(select_fields)}
                          FROM pending_rewards pr JOIN users u ON pr.user_id = u.id WHERE pr.status = %s"""
                 if reward_type:
                     sql += " AND pr.reward_type = %s"
@@ -431,17 +453,25 @@ class FinanceService:
 
                 cur.execute(sql, tuple(params))
                 rewards = cur.fetchall()
-                return [{
-                    "id": r['id'],
-                    "user_id": r['user_id'],
-                    "user_name": r['user_name'],
-                    "reward_type": r['reward_type'],
-                    "amount": float(r['amount']),
-                    "order_id": r['order_id'],
-                    "layer": r['layer'],
-                    "status": r['status'],
-                    "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S")
-                } for r in rewards]
+                
+                # 动态构造返回结果
+                result = []
+                for r in rewards:
+                    reward_dict = {}
+                    for col_name in column_names:
+                        value = r.get(col_name)
+                        # 对资产字段转换为 float，其他字段保持原样
+                        if col_name in asset_fields:
+                            reward_dict[col_name] = float(value) if value is not None else 0.0
+                        elif col_name == 'created_at' and value:
+                            reward_dict[col_name] = value.strftime("%Y-%m-%d %H:%M:%S") if hasattr(value, 'strftime') else str(value)
+                        else:
+                            reward_dict[col_name] = value
+                    # 添加用户名称
+                    reward_dict['user_name'] = r.get('user_name')
+                    result.append(reward_dict)
+                
+                return result
 
     def refund_order(self, order_no: str) -> bool:
         try:
@@ -476,8 +506,22 @@ class FinanceService:
                             {"amount": reward_amount, "user_id": referrer.referrer_id}
                         )
 
+                    # 动态构造 SELECT 语句（使用临时连接获取表结构，不影响当前事务）
+                    with get_conn() as temp_conn:
+                        with temp_conn.cursor() as temp_cur:
+                            select_fields, existing_columns = _build_team_rewards_select(temp_cur, ['reward_amount'])
+                            # 确保包含 user_id 字段（如果不存在则添加默认值 0）
+                            if 'user_id' not in existing_columns:
+                                select_fields = "0 AS user_id, " + select_fields
+                            else:
+                                # 如果 user_id 存在，确保它在最前面
+                                fields_list = [f.strip() for f in select_fields.split(",")]
+                                # 移除 user_id（如果存在）
+                                fields_list = [f for f in fields_list if f != 'user_id' and not f.startswith('user_id ')]
+                                select_fields = "user_id, " + ", ".join(fields_list)
+                    
                     result = self.session.execute(
-                        "SELECT user_id, reward_amount FROM team_rewards WHERE order_id = %s",
+                        f"SELECT {select_fields} FROM team_rewards WHERE order_id = %s",
                         {"order_id": order.id}
                     )
                     rewards = result.fetchall()
@@ -725,10 +769,31 @@ class FinanceService:
 
     def audit_withdrawal(self, withdrawal_id: int, approve: bool, auditor: str = 'admin') -> bool:
         try:
-            result = self.session.execute(
-                "SELECT * FROM withdrawals WHERE id = %s FOR UPDATE",
-                {"withdrawal_id": withdrawal_id}
-            )
+            # 先获取表结构，动态构造 SELECT 语句（表结构查询不需要事务）
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SHOW COLUMNS FROM withdrawals")
+                    columns = cur.fetchall()
+            
+            # 识别资产字段关键词（数值类型字段）
+            asset_keywords = ['balance', 'points', 'amount', 'total', 'frozen', 'available', 'tax']
+            select_fields = []
+            for col in columns:
+                field_name = col['Field']
+                field_type = col['Type'].upper()
+                # 如果是资产相关字段（字段名包含资产关键词）且为数值类型，添加降级默认值
+                is_asset_field = any(keyword in field_name.lower() for keyword in asset_keywords)
+                is_numeric_type = 'DECIMAL' in field_type or 'INT' in field_type or 'FLOAT' in field_type or 'DOUBLE' in field_type
+                
+                if is_asset_field and is_numeric_type:
+                    # 对资产字段做降级默认值（不存在或为NULL时返回0）
+                    select_fields.append(f"COALESCE({field_name}, 0) AS {field_name}")
+                else:
+                    select_fields.append(field_name)
+            
+            # 动态构造 SELECT 语句，使用 self.session 执行（确保在同一事务中）
+            select_sql = f"SELECT {', '.join(select_fields)} FROM withdrawals WHERE id = :withdrawal_id FOR UPDATE"
+            result = self.session.execute(select_sql, {"withdrawal_id": withdrawal_id})
             withdraw = result.fetchone()
 
             if not withdraw or withdraw.status not in ['pending_auto', 'pending_manual']:
@@ -736,8 +801,8 @@ class FinanceService:
 
             new_status = 'approved' if approve else 'rejected'
             self.session.execute(
-                """UPDATE withdrawals SET status = %s, audit_remark = %s, processed_at = NOW()
-                   WHERE id = %s""",
+                """UPDATE withdrawals SET status = :status, audit_remark = :remark, processed_at = NOW()
+                   WHERE id = :withdrawal_id""",
                 {
                     "status": new_status,
                     "remark": f"{auditor}审核",
@@ -1156,8 +1221,30 @@ class FinanceService:
                               FROM users WHERE merchant_points > 0 OR merchant_balance > 0""")
                 merchant = cur.fetchone()
 
-                # 平台资金池
-                cur.execute("SELECT account_name, account_type, balance FROM finance_accounts")
+                # 平台资金池 - 动态构造查询，对资产字段做降级默认值
+                # 先获取表结构
+                cur.execute("SHOW COLUMNS FROM finance_accounts")
+                columns = cur.fetchall()
+                
+                # 识别资产字段关键词（数值类型字段）
+                asset_keywords = ['balance', 'points', 'amount', 'total', 'frozen', 'available']
+                select_fields = []
+                for col in columns:
+                    field_name = col['Field']
+                    field_type = col['Type'].upper()
+                    # 如果是资产相关字段（字段名包含资产关键词）且为数值类型，添加降级默认值
+                    is_asset_field = any(keyword in field_name.lower() for keyword in asset_keywords)
+                    is_numeric_type = 'DECIMAL' in field_type or 'INT' in field_type or 'FLOAT' in field_type or 'DOUBLE' in field_type
+                    
+                    if is_asset_field and is_numeric_type:
+                        # 对资产字段做降级默认值（不存在或为NULL时返回0）
+                        select_fields.append(f"COALESCE({field_name}, 0) AS {field_name}")
+                    else:
+                        select_fields.append(field_name)
+                
+                # 动态构造 SELECT 语句
+                select_sql = f"SELECT {', '.join(select_fields)} FROM finance_accounts"
+                cur.execute(select_sql)
                 pools = cur.fetchall()
 
                 # 优惠券统计
@@ -1204,23 +1291,54 @@ class FinanceService:
     def get_account_flow_report(self, limit: int = 50) -> List[Dict[str, Any]]:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """SELECT id, account_id, account_type, related_user, change_amount, balance_after, flow_type, remark, created_at
-                       FROM account_flow ORDER BY created_at DESC LIMIT %s""",
-                    (limit,)
-                )
+                # 获取表结构
+                cur.execute("SHOW COLUMNS FROM account_flow")
+                columns = cur.fetchall()
+                
+                # 识别资产字段（DECIMAL 类型字段）
+                asset_fields = set()
+                all_fields = []
+                for col in columns:
+                    field_name = col['Field']
+                    field_type = col['Type'].upper()
+                    all_fields.append(field_name)
+                    # 判断是否为资产字段（DECIMAL 类型）
+                    if 'DECIMAL' in field_type or 'FLOAT' in field_type or 'DOUBLE' in field_type:
+                        asset_fields.add(field_name)
+                
+                # 动态构造 SELECT 语句，对资产字段做降级默认值处理
+                select_parts = []
+                for field in all_fields:
+                    if field in asset_fields:
+                        # 资产字段：如果为 NULL 则返回 0
+                        select_parts.append(f"COALESCE({field}, 0) AS {field}")
+                    else:
+                        select_parts.append(field)
+                
+                sql = f"SELECT {', '.join(select_parts)} FROM account_flow ORDER BY created_at DESC LIMIT %s"
+                cur.execute(sql, (limit,))
                 flows = cur.fetchall()
-                return [{
-                    "id": f['id'],
-                    "account_id": f['account_id'],
-                    "account_type": f['account_type'],
-                    "related_user": f['related_user'],
-                    "change_amount": float(f['change_amount']),
-                    "balance_after": float(f['balance_after']) if f['balance_after'] else None,
-                    "flow_type": f['flow_type'],
-                    "remark": f['remark'],
-                    "created_at": f['created_at'].strftime("%Y-%m-%d %H:%M:%S")
-                } for f in flows]
+                
+                # 格式化返回结果
+                result = []
+                for f in flows:
+                    item = {}
+                    for field in all_fields:
+                        value = f[field]
+                        if field in asset_fields:
+                            # 资产字段转换为 float
+                            item[field] = float(value) if value is not None else 0.0
+                        elif field == 'created_at' and value:
+                            # 日期字段格式化
+                            if isinstance(value, datetime):
+                                item[field] = value.strftime("%Y-%m-%d %H:%M:%S")
+                            else:
+                                item[field] = str(value)
+                        else:
+                            item[field] = value
+                    result.append(item)
+                
+                return result
 
     def get_points_flow_report(self, user_id: Optional[int] = None, limit: int = 50) -> List[Dict[str, Any]]:
         with get_conn() as conn:
@@ -1245,6 +1363,68 @@ class FinanceService:
                     "related_order": f['related_order'],
                     "created_at": f['created_at'].strftime("%Y-%m-%d %H:%M:%S")
                 } for f in flows]
+
+    def get_weekly_subsidy_records(self, user_id: Optional[int] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        """查询周补贴记录，动态构造 SELECT 语句，对资产字段做降级默认值处理"""
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 先获取表结构
+                cur.execute("SHOW COLUMNS FROM weekly_subsidy_records")
+                columns = cur.fetchall()
+                column_names = [col['Field'] for col in columns]
+                
+                # 识别资产字段关键词（数值类型字段）
+                asset_keywords = ['amount', 'points', 'balance', 'total', 'frozen', 'available']
+                select_fields = []
+                asset_fields = []
+                for col in columns:
+                    field_name = col['Field']
+                    field_type = col['Type'].upper()
+                    # 如果是资产相关字段（字段名包含资产关键词）且为数值类型，添加降级默认值
+                    is_asset_field = any(keyword in field_name.lower() for keyword in asset_keywords)
+                    is_numeric_type = 'DECIMAL' in field_type or 'INT' in field_type or 'FLOAT' in field_type or 'DOUBLE' in field_type
+                    
+                    if is_asset_field and is_numeric_type:
+                        # 对资产字段做降级默认值（不存在或为NULL时返回0）
+                        select_fields.append(f"COALESCE(wsr.{field_name}, 0) AS {field_name}")
+                        asset_fields.append(field_name)
+                    else:
+                        select_fields.append(f"wsr.{field_name}")
+                
+                # 添加用户名称字段
+                select_fields.append("u.name AS user_name")
+                
+                # 构造完整的 SELECT 语句
+                params = [limit]
+                sql = f"""SELECT {', '.join(select_fields)}
+                         FROM weekly_subsidy_records wsr 
+                         LEFT JOIN users u ON wsr.user_id = u.id"""
+                if user_id:
+                    sql += " WHERE wsr.user_id = %s"
+                    params.insert(0, user_id)
+                sql += " ORDER BY wsr.week_start DESC, wsr.id DESC LIMIT %s"
+
+                cur.execute(sql, tuple(params))
+                records = cur.fetchall()
+                
+                # 动态构造返回结果
+                result = []
+                for r in records:
+                    record_dict = {}
+                    for col_name in column_names:
+                        value = r.get(col_name)
+                        # 对资产字段转换为 float，其他字段保持原样
+                        if col_name in asset_fields:
+                            record_dict[col_name] = float(value) if value is not None else 0.0
+                        elif col_name == 'week_start' and value:
+                            record_dict[col_name] = value.strftime("%Y-%m-%d") if hasattr(value, 'strftime') else str(value)
+                        else:
+                            record_dict[col_name] = value
+                    # 添加用户名称
+                    record_dict['user_name'] = r.get('user_name')
+                    result.append(record_dict)
+                
+                return result
 
     # ==================== 关键修改2 & 3：修复返回字段名 ====================
     def get_points_deduction_report(self, start_date: str, end_date: str, page: int = 1, page_size: int = 20) -> Dict[
@@ -1353,9 +1533,14 @@ class FinanceService:
 
                     level += 1
 
+                    # 动态构造 SELECT 语句
+                    select_fields, existing_columns = _build_team_rewards_select(cur, ['reward_amount'])
+                    # 确保包含 created_at 字段（如果不存在则使用 NULL）
+                    if 'created_at' not in existing_columns:
+                        select_fields = select_fields + ", NULL AS created_at"
+                    
                     cur.execute(
-                        """SELECT reward_amount, created_at FROM team_rewards
-                           WHERE order_id = %s AND layer = %s""",
+                        f"SELECT {select_fields} FROM team_rewards WHERE order_id = %s AND layer = %s",
                         (order['id'], level)
                     )
                     team_reward = cur.fetchone()
@@ -1410,6 +1595,41 @@ class FinanceService:
 
 # ==================== 订单系统财务功能（来自 order/finance.py） ====================
 
+def _build_team_rewards_select(cursor, asset_fields: List[str] = None) -> tuple:
+    """
+    动态构造 team_rewards 表的 SELECT 语句
+    
+    Args:
+        cursor: 数据库游标
+        asset_fields: 资产字段列表，如果字段不存在则使用默认值 0
+    
+    Returns:
+        (select_fields_str, existing_columns_set) 元组
+        - select_fields_str: 构造的 SELECT 语句（不包含 FROM 子句）
+        - existing_columns_set: 已存在的列名集合
+    """
+    if asset_fields is None:
+        asset_fields = ['reward_amount']
+    
+    # 获取表结构
+    cursor.execute("SHOW COLUMNS FROM team_rewards")
+    columns = cursor.fetchall()
+    existing_columns = {col['Field'] for col in columns}
+    
+    # 构造 SELECT 字段列表
+    select_fields = []
+    for col in columns:
+        field_name = col['Field']
+        select_fields.append(field_name)
+    
+    # 对于资产字段，如果不存在则添加默认值
+    for asset_field in asset_fields:
+        if asset_field not in existing_columns:
+            select_fields.append(f"0 AS {asset_field}")
+    
+    return ", ".join(select_fields), existing_columns
+
+
 def split_order_funds(order_number: str, total: Decimal, is_vip: bool, cursor=None):
     """订单分账：将订单金额分配给商家和各个资金池
 
@@ -1459,7 +1679,13 @@ def _execute_split(cur, order_number: str, total: Decimal):
     )
     
     # 获取商家余额
-    cur.execute("SELECT balance FROM merchant_balance WHERE merchant_id=1")
+    select_sql = build_dynamic_select(
+        cur,
+        "merchant_balance",
+        where_clause="merchant_id=1",
+        select_fields=["balance"]
+    )
+    cur.execute(select_sql)
     merchant_balance_row = cur.fetchone()
     merchant_balance_after = merchant_balance_row["balance"] if merchant_balance_row else merchant
     
@@ -1511,7 +1737,13 @@ def _execute_split(cur, order_number: str, total: Decimal):
         )
         
         # 获取更新后的余额
-        cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (account_type,))
+        select_sql = build_dynamic_select(
+            cur,
+            "finance_accounts",
+            where_clause="account_type = %s",
+            select_fields=["balance"]
+        )
+        cur.execute(select_sql, (account_type,))
         balance_row = cur.fetchone()
         balance_after = balance_row["balance"] if balance_row else amt
         
@@ -1549,7 +1781,13 @@ def reverse_split_on_refund(order_number: str):
                 )
                 
                 # 获取回冲后的余额
-                cur.execute("SELECT balance FROM merchant_balance WHERE merchant_id=1")
+                select_sql = build_dynamic_select(
+                    cur,
+                    "merchant_balance",
+                    where_clause="merchant_id=1",
+                    select_fields=["balance"]
+                )
+                cur.execute(select_sql)
                 merchant_balance_row = cur.fetchone()
                 merchant_balance_after = merchant_balance_row["balance"] if merchant_balance_row else Decimal("0")
                 
@@ -1589,7 +1827,13 @@ def reverse_split_on_refund(order_number: str):
                     )
                     
                     # 获取回冲后的余额
-                    cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (account_type,))
+                    select_sql = build_dynamic_select(
+                        cur,
+                        "finance_accounts",
+                        where_clause="account_type = %s",
+                        select_fields=["balance"]
+                    )
+                    cur.execute(select_sql, (account_type,))
                     balance_row = cur.fetchone()
                     balance_after = balance_row["balance"] if balance_row else Decimal("0")
                     
@@ -1707,13 +1951,19 @@ def generate_statement():
         with conn.cursor() as cur:
             yesterday = date.today() - timedelta(days=1)
 
-            # 获取期初余额
-            cur.execute(
-                "SELECT closing_balance FROM merchant_statement WHERE merchant_id=1 AND date<%s ORDER BY date DESC LIMIT 1",
-                (yesterday,)
+            # 动态构造 SELECT 语句
+            select_sql = build_dynamic_select(
+                cur, 
+                "merchant_statement",
+                where_clause="merchant_id=1 AND date<%s",
+                order_by="date DESC",
+                limit="1"
             )
+            
+            # 获取期初余额
+            cur.execute(select_sql, (yesterday,))
             row = cur.fetchone()
-            opening = row["closing_balance"] if row else Decimal("0")
+            opening = Decimal(str(row["closing_balance"])) if row and row.get("closing_balance") is not None else Decimal("0")
 
             # 获取当日收入（从 account_flow 表查询）
             cur.execute(

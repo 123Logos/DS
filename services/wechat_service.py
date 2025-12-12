@@ -8,6 +8,7 @@ from fastapi import HTTPException
 
 from core.database import get_conn
 from core.config import WECHAT_APP_ID, WECHAT_APP_SECRET
+from core.table_access import build_dynamic_select
 from services.user_service import hash_pwd, UserStatus, _generate_code
 
 
@@ -35,7 +36,13 @@ class WechatService:
         """通过openid查询用户"""
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM users WHERE openid=%s", (openid,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "users",
+                    where_clause="openid=%s",
+                    select_fields=["id"]
+                )
+                cur.execute(select_sql, (openid,))
                 return cur.fetchone()
 
     @staticmethod
@@ -66,18 +73,42 @@ class WechatService:
                 code = None
                 if "referral_code" in insert_cols:
                     code = _generate_code()
-                    cur.execute("SELECT 1 FROM users WHERE referral_code=%s", (code,))
+                    select_sql = build_dynamic_select(
+                        cur,
+                        "users",
+                        where_clause="referral_code=%s",
+                        select_fields=["1"]
+                    )
+                    cur.execute(select_sql, (code,))
                     while cur.fetchone():
                         code = _generate_code()
-                        cur.execute("SELECT 1 FROM users WHERE referral_code=%s", (code,))
+                        select_sql = build_dynamic_select(
+                            cur,
+                            "users",
+                            where_clause="referral_code=%s",
+                            select_fields=["1"]
+                        )
+                        cur.execute(select_sql, (code,))
 
                 # 确保占位手机号不冲突
-                cur.execute("SELECT 1 FROM users WHERE mobile=%s", (mobile,))
+                select_sql = build_dynamic_select(
+                    cur,
+                    "users",
+                    where_clause="mobile=%s",
+                    select_fields=["1"]
+                )
+                cur.execute(select_sql, (mobile,))
                 idx = 1
                 base_mobile = mobile
                 while cur.fetchone():
                     mobile = f"{base_mobile}_{idx}"
-                    cur.execute("SELECT 1 FROM users WHERE mobile=%s", (mobile,))
+                    select_sql = build_dynamic_select(
+                        cur,
+                        "users",
+                        where_clause="mobile=%s",
+                        select_fields=["1"]
+                    )
+                    cur.execute(select_sql, (mobile,))
                     idx += 1
 
                 vals = []

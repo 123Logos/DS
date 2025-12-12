@@ -3,6 +3,7 @@ import threading
 import time
 from datetime import datetime
 from core.database import get_conn
+from core.table_access import build_dynamic_select
 from services.finance_service import settle_to_merchant
 from decimal import Decimal
 
@@ -13,7 +14,13 @@ def auto_receive_task():
                 with get_conn() as conn:
                     with conn.cursor() as cur:
                         now = datetime.now()
-                        cur.execute("SELECT id,order_number,total_amount FROM orders WHERE status='pending_recv' AND auto_recv_time<=%s", (now,))
+                        select_sql = build_dynamic_select(
+                            cur,
+                            "orders",
+                            where_clause="status='pending_recv' AND auto_recv_time<=%s",
+                            select_fields=["id", "order_number", "total_amount"]
+                        )
+                        cur.execute(select_sql, (now,))
                         for row in cur.fetchall():
                             cur.execute("UPDATE orders SET status='completed' WHERE id=%s", (row["id"],))
                             settle_to_merchant(row["total_amount"])
