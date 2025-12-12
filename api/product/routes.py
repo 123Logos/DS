@@ -244,15 +244,19 @@ def get_all_products(
             cur.execute(count_sql, tuple(params))
             total = cur.fetchone()['total']
 
-            # 查询商品列表
+            # 查询商品列表 - 使用动态表访问
             offset = (page - 1) * size
-            sql = f"""
-                SELECT * FROM products
-                {where_sql}
-                ORDER BY id DESC
-                LIMIT %s OFFSET %s
-            """
-            cur.execute(sql, tuple(params + [size, offset]))
+            where_clause_clean = where_sql.replace("WHERE ", "") if where_sql.startswith("WHERE ") else None
+            # 构建基础 SQL（不包含 LIMIT）
+            select_sql_base = build_dynamic_select(
+                cur,
+                "products",
+                where_clause=where_clause_clean,
+                order_by="id DESC"
+            )
+            # 添加 LIMIT 和 OFFSET（使用参数化查询）
+            select_sql = f"{select_sql_base} LIMIT %s OFFSET %s"
+            cur.execute(select_sql, tuple(params + [size, offset]))
             products = cur.fetchall()
 
             # 获取每个商品的 SKUs 和 attributes

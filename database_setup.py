@@ -31,6 +31,32 @@ class DatabaseManager:
             logger.error(f"❌ 数据库初始化失败: {e}")
             raise
 
+    def _ensure_table_columns(self, cursor, table_name: str, required_columns: dict):
+        """
+        确保表的必需字段存在，如果不存在则添加
+        
+        Args:
+            cursor: 数据库游标
+            table_name: 表名
+            required_columns: 必需字段字典，格式为 {字段名: 字段定义}
+        """
+        try:
+            # 获取表的现有字段
+            cursor.execute(f"SHOW COLUMNS FROM {table_name}")
+            existing_columns = {row['Field'] for row in cursor.fetchall()}
+            
+            # 检查并添加缺失的字段
+            for column_name, column_def in required_columns.items():
+                if column_name not in existing_columns:
+                    try:
+                        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_def}")
+                        logger.info(f"✅ 已添加字段 {table_name}.{column_name}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 添加字段 {table_name}.{column_name} 失败: {e}")
+        except Exception as e:
+            # 如果表不存在，会在创建表时处理
+            logger.debug(f"表 {table_name} 可能不存在，将在创建表时处理: {e}")
+
     def init_all_tables(self, cursor):
         logger.info("\n=== 初始化数据库表结构 ===")
 
@@ -352,9 +378,25 @@ class DatabaseManager:
             """,
         }
 
+        # 定义必需字段（用于检查和更新已存在的表）
+        required_columns = {
+            'users': {
+                'member_points': 'member_points DECIMAL(12,4) NOT NULL DEFAULT 0.0000',
+                'merchant_points': 'merchant_points DECIMAL(12,4) NOT NULL DEFAULT 0.0000',
+                'withdrawable_balance': 'withdrawable_balance BIGINT NOT NULL DEFAULT 0 COMMENT \'可提现余额\'',
+                'is_merchant': 'is_merchant TINYINT(1) NOT NULL DEFAULT 0 COMMENT \'判断是不是商家\'',
+                'status': 'status TINYINT NOT NULL DEFAULT 1',
+                'avatar_path': 'avatar_path VARCHAR(255) NULL DEFAULT NULL COMMENT \'头像路径\'',
+            }
+        }
+        
         for table_name, sql in tables.items():
             cursor.execute(sql)
             logger.info(f"✅ 表 `{table_name}` 已创建/确认")
+            
+            # 检查并更新表结构（添加缺失的字段）
+            if table_name in required_columns:
+                self._ensure_table_columns(cursor, table_name, required_columns[table_name])
 
         # 在表创建后添加外键约束（避免类型不匹配问题）
         self._add_cart_foreign_keys(cursor)

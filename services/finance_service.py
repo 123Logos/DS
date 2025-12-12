@@ -73,10 +73,14 @@ class FinanceService:
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(
-                        f"SELECT {balance_type} FROM users WHERE id = %s",
-                        (user_id,)
+                    # 使用动态表访问，自动处理字段不存在的情况
+                    select_sql = build_dynamic_select(
+                        cur,
+                        "users",
+                        where_clause="id=%s",
+                        select_fields=[balance_type]
                     )
+                    cur.execute(select_sql, (user_id,))
                     row = cur.fetchone()
                     val = row.get(balance_type, 0) if row else 0
                     return Decimal(str(val))
@@ -119,13 +123,25 @@ class FinanceService:
                 unit_price = Decimal(str(product['price']))
                 original_amount = unit_price * quantity
 
-                result = self.session.execute(
-                    "SELECT member_level, points FROM users WHERE id = %s FOR UPDATE",
-                    {"user_id": user_id}
-                )
-                user = result.fetchone()
-                if not user:
-                    raise OrderException(f"用户不存在: {user_id}")
+                # 使用动态表访问获取用户信息，使用 FOR UPDATE 锁定行
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        select_sql = build_dynamic_select(
+                            cur,
+                            "users",
+                            where_clause="id=%s",
+                            select_fields=["member_level", "points"]
+                        )
+                        select_sql += " FOR UPDATE"
+                        cur.execute(select_sql, (user_id,))
+                        row = cur.fetchone()
+                        if not row:
+                            raise OrderException(f"用户不存在: {user_id}")
+                        # 创建类似的对象以保持兼容性
+                        user = type('obj', (object,), {
+                            'member_level': row.get('member_level', 0) or 0,
+                            'points': Decimal(str(row.get('points', 0) or 0))
+                        })()
 
                 points_discount = Decimal('0')
                 final_amount = original_amount
@@ -284,11 +300,18 @@ class FinanceService:
             current_id = ref.referrer_id
 
         if target_referrer:
-            result = self.session.execute(
-                "SELECT member_level FROM users WHERE id = %s",
-                {"user_id": target_referrer}
-            )
-            referrer_level = result.fetchone().member_level
+            # 使用动态表访问获取推荐人等级
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    select_sql = build_dynamic_select(
+                        cur,
+                        "users",
+                        where_clause="id=%s",
+                        select_fields=["member_level"]
+                    )
+                    cur.execute(select_sql, (target_referrer,))
+                    row = cur.fetchone()
+                    referrer_level = row.get('member_level', 0) or 0 if row else 0
 
             if referrer_level >= target_layer:
                 reward_amount = MEMBER_PRODUCT_PRICE * Decimal('0.50')
@@ -579,11 +602,25 @@ class FinanceService:
             logger.warning("❌ 补贴池余额不足")
             return False
 
-        result = self.session.execute("SELECT SUM(points) as total FROM users WHERE points > 0")
-        user_points = Decimal(str(result.fetchone().total or 0))
-
-        result = self.session.execute("SELECT SUM(merchant_points) as total FROM users WHERE merchant_points > 0")
-        merchant_points = Decimal(str(result.fetchone().total or 0))
+        # 使用动态表访问检查字段是否存在，然后使用 SUM 聚合
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                structure = get_table_structure(cur, "users", use_cache=False)
+                # 检查 points 字段是否存在
+                if "points" in structure['fields']:
+                    cur.execute("SELECT SUM(COALESCE(points, 0)) as total FROM users WHERE COALESCE(points, 0) > 0")
+                    row = cur.fetchone()
+                    user_points = Decimal(str(row.get('total', 0) or 0))
+                else:
+                    user_points = Decimal('0')
+                
+                # 检查 merchant_points 字段是否存在
+                if "merchant_points" in structure['fields']:
+                    cur.execute("SELECT SUM(COALESCE(merchant_points, 0)) as total FROM users WHERE COALESCE(merchant_points, 0) > 0")
+                    row = cur.fetchone()
+                    merchant_points = Decimal(str(row.get('total', 0) or 0))
+                else:
+                    merchant_points = Decimal('0')
 
         result = self.session.execute(
             "SELECT balance as total FROM finance_accounts WHERE account_type = 'company_points'")
@@ -606,8 +643,23 @@ class FinanceService:
         today = datetime.now().date()
         valid_to = today + timedelta(days=COUPON_VALID_DAYS)
 
-        result = self.session.execute("SELECT id, points FROM users WHERE points > 0")
-        users = result.fetchall()
+        # 使用动态表访问获取用户积分信息
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                structure = get_table_structure(cur, "users", use_cache=False)
+                if "points" in structure['fields']:
+                    select_sql = build_dynamic_select(
+                        cur,
+                        "users",
+                        where_clause="COALESCE(points, 0) > 0",
+                        select_fields=["id", "points"]
+                    )
+                    cur.execute(select_sql)
+                    users_data = cur.fetchall()
+                    # 转换为类似的对象列表以保持兼容性
+                    users = [type('obj', (object,), {'id': row['id'], 'points': Decimal(str(row.get('points', 0) or 0))})() for row in users_data]
+                else:
+                    users = []
 
         try:
             with self.session.begin():
@@ -918,25 +970,37 @@ class FinanceService:
         注意：`field` 必须是受信任的字段名（由调用处保证）。"""
         # 使用字符串插值构造字段位置（确保调用方只传入受控字段名）
         self.session.execute(
-            f"UPDATE users SET {field} = {field} + %s WHERE id = %s",
+            f"UPDATE users SET {field} = COALESCE({field}, 0) + %s WHERE id = %s",
             {"delta": delta, "user_id": user_id}
         )
-        result = self.session.execute(
-            f"SELECT {field} FROM users WHERE id = %s",
-            {"user_id": user_id}
-        )
-        row = result.fetchone()
-        return Decimal(str(getattr(row, field, 0))) if row else Decimal('0')
+        # 使用动态表访问获取更新后的值
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                select_sql = build_dynamic_select(
+                    cur,
+                    "users",
+                    where_clause="id=%s",
+                    select_fields=[field]
+                )
+                cur.execute(select_sql, (user_id,))
+                row = cur.fetchone()
+                return Decimal(str(row.get(field, 0) or 0)) if row else Decimal('0')
 
     def _get_balance_after(self, account_type: str, related_user: Optional[int] = None) -> Decimal:
         if related_user and account_type in ['promotion_balance', 'merchant_balance']:
             field = account_type
-            result = self.session.execute(
-                f"SELECT {field} FROM users WHERE id = %s",
-                {"user_id": related_user}
-            )
-            row = result.fetchone()
-            return Decimal(str(getattr(row, field, 0))) if row else Decimal('0')
+            # 使用动态表访问获取余额
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    select_sql = build_dynamic_select(
+                        cur,
+                        "users",
+                        where_clause="id=%s",
+                        select_fields=[field]
+                    )
+                    cur.execute(select_sql, (related_user,))
+                    row = cur.fetchone()
+                    return Decimal(str(row.get(field, 0) or 0)) if row else Decimal('0')
         else:
             return self.get_account_balance(account_type)
 
@@ -1014,11 +1078,18 @@ class FinanceService:
 
     def set_referrer(self, user_id: int, referrer_id: int) -> bool:
         try:
-            result = self.session.execute(
-                "SELECT member_level FROM users WHERE id = %s",
-                {"referrer_id": referrer_id}
-            )
-            referrer = result.fetchone()
+            # 使用动态表访问获取推荐人等级
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    select_sql = build_dynamic_select(
+                        cur,
+                        "users",
+                        where_clause="id=%s",
+                        select_fields=["member_level"]
+                    )
+                    cur.execute(select_sql, (referrer_id,))
+                    row = cur.fetchone()
+                    referrer = type('obj', (object,), {'member_level': row.get('member_level', 0) or 0 if row else 0})() if row else None
             if not referrer:
                 raise FinanceException(f"推荐人不存在: {referrer_id}")
 

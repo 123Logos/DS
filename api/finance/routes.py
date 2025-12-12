@@ -210,15 +210,22 @@ async def get_products(
         is_member: Optional[int] = Query(None, ge=0, le=1)
 ):
     try:
-        sql = "SELECT id, sku, name, price, stock, is_member_product, merchant_id FROM products WHERE status = 1"
-        params = []
-        if is_member is not None:
-            sql += " AND is_member_product = %s"
-            params.append(is_member)
-
+        # 使用动态表访问获取商品信息
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, params)
+                where_clause = "status=1"
+                params = []
+                if is_member is not None:
+                    where_clause += " AND is_member_product=%s"
+                    params.append(is_member)
+                
+                select_sql = build_dynamic_select(
+                    cur,
+                    "products",
+                    where_clause=where_clause,
+                    select_fields=["id", "sku", "name", "price", "stock", "is_member_product", "merchant_id"]
+                )
+                cur.execute(select_sql, tuple(params))
                 products = cur.fetchall()
 
         return ResponseModel(success=True, message="查询成功", data={

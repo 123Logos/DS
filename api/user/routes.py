@@ -489,11 +489,14 @@ def user_info(mobile: str):
             )
             team_total = cur.fetchone()["c"]
 
-            cur.execute(
-                "SELECT member_points, merchant_points, withdrawable_balance "
-                "FROM users WHERE id=%s",
-                (u["id"],)
+            # 使用动态 SELECT 查询积分和余额字段
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="id=%s",
+                select_fields=["member_points", "merchant_points", "withdrawable_balance"]
             )
+            cur.execute(select_sql, (u["id"],))
             assets = cur.fetchone()
 
     return UserInfoResp(
@@ -631,13 +634,8 @@ def refer_direct(mobile: str, page: int = 1, size: int = 10):
             u = cur.fetchone()
             if not u:
                 _err("用户不存在")
-            select_sql = build_dynamic_select(
-                cur,
-                "user_referrals",
-                where_clause="referrer_id=%s",
-                select_fields=["COUNT(*) AS c"]
-            )
-            cur.execute(select_sql, (u["id"],))
+            # COUNT(*) 是聚合函数，不能使用 build_dynamic_select，直接使用 SQL
+            cur.execute("SELECT COUNT(*) AS c FROM user_referrals WHERE referrer_id=%s", (u["id"],))
             total = cur.fetchone()["c"]
             cur.execute("""
                 SELECT u.id, u.mobile, u.name, u.member_level, u.created_at
@@ -816,8 +814,14 @@ def return_addr_set(body: AddressReq):
                 # 表中没有 is_merchant 字段，视为未被授予商户身份
                 raise HTTPException(status_code=404, detail="商家不存在或未被授予商户身份")
 
-            # 读取用户的 is_merchant 字段以确认身份
-            cur.execute("SELECT id, is_merchant FROM users WHERE mobile=%s", (body.mobile,))
+            # 使用动态表访问读取用户的 is_merchant 字段以确认身份
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="mobile=%s",
+                select_fields=["id", "is_merchant"]
+            )
+            cur.execute(select_sql, (body.mobile,))
             u2 = cur.fetchone()
             if not u2 or u2.get("is_merchant") != 1:
                 raise HTTPException(status_code=404, detail="商家不存在或未被授予商户身份")
@@ -918,7 +922,14 @@ def points(body: PointsReq):
 def points_balance(mobile: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT member_points, merchant_points, withdrawable_balance FROM users WHERE mobile=%s", (mobile,))
+            # 使用动态表访问，自动处理字段不存在的情况
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="mobile=%s",
+                select_fields=["member_points", "merchant_points", "withdrawable_balance"]
+            )
+            cur.execute(select_sql, (mobile,))
             row = cur.fetchone()
             if not row:
                 _err("用户不存在")

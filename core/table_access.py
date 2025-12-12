@@ -85,11 +85,20 @@ def build_select_sql(table_name: str, structure: Dict[str, any],
     """
     fields = select_fields if select_fields else structure['fields']
     asset_fields = structure['asset_fields']
+    existing_fields = structure['fields']  # 实际存在的字段列表
     
     # 构造 SELECT 字段列表，对资产字段设置默认值
     select_parts = []
     for field in fields:
-        if field in asset_fields:
+        if field not in existing_fields:
+            # 字段不存在，使用默认值
+            if field in asset_fields or any(num_type in field.lower() for num_type in ['points', 'balance', 'amount']):
+                # 数值类型字段，默认为 0
+                select_parts.append(f"0 AS {field}")
+            else:
+                # 非数值字段，默认为 NULL
+                select_parts.append(f"NULL AS {field}")
+        elif field in asset_fields:
             # 资产字段：如果不存在则默认为 0
             select_parts.append(f"COALESCE({field}, 0) AS {field}")
         else:
