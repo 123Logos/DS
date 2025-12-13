@@ -432,10 +432,22 @@ def add_product(payload: ProductCreate):
                 # 插入 attributes
                 if payload.attributes:
                     for attr in payload.attributes:
+                        # 兼容前端两种传参格式：{"name":"...","value":"..."} 或 {"key":"value"}
+                        if isinstance(attr, dict) and "name" in attr and "value" in attr:
+                            a_name = attr["name"]
+                            a_value = attr["value"]
+                        elif isinstance(attr, dict) and len(attr) >= 1:
+                            # 取第一个键值作为 name/value
+                            k, v = next(iter(attr.items()))
+                            a_name = k
+                            a_value = v
+                        else:
+                            a_name = None
+                            a_value = None
                         cur.execute("""
                             INSERT INTO product_attributes (product_id, name, value)
                             VALUES (%s, %s, %s)
-                        """, (product_id, attr["name"], attr["value"]))
+                        """, (product_id, a_name, a_value))
 
                 conn.commit()
 
@@ -566,12 +578,22 @@ def update_product(id: int, payload: ProductUpdate):
                 if payload.attributes is not None:
                     # 删除旧 attributes
                     cur.execute("DELETE FROM product_attributes WHERE product_id = %s", (id,))
-                    # 插入新 attributes
+                    # 插入新 attributes（兼容多种格式）
                     for attr in payload.attributes:
+                        if isinstance(attr, dict) and "name" in attr and "value" in attr:
+                            a_name = attr["name"]
+                            a_value = attr["value"]
+                        elif isinstance(attr, dict) and len(attr) >= 1:
+                            k, v = next(iter(attr.items()))
+                            a_name = k
+                            a_value = v
+                        else:
+                            a_name = None
+                            a_value = None
                         cur.execute("""
                             INSERT INTO product_attributes (product_id, name, value)
                             VALUES (%s, %s, %s)
-                        """, (id, attr["name"], attr["value"]))
+                        """, (id, a_name, a_value))
 
                 conn.commit()
 

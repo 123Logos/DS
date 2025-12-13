@@ -90,6 +90,10 @@ def build_select_sql(table_name: str, structure: Dict[str, any],
     # 构造 SELECT 字段列表，对资产字段设置默认值
     select_parts = []
     for field in fields:
+        # 如果传入的是数字字面量（例如 ['1'] 用于存在性检查），直接当作字面量处理
+        if isinstance(field, str) and field.isdigit():
+            select_parts.append(field)
+            continue
         if field not in existing_fields:
             # 字段不存在，使用默认值
             if field in asset_fields or any(num_type in field.lower() for num_type in ['points', 'balance', 'amount']):

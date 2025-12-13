@@ -811,20 +811,6 @@ def return_addr_set(body: AddressReq):
 def return_addr_get(mobile: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            select_sql = build_dynamic_select(cur, "users", where_clause="mobile=%s", select_fields=["id"])
-            cur.execute(select_sql, (mobile,))
-            u = cur.fetchone()
-            if not u:
-                raise HTTPException(status_code=404, detail="商家不存在")
-            addr = AddressService.get_default_address(u["id"])
-            if not addr:
-                raise HTTPException(status_code=404, detail="未设置退货地址")
-            return addr
-
-@router.get("/address/return", summary="查看退货地址")
-def return_addr_get(mobile: str):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
             select_sql = build_dynamic_select(
                 cur,
                 "users",
