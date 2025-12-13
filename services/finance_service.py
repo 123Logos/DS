@@ -396,63 +396,63 @@ class FinanceService:
             if not reward_ids:
                 raise FinanceException("奖励ID列表不能为空")
 
-            # 构建查询参数
-            placeholders = ','.join(['%s'] * len(reward_ids))
+            placeholders = ','.join(['%s' for _ in range(len(reward_ids))])
+            params = {f"id{i}": rid for i, rid in enumerate(reward_ids)}
 
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    # 查询待审核的奖励记录
-                    sql = f"""
-                        SELECT id, user_id, reward_type, amount, order_id, layer
-                        FROM pending_rewards 
-                        WHERE id IN ({placeholders}) AND status = 'pending'
-                    """
-                    cur.execute(sql, reward_ids)
-                    rewards = cur.fetchall()
+            result = self.session.execute(
+                f"""SELECT id, user_id, reward_type, amount, order_id, layer
+                   FROM pending_rewards WHERE id IN ({placeholders}) AND status = 'pending'""",
+                params
+            )
+            rewards = result.fetchall()
 
-                    if not rewards:
-                        raise FinanceException("未找到待审核的奖励记录")
+            if not rewards:
+                raise FinanceException("未找到待审核的奖励记录")
 
-                    if approve:
-                        today = datetime.now().date()
-                        valid_to = today + timedelta(days=COUPON_VALID_DAYS)
+            if approve:
+                today = datetime.now().date()
+                valid_to = today + timedelta(days=COUPON_VALID_DAYS)
 
-                        for reward in rewards:
-                            # 发放优惠券
-                            cur.execute(
-                                """INSERT INTO coupons (user_id, coupon_type, amount, valid_from, valid_to, status)
-                                   VALUES (%s, 'user', %s, %s, %s, 'unused')""",
-                                (reward['user_id'], reward['amount'], today, valid_to)
-                            )
-                            coupon_id = cur.lastrowid
+                for reward in rewards:
+                    result = self.session.execute(
+                        """INSERT INTO coupons (user_id, coupon_type, amount, valid_from, valid_to, status)
+                           VALUES (%s, 'user', %s, %s, %s, 'unused')""",
+                        {
+                            "user_id": reward.user_id,
+                            "amount": reward.amount,
+                            "valid_from": today,
+                            "valid_to": valid_to
+                        }
+                    )
+                    coupon_id = result.lastrowid
 
-                            # 更新奖励状态
-                            cur.execute(
-                                "UPDATE pending_rewards SET status = 'approved' WHERE id = %s",
-                                (reward['id'],)
-                            )
+                    self.session.execute(
+                        "UPDATE pending_rewards SET status = 'approved' WHERE id = %s",
+                        {"id": reward.id}
+                    )
 
-                            reward_desc = '推荐' if reward['reward_type'] == 'referral' else f"团队L{reward['layer']}"
+                    reward_desc = '推荐' if reward.reward_type == 'referral' else f"团队L{reward.layer}"
+                    self._record_flow(
+                        account_type='coupon',
+                        related_user=reward.user_id,
+                        change_amount=0,
+                        flow_type='coupon',
+                        remark=f"{reward_desc}奖励发放优惠券#{coupon_id} ¥{reward.amount:.2f}"
+                    )
+                    logger.debug(f"奖励{reward.id}已批准，发放优惠券{coupon_id}")
+            else:
+                self.session.execute(
+                    f"UPDATE pending_rewards SET status = 'rejected' WHERE id IN ({placeholders})",
+                    params
+                )
+                logger.debug(f"已拒绝 {len(reward_ids)} 条奖励")
 
-                            # 记录流水
-                            cur.execute(
-                                """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
-                                   VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
-                                ('coupon', reward['user_id'], 0, 0, 'coupon',
-                                 f"{reward_desc}奖励发放优惠券#{coupon_id} ¥{reward['amount']:.2f}")
-                            )
-                            logger.debug(f"奖励{reward['id']}已批准，发放优惠券{coupon_id}")
-                    else:
-                        # 拒绝奖励
-                        sql = f"UPDATE pending_rewards SET status = 'rejected' WHERE id IN ({placeholders})"
-                        cur.execute(sql, reward_ids)
-                        logger.debug(f"已拒绝 {len(reward_ids)} 条奖励")
-
-                    conn.commit()
-                    return True
+            self.session.commit()
+            return True
 
         except Exception as e:
-            logger.error(f"❌ 审核奖励失败: {e}", exc_info=True)
+            self.session.rollback()
+            logger.error(f"❌ 审核奖励失败: {e}")
             return False
 
     def get_rewards_by_status(self, status: str = 'pending', reward_type: Optional[str] = None, limit: int = 50) -> \
@@ -516,244 +516,412 @@ class FinanceService:
     def distribute_weekly_subsidy(self) -> bool:
         logger.info("周补贴发放开始（优惠券形式）")
 
-        try:
-            # 1. 检查补贴池余额
-            pool_balance = self.get_account_balance('subsidy_pool')
-            if pool_balance <= 0:
-                logger.warning(f"❌ 补贴池余额不足: ¥{pool_balance}")
-                return False
-
-            logger.info(f"补贴池余额: ¥{pool_balance:.4f}")
-
-            # 2. 获取总积分（使用全新的连接）
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    # 查询用户积分
-                    cur.execute("SELECT SUM(COALESCE(member_points, 0)) as total FROM users WHERE member_points > 0")
-                    user_points = Decimal(str(cur.fetchone()['total'] or 0))
-
-                    # 查询商家积分
-                    cur.execute(
-                        "SELECT SUM(COALESCE(merchant_points, 0)) as total FROM users WHERE merchant_points > 0")
-                    merchant_points = Decimal(str(cur.fetchone()['total'] or 0))
-
-                    # 查询公司积分
-                    cur.execute(
-                        "SELECT COALESCE(balance, 0) as total FROM finance_accounts WHERE account_type = 'company_points'")
-                    company_points = Decimal(str(cur.fetchone()['total'] or 0))
-
-            total_points = user_points + merchant_points + company_points
-            if total_points <= 0:
-                logger.warning("❌ 总积分为0，无法发放补贴")
-                return False
-
-            # 3. 计算积分价值
-            points_value = pool_balance / total_points
-            if points_value > MAX_POINTS_VALUE:
-                points_value = MAX_POINTS_VALUE
-
-            logger.info(f"积分价值: ¥{points_value:.4f}/分")
-
-            # 4. 获取有积分的用户
-            users = []
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT id, member_points FROM users WHERE member_points > 0")
-                    for row in cur.fetchall():
-                        users.append(type('obj', (object,), {
-                            'id': row['id'],
-                            'member_points': Decimal(str(row['member_points']))
-                        })())
-
-            # 5. 发放补贴（使用全新的连接和事务）
-            total_distributed = Decimal('0')
-            today = datetime.now().date()
-            valid_to = today + timedelta(days=COUPON_VALID_DAYS)
-
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    for user in users:
-                        user_points = Decimal(str(user.member_points))
-                        subsidy_amount = user_points * points_value
-                        deduct_points = subsidy_amount / points_value if points_value > 0 else Decimal('0')
-
-                        if subsidy_amount <= Decimal('0'):
-                            continue
-
-                        # 发放优惠券
-                        cur.execute(
-                            """INSERT INTO coupons (user_id, coupon_type, amount, valid_from, valid_to, status)
-                               VALUES (%s, 'user', %s, %s, %s, 'unused')""",
-                            (user.id, subsidy_amount, today, valid_to)
-                        )
-                        coupon_id = cur.lastrowid
-
-                        # 扣减积分
-                        new_points = user_points - deduct_points
-                        cur.execute(
-                            "UPDATE users SET member_points = %s WHERE id = %s",
-                            (new_points, user.id)
-                        )
-
-                        # 记录补贴记录
-                        cur.execute(
-                            """INSERT INTO weekly_subsidy_records (user_id, week_start, subsidy_amount, points_before, points_deducted, coupon_id)
-                               VALUES (%s, %s, %s, %s, %s, %s)""",
-                            (user.id, today, subsidy_amount, user_points, deduct_points, coupon_id)
-                        )
-
-                        total_distributed += subsidy_amount
-                        logger.info(f"用户{user.id}: 发放优惠券¥{subsidy_amount:.4f}, 扣积分{deduct_points:.4f}")
-
-                    conn.commit()  # 手动提交事务
-                    logger.info(f"周补贴完成: 共发放¥{total_distributed:.4f}优惠券")
-                    return True
-
-        except Exception as e:
-            logger.error(f"周补贴发放异常: {e}", exc_info=True)
+        pool_balance = self.get_account_balance('subsidy_pool')
+        if pool_balance <= 0:
+            logger.warning("❌ 补贴池余额不足")
             return False
 
-    # def apply_withdrawal(self, user_id: int, amount: float, withdrawal_type: str = 'user') -> Optional[int]:
-    #     """申请提现"""
-    #     try:
-    #         balance_field = 'promotion_balance' if withdrawal_type == 'user' else 'merchant_balance'
-    #         amount_decimal = Decimal(str(amount))
-    #
-    #         self._check_user_balance(user_id, amount_decimal, balance_field)
-    #
-    #         tax_amount = amount_decimal * TAX_RATE
-    #         actual_amount = amount_decimal - tax_amount
-    #
-    #         status = 'pending_manual' if amount_decimal > 5000 else 'pending_auto'
-    #
-    #         with get_conn() as conn:
-    #             with conn.cursor() as cur:
-    #                 # 插入提现记录（无 withdrawal_type 字段，兼容旧版）
-    #                 cur.execute(
-    #                     """INSERT INTO withdrawals (user_id, amount, tax_amount, actual_amount, status)
-    #                        VALUES (%s, %s, %s, %s, %s)""",
-    #                     (user_id, amount_decimal, tax_amount, actual_amount, status)
-    #                 )
-    #                 withdrawal_id = cur.lastrowid
-    #
-    #                 # 冻结用户余额
-    #                 cur.execute(
-    #                     f"UPDATE users SET {balance_field} = {balance_field} - %s WHERE id = %s",
-    #                     (amount_decimal, user_id)
-    #                 )
-    #
-    #                 # 记录冻结流水
-    #                 cur.execute(
-    #                     """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
-    #                        VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
-    #                     (balance_field, user_id, -amount_decimal, 0, 'expense', f"提现申请冻结 #{withdrawal_id}")
-    #                 )
-    #
-    #                 # 将税金转入公司余额
-    #                 cur.execute(
-    #                     "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'company_balance'",
-    #                     (tax_amount,)
-    #                 )
-    #
-    #                 # 记录税金流水
-    #                 cur.execute(
-    #                     """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
-    #                        VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
-    #                     ('company_balance', user_id, tax_amount, 0, 'income', f"提现个税 #{withdrawal_id}")
-    #                 )
-    #
-    #                 conn.commit()
-    #                 logger.debug(
-    #                     f"提现申请 #{withdrawal_id}: ¥{amount_decimal}（税¥{tax_amount:.2f}，实到¥{actual_amount:.2f}）")
-    #                 return withdrawal_id
-    #
-    #     except Exception as e:
-    #         logger.error(f"❌ 提现申请失败: {e}", exc_info=True)
-    #         return None
+        # 使用动态表访问检查字段是否存在，然后使用 SUM 聚合
+        # 关键修改：member_points替代points
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                structure = get_table_structure(cur, "users", use_cache=False)
+                # 检查 member_points 字段是否存在
+                if "member_points" in structure['fields']:
+                    cur.execute(
+                        "SELECT SUM(COALESCE(member_points, 0)) as total FROM users WHERE COALESCE(member_points, 0) > 0")
+                    row = cur.fetchone()
+                    user_points = Decimal(str(row.get('total', 0) or 0))
+                else:
+                    user_points = Decimal('0')
 
-    # 在 audit_withdrawal 方法中（约第 675 行）
+                # 检查 merchant_points 字段是否存在
+                if "merchant_points" in structure['fields']:
+                    cur.execute(
+                        "SELECT SUM(COALESCE(merchant_points, 0)) as total FROM users WHERE COALESCE(merchant_points, 0) > 0")
+                    row = cur.fetchone()
+                    merchant_points = Decimal(str(row.get('total', 0) or 0))
+                else:
+                    merchant_points = Decimal('0')
+
+        result = self.session.execute(
+            "SELECT balance as total FROM finance_accounts WHERE account_type = 'company_points'")
+        company_points = Decimal(str(result.fetchone().total or 0))
+
+        total_points = user_points + merchant_points + company_points
+
+        if total_points <= 0:
+            logger.warning("❌ 总积分为0，无法发放补贴")
+            return False
+
+        points_value = pool_balance / total_points
+        if points_value > MAX_POINTS_VALUE:
+            points_value = MAX_POINTS_VALUE
+
+        logger.info(
+            f"补贴池: ¥{pool_balance} | 用户积分: {user_points} | 商家积分: {merchant_points} | 公司积分: {company_points}（仅参与计算） | 积分值: ¥{points_value:.4f}/分")
+
+        total_distributed = Decimal('0')
+        today = datetime.now().date()
+        valid_to = today + timedelta(days=COUPON_VALID_DAYS)
+
+        # 使用动态表访问获取用户member_points积分信息
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                structure = get_table_structure(cur, "users", use_cache=False)
+                if "member_points" in structure['fields']:
+                    select_sql = build_dynamic_select(
+                        cur,
+                        "users",
+                        where_clause="COALESCE(member_points, 0) > 0",
+                        select_fields=["id", "member_points"]
+                    )
+                    cur.execute(select_sql)
+                    users_data = cur.fetchall()
+                    # 转换为类似的对象列表以保持兼容性
+                    users = [type('obj', (object,),
+                                  {'id': row['id'], 'member_points': Decimal(str(row.get('member_points', 0) or 0))})()
+                             for row in users_data]
+                else:
+                    users = []
+
+        try:
+            with self.session.begin():
+                for user in users:
+                    user_points = Decimal(str(user.member_points))
+                    subsidy_amount = user_points * points_value
+                    deduct_points = subsidy_amount / points_value if points_value > 0 else Decimal('0')
+
+                    if subsidy_amount <= Decimal('0'):
+                        continue
+
+                    result = self.session.execute(
+                        """INSERT INTO coupons (user_id, coupon_type, amount, valid_from, valid_to, status)
+                           VALUES (%s, 'user', %s, %s, %s, 'unused')""",
+                        {
+                            "user_id": user.id,
+                            "amount": subsidy_amount,
+                            "valid_from": today,
+                            "valid_to": valid_to
+                        }
+                    )
+                    coupon_id = result.lastrowid
+
+                    new_points = user_points - deduct_points
+                    # 关键修改：扣减member_points
+                    self.session.execute(
+                        "UPDATE users SET member_points = %s WHERE id = %s",
+                        {"points": new_points, "user_id": user.id}
+                    )
+
+                    self.session.execute(
+                        """INSERT INTO weekly_subsidy_records (user_id, week_start, subsidy_amount, points_before, points_deducted, coupon_id)
+                           VALUES (%s, %s, %s, %s, %s, %s)""",
+                        {
+                            "user_id": user.id,
+                            "week_start": today,
+                            "subsidy_amount": subsidy_amount,
+                            "points_before": user_points,
+                            "points_deducted": deduct_points,
+                            "coupon_id": coupon_id
+                        }
+                    )
+
+                    total_distributed += subsidy_amount
+                    logger.info(f"用户{user.id}: 优惠券¥{subsidy_amount:.4f}, 扣积分{deduct_points:.4f}")
+
+                # 处理商家的merchant_points
+                result = self.session.execute("SELECT id, merchant_points FROM users WHERE merchant_points > 0")
+                merchants = result.fetchall()
+
+                for merchant in merchants:
+                    merchant_points = Decimal(str(merchant.merchant_points))
+                    subsidy_amount = merchant_points * points_value
+                    deduct_points = subsidy_amount / points_value if points_value > 0 else Decimal('0')
+
+                    if subsidy_amount <= Decimal('0'):
+                        continue
+
+                    result = self.session.execute(
+                        """INSERT INTO coupons (user_id, coupon_type, amount, valid_from, valid_to, status)
+                           VALUES (%s, 'merchant', %s, %s, %s, 'unused')""",
+                        {
+                            "user_id": merchant.id,
+                            "amount": subsidy_amount,
+                            "valid_from": today,
+                            "valid_to": valid_to
+                        }
+                    )
+                    coupon_id = result.lastrowid
+
+                    new_points = merchant_points - deduct_points
+                    # 关键修改：扣减merchant_points
+                    self.session.execute(
+                        "UPDATE users SET merchant_points = %s WHERE id = %s",
+                        {"points": new_points, "user_id": merchant.id}
+                    )
+
+                    self.session.execute(
+                        """INSERT INTO weekly_subsidy_records (user_id, week_start, subsidy_amount, points_before, points_deducted, coupon_id)
+                           VALUES (%s, %s, %s, %s, %s, %s)""",
+                        {
+                            "user_id": merchant.id,
+                            "week_start": today,
+                            "subsidy_amount": subsidy_amount,
+                            "points_before": merchant_points,
+                            "points_deducted": deduct_points,
+                            "coupon_id": coupon_id
+                        }
+                    )
+
+                    total_distributed += subsidy_amount
+                    logger.debug(f"商家{merchant.id}: 优惠券¥{subsidy_amount:.4f}, 扣积分{deduct_points:.4f}")
+
+                logger.debug(f"公司积分{company_points}未扣除，未发放优惠券")
+
+            logger.info(
+                f"周补贴完成: 发放¥{total_distributed:.4f}优惠券（补贴池余额不变: ¥{pool_balance}，公司积分不扣除）")
+            return True
+        except Exception as e:
+            logger.error(f"❌ 周补贴发放失败: {e}")
+            return False
+
+    # ==================== 关键修改4：退款逻辑使用member_points ====================
+    def refund_order(self, order_no: str) -> bool:
+        try:
+            with self.session.begin():
+                result = self.session.execute(
+                    "SELECT * FROM orders WHERE order_number = %s FOR UPDATE",
+                    {"order_number": order_no}
+                )
+                order = result.fetchone()
+
+                if not order or order.status == 'refunded':
+                    raise FinanceException("订单不存在或已退款")
+
+                is_member = order.is_member_order
+                user_id = order.user_id
+                amount = Decimal(str(order.total_amount))
+                merchant_id = order.merchant_id
+
+                logger.debug(f"订单退款: {order_no} (会员商品: {is_member})")
+
+                if is_member:
+                    result = self.session.execute(
+                        "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
+                        {"user_id": user_id}
+                    )
+                    referrer = result.fetchone()
+                    if referrer and referrer.referrer_id:
+                        reward_amount = Decimal(str(order.original_amount)) * Decimal('0.50')
+                        self.session.execute(
+                            """UPDATE users SET promotion_balance = promotion_balance - %s
+                               WHERE id = %s AND promotion_balance >= %s""",
+                            {"amount": reward_amount, "user_id": referrer.referrer_id}
+                        )
+
+                    # 动态构造 SELECT 语句（使用临时连接获取表结构，不影响当前事务）
+                    with get_conn() as temp_conn:
+                        with temp_conn.cursor() as temp_cur:
+                            select_fields, existing_columns = _build_team_rewards_select(temp_cur, ['reward_amount'])
+                            # 确保包含 user_id 字段（如果不存在则添加默认值 0）
+                            if 'user_id' not in existing_columns:
+                                select_fields = "0 AS user_id, " + select_fields
+                            else:
+                                # 如果 user_id 存在，确保它在最前面
+                                fields_list = [f.strip() for f in select_fields.split(",")]
+                                # 移除 user_id（如果存在）
+                                fields_list = [f for f in fields_list if
+                                               f != 'user_id' and not f.startswith('user_id ')]
+                                select_fields = "user_id, " + ", ".join(fields_list)
+
+                    result = self.session.execute(
+                        f"SELECT {select_fields} FROM team_rewards WHERE order_id = %s",
+                        {"order_id": order.id}
+                    )
+                    rewards = result.fetchall()
+                    for reward in rewards:
+                        self.session.execute(
+                            """UPDATE users SET promotion_balance = promotion_balance - %s
+                               WHERE id = %s AND promotion_balance >= %s""",
+                            {"amount": reward.reward_amount, "user_id": reward.user_id}
+                        )
+
+                    # 关键修改：退款时扣减member_points（不再是points）
+                    user_points = Decimal(str(order.original_amount))
+                    self.session.execute(
+                        "UPDATE users SET member_points = GREATEST(member_points - %s, 0) WHERE id = %s",
+                        {"points": user_points, "user_id": user_id}
+                    )
+                    self.session.execute(
+                        "UPDATE users SET member_level = GREATEST(member_level - 1, 0) WHERE id = %s",
+                        {"user_id": user_id}
+                    )
+                    logger.info(f"⚠️ 用户{user_id}退款后降级")
+
+                merchant_amount = amount * Decimal('0.80')
+
+                if is_member:
+                    self._check_pool_balance('platform_revenue_pool', merchant_amount)
+                    # 从平台收入池扣减并记录流水
+                    self._add_pool_balance('platform_revenue_pool', -merchant_amount, f"退款 - 订单#{order_no}")
+                else:
+                    if merchant_id == PLATFORM_MERCHANT_ID:
+                        self._add_pool_balance('platform_revenue_pool', -merchant_amount, f"退款 - 订单#{order_no}")
+                    else:
+                        self._check_user_balance(merchant_id, merchant_amount, 'merchant_balance')
+                        self.session.execute(
+                            "UPDATE users SET merchant_balance = merchant_balance - %s WHERE id = %s",
+                            {"amount": merchant_amount, "merchant_id": merchant_id}
+                        )
+
+                self.session.execute(
+                    "UPDATE orders SET refund_status = 'refunded', updated_at = NOW() WHERE id = %s",
+                    {"order_id": order.id}
+                )
+
+            logger.debug(f"订单退款成功: {order_no}")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ 退款失败: {e}")
+            return False
+
+    def apply_withdrawal(self, user_id: int, amount: float, withdrawal_type: str = 'user') -> Optional[int]:
+        """申请提现"""
+        try:
+            balance_field = 'promotion_balance' if withdrawal_type == 'user' else 'merchant_balance'
+            amount_decimal = Decimal(str(amount))
+
+            self._check_user_balance(user_id, amount_decimal, balance_field)
+
+            tax_amount = amount_decimal * TAX_RATE
+            actual_amount = amount_decimal - tax_amount
+
+            status = 'pending_manual' if amount_decimal > 5000 else 'pending_auto'
+
+            result = self.session.execute(
+                """INSERT INTO withdrawals (user_id, amount, tax_amount, actual_amount, status)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                {
+                    "user_id": user_id,
+                    "amount": amount_decimal,
+                    "tax_amount": tax_amount,
+                    "actual_amount": actual_amount,
+                    "status": status
+                }
+            )
+            withdrawal_id = result.lastrowid
+
+            self.session.execute(
+                f"UPDATE users SET {balance_field} = {balance_field} - %s WHERE id = %s",
+                {"amount": amount_decimal, "user_id": user_id}
+            )
+
+            self._record_flow(
+                account_type=balance_field,
+                related_user=user_id,
+                change_amount=-amount_decimal,
+                flow_type='expense',
+                remark=f"{withdrawal_type}_提现申请冻结 #{withdrawal_id}"
+            )
+
+            self.session.execute(
+                "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'company_balance'",
+                {"amount": tax_amount}
+            )
+
+            self._record_flow(
+                account_type='company_balance',
+                related_user=user_id,
+                change_amount=tax_amount,
+                flow_type='income',
+                remark=f"{withdrawal_type}_提现个税 #{withdrawal_id}"
+            )
+
+            self.session.commit()
+            logger.debug(f"提现申请 #{withdrawal_id}: ¥{amount_decimal}（税¥{tax_amount:.2f}，实到¥{actual_amount:.2f}）")
+            return withdrawal_id
+
+        except Exception as e:
+            self.session.rollback()
+            logger.error(f"❌ 提现申请失败: {e}")
+            return None
     def audit_withdrawal(self, withdrawal_id: int, approve: bool, auditor: str = 'admin') -> bool:
         """审核提现申请"""
         try:
+            # 先获取表结构，动态构造 SELECT 语句（表结构查询不需要事务）
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    # 查询提现记录及用户当前余额（加锁）
-                    cur.execute(
-                        """SELECT w.id, w.user_id, w.amount, w.actual_amount, w.status,
-                                  u.withdrawable_balance
-                           FROM withdrawals w
-                           JOIN users u ON w.user_id = u.id
-                           WHERE w.id = %s FOR UPDATE""",
-                        (withdrawal_id,)
-                    )
-                    withdraw = cur.fetchone()
+                    cur.execute("SHOW COLUMNS FROM withdrawals")
+                    columns = cur.fetchall()
 
-                    if not withdraw or withdraw['status'] not in ['pending_auto', 'pending_manual']:
-                        raise FinanceException("提现记录不存在或已处理")
+            # 识别资产字段关键词（数值类型字段）
+            asset_keywords = ['balance', 'points', 'amount', 'total', 'frozen', 'available', 'tax']
+            select_fields = []
+            for col in columns:
+                field_name = col['Field']
+                field_type = col['Type'].upper()
+                # 如果是资产相关字段（字段名包含资产关键词）且为数值类型，添加降级默认值
+                is_asset_field = any(keyword in field_name.lower() for keyword in asset_keywords)
+                is_numeric_type = 'DECIMAL' in field_type or 'INT' in field_type or 'FLOAT' in field_type or 'DOUBLE' in field_type
 
-                    new_status = 'approved' if approve else 'rejected'
+                if is_asset_field and is_numeric_type:
+                    # 对资产字段做降级默认值（不存在或为NULL时返回0）
+                    select_fields.append(f"COALESCE({field_name}, 0) AS {field_name}")
+                else:
+                    select_fields.append(field_name)
 
-                    # 更新提现状态
-                    cur.execute(
-                        "UPDATE withdrawals SET status = %s, audit_remark = %s, processed_at = NOW() WHERE id = %s",
-                        (new_status, f"{auditor}审核", withdrawal_id)
-                    )
+            # 动态构造 SELECT 语句，使用 self.session 执行（确保在同一事务中）
+            select_sql = f"SELECT {', '.join(select_fields)} FROM withdrawals WHERE id = :withdrawal_id FOR UPDATE"
+            result = self.session.execute(select_sql, {"withdrawal_id": withdrawal_id})
+            withdraw = result.fetchone()
 
-                    if approve:
-                        # 检查是否在申请时已冻结余额
-                        cur.execute(
-                            """SELECT id FROM account_flow 
-                               WHERE account_type = 'withdrawable_balance' 
-                               AND related_user = %s 
-                               AND remark LIKE %s
-                               LIMIT 1""",
-                            (withdraw['user_id'], f"%提现申请冻结 #{withdrawal_id}%")
-                        )
-                        frozen_record = cur.fetchone()
+            if not withdraw or withdraw.status not in ['pending_auto', 'pending_manual']:
+                raise FinanceException("提现记录不存在或已处理")
 
-                        if not frozen_record:
-                            # 手动插入的数据，未冻结余额，现在补扣
-                            cur.execute(
-                                "UPDATE users SET withdrawable_balance = withdrawable_balance - %s WHERE id = %s",
-                                (withdraw['amount'], withdraw['user_id'])
-                            )
-                            # 记录扣款流水
-                            cur.execute(
-                                """INSERT INTO account_flow (account_type, related_user, change_amount, flow_type, remark, created_at)
-                                   VALUES (%s, %s, %s, %s, %s, NOW())""",
-                                ('withdrawable_balance', withdraw['user_id'], -withdraw['amount'],
-                                 'expense', f"提现扣款 #{withdrawal_id}")
-                            )
-                            logger.warning(f"提现申请 #{withdrawal_id} 缺少冻结记录，审核时补扣余额")
+            new_status = 'approved' if approve else 'rejected'
+            self.session.execute(
+                """UPDATE withdrawals SET status = :status, audit_remark = :remark, processed_at = NOW()
+                   WHERE id = :withdrawal_id""",
+                {
+                    "status": new_status,
+                    "remark": f"{auditor}审核",
+                    "withdrawal_id": withdrawal_id
+                }
+            )
 
-                        # 记录实际支付流水
-                        cur.execute(
-                            """INSERT INTO account_flow (account_type, related_user, change_amount, flow_type, remark, created_at)
-                               VALUES (%s, %s, %s, %s, %s, NOW())""",
-                            ('withdrawal_paid', withdraw['user_id'], -withdraw['actual_amount'],
-                             'expense', f"提现支付 #{withdrawal_id}")
-                        )
-                        logger.debug(f"提现审核通过 #{withdrawal_id}，支付¥{withdraw['actual_amount']:.2f}")
-                    else:
-                        # 审核拒绝：返还冻结资金
-                        cur.execute(
-                            "UPDATE users SET withdrawable_balance = withdrawable_balance + %s WHERE id = %s",
-                            (withdraw['amount'], withdraw['user_id'])
-                        )
-                        # 记录返还流水
-                        cur.execute(
-                            """INSERT INTO account_flow (account_type, related_user, change_amount, flow_type, remark, created_at)
-                               VALUES (%s, %s, %s, %s, %s, NOW())""",
-                            ('withdrawable_balance', withdraw['user_id'], withdraw['amount'],
-                             'income', f"提现拒绝返还 #{withdrawal_id}")
-                        )
-                        logger.debug(f"提现审核拒绝 #{withdrawal_id}，返还¥{withdraw['amount']:.2f}")
+            if approve:
+                self._record_flow(
+                    account_type='withdrawal',
+                    related_user=withdraw.user_id,
+                    change_amount=withdraw.actual_amount,
+                    flow_type='income',
+                    remark=f"提现到账 #{withdrawal_id}"
+                )
+                logger.debug(f"提现审核通过 #{withdrawal_id}，到账¥{withdraw.actual_amount:.2f}")
+            else:
+                balance_field = 'promotion_balance' if withdraw.withdrawal_type == 'user' else 'merchant_balance'
+                self.session.execute(
+                    f"UPDATE users SET {balance_field} = {balance_field} + %s WHERE id = %s",
+                    {"amount": withdraw.amount, "user_id": withdraw.user_id}
+                )
 
-                    conn.commit()
-                    return True
+                self._record_flow(
+                    account_type=balance_field,
+                    related_user=withdraw.user_id,
+                    change_amount=withdraw.amount,
+                    flow_type='income',
+                    remark=f"提现拒绝退回 #{withdrawal_id}"
+                )
+                logger.debug(f"提现审核拒绝 #{withdrawal_id}")
+
+            self.session.commit()
+            return True
 
         except Exception as e:
-            logger.error(f"提现审核失败: {e}", exc_info=True)
+            self.session.rollback()
+            logger.error(f"❌ 提现审核失败: {e}")
             return False
 
     def _record_flow(self, account_type: str, related_user: Optional[int],
@@ -940,6 +1108,213 @@ class FinanceService:
                     } for d in details]
                 }
 
+    def set_referrer(self, user_id: int, referrer_id: int) -> bool:
+        try:
+            # 使用动态表访问获取推荐人等级
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    select_sql = build_dynamic_select(
+                        cur,
+                        "users",
+                        where_clause="id=%s",
+                        select_fields=["member_level"]
+                    )
+                    cur.execute(select_sql, (referrer_id,))
+                    row = cur.fetchone()
+                    referrer = type('obj', (object,),
+                                    {'member_level': row.get('member_level', 0) or 0 if row else 0})() if row else None
+            if not referrer:
+                raise FinanceException(f"推荐人不存在: {referrer_id}")
+
+            if user_id == referrer_id:
+                raise FinanceException("不能设置自己为推荐人")
+
+            result = self.session.execute(
+                "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
+                {"user_id": user_id}
+            )
+            if result.fetchone():
+                raise FinanceException("用户已存在推荐人，无法重复设置")
+
+            self.session.execute(
+                "INSERT INTO user_referrals (user_id, referrer_id) VALUES (%s, %s)",
+                {"user_id": user_id, "referrer_id": referrer_id}
+            )
+
+            self.session.commit()
+            logger.debug(f"用户{user_id}的推荐人设置为{referrer_id}（{referrer.member_level}星）")
+            return True
+
+        except Exception as e:
+            self.session.rollback()
+            logger.error(f"❌ 设置推荐人失败: {e}")
+            return False
+
+    def get_user_referrer(self, user_id: int) -> Optional[Dict[str, Any]]:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT ur.referrer_id, u.name, u.member_level
+                       FROM user_referrals ur JOIN users u ON ur.referrer_id = u.id
+                       WHERE ur.user_id = %s""",
+                    (user_id,)
+                )
+                row = cur.fetchone()
+                return {
+                    "referrer_id": row['referrer_id'],
+                    "name": row['name'],
+                    "member_level": row['member_level']
+                } if row else None
+
+    def get_user_team(self, user_id: int, max_layer: int = MAX_TEAM_LAYER) -> List[Dict[str, Any]]:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """WITH RECURSIVE team_tree AS (
+                       SELECT user_id, referrer_id, 1 as layer FROM user_referrals WHERE referrer_id = %s
+                       UNION ALL
+                       SELECT ur.user_id, ur.referrer_id, tt.layer + 1
+                       FROM user_referrals ur JOIN team_tree tt ON ur.referrer_id = tt.user_id
+                       WHERE tt.layer < %s
+                       )
+                       SELECT tt.user_id, u.name, u.member_level, tt.layer
+                       FROM team_tree tt JOIN users u ON tt.user_id = u.id
+                       ORDER BY tt.layer, tt.user_id""",
+                    (user_id, max_layer)
+                )
+                results = cur.fetchall()
+                return [{
+                    "user_id": r['user_id'],
+                    "name": r['name'],
+                    "member_level": r['member_level'],
+                    "layer": r['layer']
+                } for r in results]
+
+    def check_director_promotion(self) -> bool:
+        try:
+            logger.debug("荣誉董事晋升审核")
+
+            result = self.session.execute("SELECT id FROM users WHERE member_level = 6")
+            six_star_users = result.fetchall()
+
+            promoted_count = 0
+            for user in six_star_users:
+                user_id = user.id
+
+                result = self.session.execute(
+                    """SELECT COUNT(DISTINCT u.id) as count
+                       FROM user_referrals ur JOIN users u ON ur.user_id = u.id
+                       WHERE ur.referrer_id = %s AND u.member_level = 6""",
+                    {"user_id": user_id}
+                )
+                direct_count = result.fetchone().count
+
+                result = self.session.execute(
+                    """WITH RECURSIVE team AS (
+                       SELECT user_id, referrer_id, 1 as level FROM user_referrals WHERE referrer_id = %s
+                       UNION ALL
+                       SELECT ur.user_id, ur.referrer_id, t.level + 1
+                       FROM user_referrals ur JOIN team t ON ur.referrer_id = t.user_id
+                       WHERE t.level < 6
+                       )
+                       SELECT COUNT(DISTINCT t.user_id) as count
+                       FROM team t JOIN users u ON t.user_id = u.id
+                       WHERE u.member_level = 6""",
+                    {"user_id": user_id}
+                )
+                total_count = result.fetchone().count
+
+                if direct_count >= 3 and total_count >= 10:
+                    result = self.session.execute(
+                        "UPDATE users SET status = 9 WHERE id = %s AND status != 9",
+                        {"user_id": user_id}
+                    )
+                    if result.rowcount > 0:
+                        promoted_count += 1
+                        logger.info(f"用户{user_id}晋升为荣誉董事！（直接:{direct_count}, 团队:{total_count}）")
+
+            self.session.commit()
+            logger.info(f"荣誉董事审核完成: 晋升{promoted_count}人")
+            return True
+
+        except Exception as e:
+            self.session.rollback()
+            logger.error(f"❌ 荣誉董事审核失败: {e}")
+            return False
+
+    # ==================== 关键修改6：get_user_info使用member_points ====================
+    def get_user_info(self, user_id: int) -> Dict[str, Any]:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 用户主信息
+                # 关键修改：查询member_points而非points
+                cur.execute(
+                    """SELECT id, mobile, name, member_level, member_points, promotion_balance,
+                       merchant_points, merchant_balance, status
+                       FROM users WHERE id = %s""",
+                    (user_id,)
+                )
+                user = cur.fetchone()
+                if not user:
+                    raise FinanceException("用户不存在")
+
+                # 优惠券统计
+                cur.execute(
+                    """SELECT COUNT(*) as count, SUM(amount) as total_amount
+                       FROM coupons WHERE user_id = %s AND status = 'unused'""",
+                    (user_id,)
+                )
+                coupons = cur.fetchone()
+
+                # 角色判定
+                roles = []
+                # 关键修改：使用member_points判断用户角色
+                if user['member_points'] > 0 or user['promotion_balance'] > 0:
+                    roles.append("普通用户")
+                if user['merchant_points'] > 0 or user['merchant_balance'] > 0:
+                    roles.append("商家")
+
+                star_level = "荣誉董事" if user['status'] == 9 else (
+                    f"{user['member_level']}星级会员" if user['member_level'] > 0 else "非会员")
+
+                return {
+                    "id": user['id'],
+                    "mobile": user['mobile'],
+                    "name": user['name'],
+                    "member_level": user['member_level'],
+                    "member_points": user['member_points'],  # 修改：返回member_points
+                    "promotion_balance": float(user['promotion_balance']),
+                    "merchant_points": user['merchant_points'],
+                    "merchant_balance": float(user['merchant_balance']),
+                    "roles": roles,
+                    "star_level": star_level,
+                    "status": user['status'],
+                    "coupons": {
+                        "unused_count": coupons['count'] or 0,
+                        "total_amount": float(coupons['total_amount'] or 0)
+                    }
+                }
+
+    def get_user_coupons(self, user_id: int, status: str = 'unused') -> List[Dict[str, Any]]:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, coupon_type, amount, status, valid_from, valid_to, used_at, created_at
+                       FROM coupons WHERE user_id = %s AND status = %s
+                       ORDER BY created_at DESC""",
+                    (user_id, status)
+                )
+                coupons = cur.fetchall()
+                return [{
+                    "id": c['id'],
+                    "coupon_type": c['coupon_type'],
+                    "amount": float(c['amount']),
+                    "status": c['status'],
+                    "valid_from": c['valid_from'].strftime("%Y-%m-%d"),
+                    "valid_to": c['valid_to'].strftime("%Y-%m-%d"),
+                    "used_at": c['used_at'].strftime("%Y-%m-%d %H:%M:%S") if c['used_at'] else None,
+                    "created_at": c['created_at'].strftime("%Y-%m-%d %H:%M:%S")
+                } for c in coupons]
 
     # ==================== 关键修改7：财务报告使用member_points ====================
     def get_finance_report(self) -> Dict[str, Any]:
@@ -1424,22 +1799,22 @@ def _execute_split(cur, order_number: str, total: Decimal):
     # 商家分得 80%
     merchant = total * Decimal("0.8")
 
-    # 更新商家余额（使用 merchant_balance 表）
+    # 更新商家余额（使用 users 表）
     cur.execute(
-        "UPDATE merchant_balance SET balance=balance+%s WHERE merchant_id=1",
+        "UPDATE users SET merchant_balance=merchant_balance+%s WHERE id=1",
         (merchant,)
     )
 
     # 获取商家余额
     select_sql = build_dynamic_select(
         cur,
-        "merchant_balance",
-        where_clause="merchant_id=1",
-        select_fields=["balance"]
+        "users",
+        where_clause="id=1",
+        select_fields=["merchant_balance"]
     )
     cur.execute(select_sql)
     merchant_balance_row = cur.fetchone()
-    merchant_balance_after = merchant_balance_row["balance"] if merchant_balance_row else merchant
+    merchant_balance_after = merchant_balance_row["merchant_balance"] if merchant_balance_row else merchant
 
     # 记录商家流水到 account_flow
     cur.execute(
@@ -1528,20 +1903,20 @@ def reverse_split_on_refund(order_number: str):
             if m > 0:
                 # 回冲商家余额
                 cur.execute(
-                    "UPDATE merchant_balance SET balance=balance-%s WHERE merchant_id=1",
+                    "UPDATE users SET merchant_balance=merchant_balance-%s WHERE id=1",
                     (m,)
                 )
 
                 # 获取回冲后的余额
                 select_sql = build_dynamic_select(
                     cur,
-                    "merchant_balance",
-                    where_clause="merchant_id=1",
-                    select_fields=["balance"]
+                    "users",
+                    where_clause="id=1",
+                    select_fields=["merchant_balance"]
                 )
                 cur.execute(select_sql)
                 merchant_balance_row = cur.fetchone()
-                merchant_balance_after = merchant_balance_row["balance"] if merchant_balance_row else Decimal("0")
+                merchant_balance_after = merchant_balance_row["merchant_balance"] if merchant_balance_row else Decimal("0")
 
                 # 记录回冲流水
                 cur.execute(
@@ -1606,25 +1981,26 @@ def get_balance(merchant_id: int = 1):
         merchant_id: 商家ID，默认为1
 
     返回:
-        dict: 包含 balance, bank_name, bank_account 的字典
+        dict: 包含 merchant_balance, bank_name, bank_account 的字典
     """
     from core.database import get_conn
 
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # 修改为从 users 表获取 merchant_balance 字段
             cur.execute(
-                "SELECT balance,bank_name,bank_account FROM merchant_balance WHERE merchant_id=%s",
+                "SELECT merchant_balance, bank_name, bank_account FROM users WHERE id=%s",
                 (merchant_id,)
             )
             row = cur.fetchone()
             if not row:
                 # 如果不存在，创建初始记录
                 cur.execute(
-                    "INSERT INTO merchant_balance(merchant_id,balance) VALUES(%s,0)",
+                    "INSERT INTO users (id, merchant_balance, bank_name, bank_account) VALUES (%s, 0, '', '')",
                     (merchant_id,)
                 )
                 conn.commit()
-                return {"balance": Decimal("0"), "bank_name": "", "bank_account": ""}
+                return {"merchant_balance": Decimal("0"), "bank_name": "", "bank_account": ""}
             return row
 
 
@@ -1640,15 +2016,25 @@ def bind_bank(bank_name: str, bank_account: str, merchant_id: int = 1):
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE merchant_balance SET bank_name=%s,bank_account=%s WHERE merchant_id=%s",
-                (bank_name, bank_account, merchant_id)
-            )
+            # 检查是否存在该商家
+            cur.execute("SELECT 1 FROM users WHERE id=%s", (merchant_id,))
+            if cur.fetchone():
+                # 更新现有记录
+                cur.execute(
+                    "UPDATE users SET bank_name=%s, bank_account=%s WHERE id=%s",
+                    (bank_name, bank_account, merchant_id)
+                )
+            else:
+                # 插入新记录
+                cur.execute(
+                    "INSERT INTO users (id, bank_name, bank_account) VALUES (%s, %s, %s)",
+                    (merchant_id, bank_name, bank_account)
+                )
             conn.commit()
 
 
 def withdraw(amount: Decimal, merchant_id: int = 1) -> bool:
-    """商家提现
+    """商家提现（改用 users.merchant_balance）
 
     参数:
         amount: 提现金额
@@ -1661,15 +2047,18 @@ def withdraw(amount: Decimal, merchant_id: int = 1) -> bool:
 
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # 1. 查余额
             cur.execute(
-                "SELECT balance FROM merchant_balance WHERE merchant_id=%s",
+                "SELECT merchant_balance FROM users WHERE id=%s",
                 (merchant_id,)
             )
-            bal = cur.fetchone()["balance"]
-            if bal < amount:
+            row = cur.fetchone()
+            if not row or Decimal(str(row["merchant_balance"] or 0)) < amount:
                 return False
+
+            # 2. 扣余额
             cur.execute(
-                "UPDATE merchant_balance SET balance=balance-%s WHERE merchant_id=%s",
+                "UPDATE users SET merchant_balance=merchant_balance-%s WHERE id=%s",
                 (amount, merchant_id)
             )
             conn.commit()
@@ -1687,8 +2076,9 @@ def settle_to_merchant(amount: Decimal, merchant_id: int = 1):
 
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # 修改为更新 users 表中的 merchant_balance 字段
             cur.execute(
-                "UPDATE merchant_balance SET balance=balance+%s WHERE merchant_id=%s",
+                "UPDATE users SET merchant_balance=merchant_balance+%s WHERE id=%s",
                 (amount, merchant_id)
             )
             conn.commit()

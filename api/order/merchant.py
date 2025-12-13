@@ -1,10 +1,9 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from core.database import get_conn
 from services.finance_service import get_balance, bind_bank, withdraw
 from decimal import Decimal
-from typing import List, Dict, Any
 from .refund import RefundManager
 
 router = APIRouter()
@@ -50,7 +49,7 @@ class MerchantManager:
     def ship(order_number: str) -> bool:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE orders SET status='pending_recv' WHERE (order_number=%s OR order_no=%s) AND status='pending_ship'", (order_number, order_number))
+                cur.execute("UPDATE orders SET status='pending_recv' WHERE order_number=%s AND status='pending_ship'", (order_number,))
                 conn.commit()
                 return cur.rowcount > 0
 
@@ -87,9 +86,7 @@ def m_refund_audit(body: MRefundAudit):
     MerchantManager.approve_refund(body.order_number, body.approve, body.reject_reason)
     return {"ok": True}
 
-@router.get("/balance", summary="查询账户余额")
-def m_balance():
-    return get_balance()
+
 
 @router.post("/bind_bank", summary="绑定银行卡")
 def m_bind(body: MBindBank):

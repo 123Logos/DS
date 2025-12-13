@@ -35,7 +35,7 @@ class RefundManager:
                 cur.execute("UPDATE refunds SET status=%s,reject_reason=%s WHERE order_number=%s",
                             (new_status, reject_reason, order_number))
                 if approve:
-                    cur.execute("UPDATE orders SET status='refund' WHERE order_number=%s OR order_no=%s", (order_number, order_number))
+                    cur.execute("UPDATE orders SET status='refund' WHERE order_number=%s", (order_number,))
                     reverse_split_on_refund(order_number)
                 conn.commit()
                 return True
