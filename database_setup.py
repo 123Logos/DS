@@ -382,6 +382,15 @@ class DatabaseManager:
                     INDEX idx_product_id (product_id)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
+            'system_sentence': """
+                CREATE TABLE IF NOT EXISTS system_sentence (
+                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    banner_sentence VARCHAR(128) NULL COMMENT '轮播图标语',
+                    system_sentence VARCHAR(128) NULL COMMENT '系统标语',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间'
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
         }
 
         # 定义必需字段（用于检查和更新已存在的表）
