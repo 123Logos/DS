@@ -5,7 +5,7 @@ import datetime
 from models.schemas.user import (
     SetStatusReq, AuthReq, AuthResp, UpdateProfileReq, SelfDeleteReq,
     FreezeReq, ResetPwdReq, AdminResetPwdReq, SetLevelReq, AddressReq,
-    PointsReq, UserInfoResp, BindReferrerReq
+    PointsReq, UserInfoResp, BindReferrerReq,MobileResp,Query
 )
 
 from core.database import get_conn
@@ -1067,3 +1067,55 @@ async def wechat_login(request: Request):
         logger.exception("微信登录失败")
         # 为避免将原始异常（可能包含 Decimal 等不可序列化对象）放入响应，返回简单错误信息
         raise HTTPException(status_code=500, detail="微信登录失败")
+
+@router.get("/user/mobile", response_model=MobileResp, summary="根据用户ID获取手机号")
+def get_mobile_by_uid(
+    user_id: int = Query(..., gt=0, description="用户ID"),
+    key: str = Query(..., description="后台口令")
+):
+    if key != "gm2025":
+        raise HTTPException(status_code=403, detail="口令错误")
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            select_sql = build_dynamic_select(
+                cur, "users", where_clause="id=%s", select_fields=["mobile"]
+            )
+            cur.execute(select_sql, (user_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="用户不存在")
+            return {"mobile": row["mobile"]}
+
+@router.put("/user/mobile", summary="后台修改手机号（无验证码）")
+def change_mobile(
+    user_id: int = Query(..., gt=0, description="用户ID"),
+    old_mobile: str = Query(..., description="原手机号"),
+    new_mobile: str = Query(..., description="新手机号"),
+    key: str = Query(..., description="后台口令")
+):
+    if key != "gm2025":
+        raise HTTPException(status_code=403, detail="口令错误")
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # 1. 旧手机号是否属于该用户
+            select_sql = build_dynamic_select(
+                cur, "users", where_clause="id=%s AND mobile=%s", select_fields=["id"]
+            )
+            cur.execute(select_sql, (user_id, old_mobile))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="旧手机号与用户不匹配")
+
+            # 2. 新号是否已被占用
+            select_sql = build_dynamic_select(
+                cur, "users", where_clause="mobile=%s", select_fields=["1"]
+            )
+            cur.execute(select_sql, (new_mobile,))
+            if cur.fetchone():
+                raise HTTPException(status_code=400, detail="新手机号已被注册")
+
+            # 3. 更新
+            cur.execute("UPDATE users SET mobile=%s WHERE id=%s", (new_mobile, user_id))
+            conn.commit()
+            return {"msg": "手机号已更新"}

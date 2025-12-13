@@ -139,3 +139,19 @@ class BindReferrerReq(BaseModel):
     mobile: str                       # 被推荐人手机号
     referrer_mobile: Optional[str] = None  # 推荐人手机号（老逻辑保留）
     referrer_code: Optional[str] = None    # 新增：推荐码（优先用）
+
+class MobileResp(BaseModel):
+    mobile: str
+
+class ChangeMobileReq(BaseModel):
+    user_id: int
+    old_mobile: str
+    new_mobile: str
+    sms_code: str = Field(..., description="短信验证码（先 mock 111111）")
+
+
+class ChangeMobileReq(BaseModel):
+    user_id: int
+    old_mobile: str
+    new_mobile: str
+
