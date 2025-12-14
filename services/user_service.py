@@ -80,7 +80,7 @@ class UserService:
                     elif col == "password_hash":
                         vals.append(pwd_hash)
                     elif col == "name":
-                        vals.append(name)
+                        vals.append(name if name is not None else "微信用户")
                     elif col in ("member_points", "merchant_points"):
                         vals.append(0)
                     elif col == "withdrawable_balance":
