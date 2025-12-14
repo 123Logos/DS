@@ -10,6 +10,7 @@ from .cart import router as cart_router
 from .order import router as order_router
 from .refund import router as refund_router
 from .merchant import router as merchant_router
+from .logistics import register_logistics_routes
 
 def register_routes(app: "FastAPI"):
     """注册订单系统路由到主应用"""
@@ -19,3 +20,4 @@ def register_routes(app: "FastAPI"):
     app.include_router(order_router, prefix="/order", tags=["订单系统"])
     app.include_router(refund_router, prefix="/refund", tags=["订单系统"])
     app.include_router(merchant_router, prefix="/merchant", tags=["订单系统"])
+    register_logistics_routes(app)
