@@ -391,6 +391,17 @@ class DatabaseManager:
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间'
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
+            'user_unilevel': """
+                CREATE TABLE IF NOT EXISTS user_unilevel (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id BIGINT UNSIGNED NOT NULL,
+                    level TINYINT NOT NULL COMMENT '1-一星联创 2-二星 3-三星',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY uk_uid (user_id),
+                    INDEX idx_user_id (user_id),
+                    INDEX idx_level (level)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
         }
 
         # 定义必需字段（用于检查和更新已存在的表）
@@ -422,6 +433,7 @@ class DatabaseManager:
         self._add_banner_foreign_keys(cursor)
         self._add_product_attributes_foreign_keys(cursor)
         self._add_product_skus_foreign_keys(cursor)
+        self._add_user_unilevel_foreign_keys(cursor)
 
         self._init_finance_accounts(cursor)
         logger.info("数据库表结构初始化完成")
@@ -673,6 +685,41 @@ class DatabaseManager:
                 logger.debug("product_skus 表外键约束 product_skus_ibfk_1 已添加")
         except Exception as e:
             logger.debug(f"⚠️ product_skus 表外键约束添加失败（已忽略）: {e}")
+
+    def _add_user_unilevel_foreign_keys(self, cursor):
+        """为 user_unilevel 表添加外键约束（如果不存在）"""
+        try:
+            # 检查 user_unilevel 表和 users 表是否存在
+            cursor.execute("""
+                SELECT TABLE_NAME 
+                FROM information_schema.TABLES 
+                WHERE TABLE_SCHEMA = DATABASE() 
+                AND TABLE_NAME IN ('user_unilevel', 'users')
+            """)
+            existing_tables = {row['TABLE_NAME'] for row in cursor.fetchall()}
+            
+            if 'user_unilevel' not in existing_tables or 'users' not in existing_tables:
+                logger.debug("⚠️ user_unilevel 表或 users 表不存在，跳过外键添加")
+                return
+            
+            cursor.execute("""
+                SELECT CONSTRAINT_NAME 
+                FROM information_schema.TABLE_CONSTRAINTS 
+                WHERE TABLE_SCHEMA = DATABASE() 
+                AND TABLE_NAME = 'user_unilevel' 
+                AND CONSTRAINT_TYPE = 'FOREIGN KEY'
+            """)
+            existing_fks = [row['CONSTRAINT_NAME'] for row in cursor.fetchall()]
+            
+            if 'user_unilevel_ibfk_1' not in existing_fks:
+                cursor.execute("""
+                    ALTER TABLE user_unilevel 
+                    ADD CONSTRAINT user_unilevel_ibfk_1 
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                """)
+                logger.debug("user_unilevel 表外键约束 user_unilevel_ibfk_1 已添加")
+        except Exception as e:
+            logger.debug(f"⚠️ user_unilevel 表外键约束添加失败（已忽略）: {e}")
 
     def _init_finance_accounts(self, cursor):
         accounts = [
