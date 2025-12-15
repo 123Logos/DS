@@ -18,6 +18,8 @@ from models.schemas.finance import (
     WithdrawalRequest, WithdrawalAuditRequest, RewardAuditRequest,
     CouponUseRequest, RefundRequest
 )
+from typing import List
+from pydantic import BaseModel
 
 logger = get_logger(__name__)
 
@@ -33,6 +35,10 @@ def get_finance_service() -> FinanceService:
 def get_database_manager() -> DatabaseManager:
     """获取 DatabaseManager 实例（用于数据库初始化）"""
     return DatabaseManager()
+
+
+class ClearFundPoolsRequest(BaseModel):
+    pool_types: List[str] = []  # 要清空的资金池类型列表
 
 
 @router.get("/", summary="系统状态")
@@ -94,7 +100,6 @@ async def create_user(
     except Exception as e:
         logger.error(f"创建用户失败: {e}")
         raise HTTPException(status_code=400, detail=str(e))"""
-
 
 """@router.get("/api/users/{user_id}", response_model=ResponseModel, summary="查询用户信息")
 async def get_user_info(
@@ -191,7 +196,7 @@ async def create_product(
             with conn.cursor() as cur:
                 cur.execute(
                     """"""INSERT INTO products (sku, name, price, stock, is_member_product, merchant_id, status)
-                       VALUES (%s, %s, %s, %s, %s, %s, 1)""","""
+                       VALUES (%s, %s, %s, %s, %s, %s, 1)""", """
                     (sku, product.name, final_price, product.stock, product.is_member_product, product.merchant_id)
                 )
                 product_id = cur.lastrowid
@@ -242,7 +247,6 @@ async def get_products(
     except Exception as e:
         logger.error(f"查询商品失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))"""
-
 
 '''@router.post("/api/orders", response_model=ResponseModel, summary="订单结算")
 async def settle_order(
@@ -408,6 +412,22 @@ async def distribute_subsidy(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/api/unilevel/dividend", response_model=ResponseModel, summary="发放联创星级分红（手动触发）")
+async def distribute_unilevel_dividend(
+    service: FinanceService = Depends(get_finance_service)
+):
+    """手动触发联创星级分红发放"""
+    try:
+        # 每次调用创建新实例避免连接污染
+        result = service.distribute_unilevel_dividend()
+        if result:
+            return ResponseModel(success=True, message="联创星级分红发放成功")
+        return ResponseModel(success=False, message="分红发放失败或无符合条件的用户")
+    except Exception as e:
+        logger.error(f"联创分红接口异常: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/api/subsidy/fund", response_model=ResponseModel, summary="预存补贴资金")
 async def fund_subsidy_pool(
         service: FinanceService = Depends(get_finance_service),
@@ -484,7 +504,9 @@ async def get_public_welfare_flow(
                 "balance_after": float(flow['balance_after']) if flow['balance_after'] else None,
                 "flow_type": flow['flow_type'],
                 "remark": flow['remark'],
-                "created_at": flow['created_at'].strftime("%Y-%m-%d %H:%M:%S") if isinstance(flow['created_at'], datetime) else str(flow['created_at'])
+                "created_at": flow['created_at'].strftime("%Y-%m-%d %H:%M:%S") if isinstance(flow['created_at'],
+                                                                                             datetime) else str(
+                    flow['created_at'])
             } for flow in flows]
         }
         return ResponseModel(success=True, message="查询成功", data=data)
@@ -524,7 +546,9 @@ async def get_public_welfare_report(
             "user_name": get_user_name(item['related_user']),
             "change_amount": float(item['change_amount']),
             "balance_after": float(item['balance_after']) if item['balance_after'] else None,
-            "created_at": item['created_at'].strftime("%Y-%m-%d %H:%M:%S") if isinstance(item['created_at'], datetime) else str(item['created_at'])
+            "created_at": item['created_at'].strftime("%Y-%m-%d %H:%M:%S") if isinstance(item['created_at'],
+                                                                                         datetime) else str(
+                item['created_at'])
         } for item in report_data['details']]
 
         return ResponseModel(
@@ -664,6 +688,27 @@ async def get_transaction_chain_report(
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.error(f"查询交易链报表失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/fund-pools/clear", response_model=ResponseModel, summary="清空指定资金池")
+async def clear_fund_pools(
+        request: ClearFundPoolsRequest,
+        service: FinanceService = Depends(get_finance_service)
+):
+    """手动清空指定的资金池"""
+    try:
+        result = service.clear_fund_pools(request.pool_types)
+
+        return ResponseModel(
+            success=True,
+            message=f"已清空 {len(result['cleared_pools'])} 个资金池，总计 ¥{result['total_cleared']:.2f}",
+            data=result
+        )
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"清空资金池接口异常: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

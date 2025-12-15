@@ -1456,6 +1456,70 @@ class FinanceService:
 
                 return result
 
+    def distribute_unilevel_dividend(self) -> bool:
+        """发放联创星级分红（手动触发）"""
+        logger.info("联创星级分红发放开始")
+
+        # ============= 1. 在事务外查询 =============
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT uu.user_id, uu.level, u.name, u.member_level
+                    FROM user_unilevel uu
+                    JOIN users u ON uu.user_id = u.id
+                    WHERE uu.level IN (1, 2, 3)
+                """)
+                unilevel_users = cur.fetchall()
+
+        if not unilevel_users:
+            logger.warning("没有符合条件的联创用户")
+            return False
+
+        total_weight = sum(Decimal(str(user['level'])) for user in unilevel_users)
+        pool_balance = self.get_account_balance('honor_director')
+
+        if pool_balance <= 0:
+            logger.warning(f"联创分红资金池余额不足: ¥{pool_balance}")
+            return False
+
+        # ============= 2. 使用 get_conn() 替代 self.session =============
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    total_distributed = Decimal('0')
+                    for user in unilevel_users:
+                        user_id = user['user_id']
+                        weight = Decimal(str(user['level']))
+
+                        dividend_amount = pool_balance * weight / total_weight
+                        points_to_add = dividend_amount
+
+                        # 使用位置参数 %s
+                        cur.execute(
+                            "UPDATE users SET points = COALESCE(points, 0) + %s WHERE id = %s",
+                            (points_to_add, user_id)
+                        )
+
+                        # 记录流水
+                        cur.execute(
+                            """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
+                               VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+                            ('honor_director', user_id, points_to_add, 0, 'income',
+                             f"联创{weight}星级分红（权重{weight}/{total_weight}）")
+                        )
+
+                        total_distributed += points_to_add
+                        logger.debug(f"用户{user_id}获得联创分红点数: {points_to_add:.4f}")
+
+                    conn.commit()
+
+                logger.info(f"联创星级分红完成: 共{len(unilevel_users)}人，发放点数{total_distributed:.4f}")
+                return True
+
+        except Exception as e:
+            logger.error(f"联创星级分红失败: {e}", exc_info=True)
+            return False
+
     # ==================== 关键修改8：积分流水报告使用member_points ====================
     def get_points_flow_report(self, user_id: Optional[int] = None, limit: int = 50) -> List[Dict[str, Any]]:
         with get_conn() as conn:
@@ -1724,6 +1788,100 @@ class FinanceService:
                     },
                     "chain": chain
                 }
+
+    # services/finance_service.py
+
+    def clear_fund_pools(self, pool_types: List[str]) -> Dict[str, Any]:
+        """清空指定的资金池"""
+        logger.info(f"开始清空资金池: {pool_types}")
+
+        if not pool_types:
+            raise FinanceException("必须指定要清空的资金池类型")
+
+        # 验证所有池子类型是否有效
+        valid_pools = [key.value for key in AllocationKey]
+        for pool_type in pool_types:
+            if pool_type not in valid_pools:
+                raise FinanceException(f"无效的资金池类型: {pool_type}")
+
+        # ============= 在事务外查询余额并过滤 =============
+        pools_to_clear = []
+        for pool_type in pool_types:
+            current_balance = self.get_account_balance(pool_type)
+            if current_balance <= 0:
+                logger.debug(f"资金池 {pool_type} 余额为0，跳过")
+                continue
+
+            # 获取账户名称
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT account_name FROM finance_accounts WHERE account_type = %s",
+                        (pool_type,)
+                    )
+                    account = cur.fetchone()
+                    account_name = account['account_name'] if account else pool_type
+
+            pools_to_clear.append({
+                "account_type": pool_type,
+                "account_name": account_name,
+                "balance": current_balance
+            })
+
+        if not pools_to_clear:
+            logger.info("所有指定资金池余额为0，无需清空")
+            return {
+                "cleared_pools": [],
+                "total_cleared": 0.0
+            }
+
+        # ============= 使用 get_conn() 替代 self.session =============
+        cleared_pools = []
+        total_cleared = Decimal('0')
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    for pool_info in pools_to_clear:
+                        pool_type = pool_info["account_type"]
+                        account_name = pool_info["account_name"]
+                        current_balance = pool_info["balance"]
+
+                        # 执行清空操作（使用直接SQL执行）
+                        cur.execute(
+                            "UPDATE finance_accounts SET balance = 0 WHERE account_type = %s",
+                            (pool_type,)
+                        )
+
+                        # 记录流水
+                        cur.execute(
+                            """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
+                               VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+                            (pool_type, None, -current_balance, 0, 'expense', "手动清空资金池")
+                        )
+
+                        cleared_pools.append({
+                            "account_type": pool_type,
+                            "account_name": account_name,
+                            "amount_cleared": float(current_balance),
+                            "previous_balance": float(current_balance)
+                        })
+                        total_cleared += current_balance
+
+                        logger.info(f"已清空资金池 {pool_type}: ¥{current_balance:.2f}")
+
+                    conn.commit()
+
+                logger.info(f"资金池清空完成: 共清空 {len(cleared_pools)} 个，总计 ¥{total_cleared:.2f}")
+
+                return {
+                    "cleared_pools": cleared_pools,
+                    "total_cleared": float(total_cleared)
+                }
+
+        except Exception as e:
+            logger.error(f"清空资金池失败: {e}", exc_info=True)
+            raise
 
 
 # ==================== 订单系统财务功能（来自 order/finance.py） ====================
