@@ -84,6 +84,7 @@ class UserInfoResp(BaseModel):
     name: Optional[str]
     avatar_path: Optional[str]
     member_level: int
+    status: UserStatus
     referral_code: Optional[str]
     direct_count: int
     team_total: int

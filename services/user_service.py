@@ -278,6 +278,7 @@ class UserService:
         direct = UserService._count_direct_6star(uid)
         need = {1: 3, 2: 5, 3: 7}[target]
         if direct < need:
+            print(f"直推六星不足：需要 {need}，实际 {direct}")
             return False
         with get_conn() as conn:
             with conn.cursor() as cur:
