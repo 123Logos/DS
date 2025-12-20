@@ -32,6 +32,21 @@ def to_pinyin(text: str) -> str:
     return " ".join(lazy_pinyin(text, style=Style.NORMAL)).upper()
 
 
+# ✅ 新增：处理可选文件上传的依赖函数
+def get_optional_files(files: Optional[List[UploadFile]] = File(None)) -> Optional[List[UploadFile]]:
+    """
+    处理可选文件上传参数，解决422错误
+    - 过滤掉前端发送的空字符串等无效文件对象
+    - 保持原有上传逻辑完全不变
+    """
+    if files is None:
+        return None
+
+    # 过滤掉无效的文件项（包括空字符串、None等）
+    valid_files = [f for f in files if f is not None and hasattr(f, 'filename') and f.filename]
+    return valid_files if valid_files else None
+
+
 # ✅ 修改：在 PRODUCT_COLUMNS 中添加 max_points_discount
 PRODUCT_COLUMNS = ["id", "name", "pinyin", "description", "category",
                    "main_image", "detail_images", "status", "user_id",
@@ -165,6 +180,18 @@ class ProductUpdate(BaseModel):
                                        ProductStatus.OUT_OF_STOCK}:
             raise ValueError(f"状态非法")
         return v
+
+
+# ✅ 新增：删除图片请求模型
+class ImageDeleteRequest(BaseModel):
+    image_urls: List[str]
+    image_type: str = Field(..., pattern="^(banner|detail)$")  # ✅ 修改：regex → pattern
+
+
+# ✅ 新增：更新图片请求模型
+class ImageUpdateRequest(BaseModel):
+    detail_images: Optional[List[str]] = None
+    banner_images: Optional[List[str]] = None
 
 
 # ---------------- 中文路由摘要 + 修复上下文 ----------------
@@ -852,3 +879,314 @@ def get_sales_data(id: int):
                 raise HTTPException(status_code=404, detail="暂无销售数据")
             return {"status": "success",
                     "data": {"total_quantity": int(row['qty']), "total_sales": float(row['sales'])}}
+
+
+# ✅ 新增：删除图片接口
+@router.delete("/products/{id}/images", summary="🗑️ 删除商品图片")
+def delete_images(
+        id: int,
+        image_urls: List[str] = Query(..., description="要删除的图片URL列表"),
+        image_type: str = Query(..., pattern="^(banner|detail)$",
+                                description="图片类型: banner(轮播图) 或 detail(详情图)")
+):
+    """
+    删除指定商品的图片
+    - image_type: banner 删除轮播图，detail 删除详情图
+    - image_urls: 要删除的图片URL列表
+    """
+    from pathlib import Path
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            try:
+                # 查询商品
+                select_sql = build_dynamic_select(
+                    cur,
+                    "products",
+                    where_clause="id = %s"
+                )
+                cur.execute(select_sql, (id,))
+                product = cur.fetchone()
+                if not product:
+                    raise HTTPException(status_code=404, detail="商品不存在")
+
+                # 获取当前图片列表
+                if image_type == "banner":
+                    raw_images = product.get('main_image')
+                    banner_table = True  # 需要同步删除 banner 表
+                else:  # detail
+                    raw_images = product.get('detail_images')
+                    banner_table = False
+
+                # 解析图片列表
+                current_images = []
+                try:
+                    if raw_images:
+                        if isinstance(raw_images, str) and raw_images.strip().startswith('['):
+                            current_images = json.loads(raw_images)
+                        elif isinstance(raw_images, list):
+                            current_images = raw_images
+                except:
+                    current_images = []
+
+                if not current_images:
+                    return {"status": "success", "message": "图片列表为空，无需删除"}
+
+                # 检查要删除的图片是否存在
+                images_to_delete = []
+                for url in image_urls:
+                    if url in current_images:
+                        images_to_delete.append(url)
+                    else:
+                        raise HTTPException(status_code=400, detail=f"图片不存在: {url}")
+
+                if not images_to_delete:
+                    raise HTTPException(status_code=400, detail="没有有效的图片需要删除")
+
+                # 从列表中移除图片
+                updated_images = [url for url in current_images if url not in images_to_delete]
+
+                # 更新数据库
+                if image_type == "banner":
+                    cur.execute("UPDATE products SET main_image = %s WHERE id = %s",
+                                (json.dumps(updated_images, ensure_ascii=False), id))
+
+                    # 同步删除 banner 表中的记录
+                    for url in images_to_delete:
+                        cur.execute("DELETE FROM banner WHERE product_id = %s AND image_url = %s", (id, url))
+                else:
+                    cur.execute("UPDATE products SET detail_images = %s WHERE id = %s",
+                                (json.dumps(updated_images, ensure_ascii=False), id))
+
+                # ✅ 修复：物理删除文件（移除/pic/前缀）
+                category = product['category']
+                for url in images_to_delete:
+                    try:
+                        # 移除 /pic/ 前缀，构建正确路径
+                        relative_path = url.lstrip('/').replace('pic/', '', 1)  # 只替换第一个 pic/
+                        file_path = Path(str(BASE_PIC_DIR)) / relative_path
+
+                        if file_path.exists():
+                            file_path.unlink()
+                            print(f"✅ 已删除文件: {file_path}")
+                        else:
+                            print(f"⚠️ 文件不存在: {file_path}")
+                    except Exception as e:
+                        # 文件删除失败不影响主流程
+                        print(f"⚠️ 删除文件失败 {url}: {e}")
+
+                conn.commit()
+
+                # 查询更新后的商品
+                select_sql = build_dynamic_select(
+                    cur,
+                    "products",
+                    where_clause="id = %s"
+                )
+                cur.execute(select_sql, (id,))
+                updated_product = cur.fetchone()
+
+                # 获取 SKUs
+                select_sql = build_dynamic_select(
+                    cur,
+                    "product_skus",
+                    where_clause="product_id = %s",
+                    select_fields=["id", "sku_code", "price", "original_price", "stock", "specifications"]
+                )
+                cur.execute(select_sql, (id,))
+                skus = cur.fetchall()
+                skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']),
+                         "original_price": float(s['original_price']) if s['original_price'] else None,
+                         "stock": s['stock'], "specifications": s['specifications']} for s in skus]
+
+                # 获取 attributes
+                select_sql = build_dynamic_select(
+                    cur,
+                    "product_attributes",
+                    where_clause="product_id = %s",
+                    select_fields=["name", "value"]
+                )
+                cur.execute(select_sql, (id,))
+                attributes = cur.fetchall()
+                attributes = [{"name": a['name'], "value": a['value']} for a in attributes]
+
+                return {
+                    "status": "success",
+                    "message": f"已删除 {len(images_to_delete)} 张{image_type}图",
+                    "data": build_product_dict(updated_product, skus, attributes)
+                }
+            except HTTPException:
+                raise
+            except Exception as e:
+                conn.rollback()
+                raise HTTPException(status_code=400, detail=f"删除图片失败: {str(e)}")
+
+
+# ✅ 新增：更新图片接口（追加式，不覆盖原有图片）
+@router.put("/products/{id}/images", summary="🔄 更新商品图片")
+def update_images(
+        id: int,
+        image_type: str = Query(..., pattern="^(banner|detail)$", description="图片类型: banner=轮播图, detail=详情图"),
+        files: List[UploadFile] = File(..., description="图片文件列表，最多10张"),
+):
+    """
+    更新商品图片（追加式）
+    - 通过 image_type 参数明确指定上传的是轮播图还是详情图
+    - 上传的图片会追加到现有的对应图片列表
+    - 未选择的图片类型保持原样不变
+    """
+    from PIL import Image
+    import uuid
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            try:
+                # 查询商品
+                select_sql = build_dynamic_select(
+                    cur,
+                    "products",
+                    where_clause="id = %s"
+                )
+                cur.execute(select_sql, (id,))
+                product = cur.fetchone()
+                if not product:
+                    raise HTTPException(status_code=404, detail="商品不存在")
+
+                category = product['category']
+                cat_path = BASE_PIC_DIR / category
+                goods_path = cat_path / str(id)
+                goods_path.mkdir(parents=True, exist_ok=True)
+
+                # 验证文件数量
+                if len(files) > 10:
+                    raise HTTPException(status_code=400, detail=f"{image_type}图最多10张")
+
+                # 根据类型分别处理
+                if image_type == "detail":
+                    # ✅ 处理详情图（追加模式）
+                    raw_detail = product.get('detail_images')
+                    try:
+                        if raw_detail:
+                            if isinstance(raw_detail, str):
+                                detail_urls = json.loads(raw_detail)
+                            elif isinstance(raw_detail, list):
+                                detail_urls = raw_detail
+                            else:
+                                detail_urls = []
+                        else:
+                            detail_urls = []
+                    except:
+                        detail_urls = []
+
+                    # 处理每个文件
+                    for f in files:
+                        # 验证文件类型
+                        ext = Path(f.filename).suffix.lower()
+                        if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+                            raise HTTPException(status_code=400, detail="仅支持 JPG/PNG/WEBP")
+                        if f.size > 3 * 1024 * 1024:
+                            raise HTTPException(status_code=400, detail="详情图单张大小不能超过 3MB")
+
+                        # 保存文件
+                        file_name = f"detail_{uuid.uuid4().hex}{ext}"
+                        file_path = goods_path / file_name
+                        with Image.open(f.file) as im:
+                            im = im.convert("RGB")
+                            im.thumbnail((750, 2000), Image.LANCZOS)
+                            im.save(file_path, "JPEG", quality=80, optimize=True)
+                        detail_urls.append(f"/pic/{category}/{id}/{file_name}")
+
+                    # 更新详情图到数据库
+                    cur.execute("UPDATE products SET detail_images = %s WHERE id = %s",
+                                (json.dumps(detail_urls, ensure_ascii=False), id))
+
+                elif image_type == "banner":
+                    # ✅ 处理轮播图（追加模式）
+                    raw_main = product.get('main_image')
+                    try:
+                        if raw_main:
+                            if isinstance(raw_main, str) and raw_main.strip().startswith('['):
+                                banner_urls = json.loads(raw_main)
+                            elif isinstance(raw_main, list):
+                                banner_urls = raw_main
+                            else:
+                                banner_urls = []
+                        else:
+                            banner_urls = []
+                    except:
+                        banner_urls = []
+
+                    # 处理每个文件
+                    for f in files:
+                        # 验证文件类型
+                        ext = Path(f.filename).suffix.lower()
+                        if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+                            raise HTTPException(status_code=400, detail="仅支持 JPG/PNG/WEBP")
+                        if f.size > 5 * 1024 * 1024:
+                            raise HTTPException(status_code=400, detail="轮播图单张大小不能超过 5MB")
+
+                        # 保存文件
+                        file_name = f"banner_{uuid.uuid4().hex}{ext}"
+                        file_path = goods_path / file_name
+                        with Image.open(f.file) as im:
+                            im = im.convert("RGB")
+                            im.thumbnail((1200, 1200), Image.LANCZOS)
+                            im.save(file_path, "JPEG", quality=85, optimize=True)
+                        url = f"/pic/{category}/{id}/{file_name}"
+                        banner_urls.append(url)
+
+                        # 追加插入 banner 表记录
+                        cur.execute("""
+                            INSERT INTO banner (product_id, image_url, sort_order, status)
+                            VALUES (%s, %s, %s, 1)
+                        """, (id, url, len(banner_urls)))
+
+                    # 更新轮播图到数据库
+                    cur.execute("UPDATE products SET main_image = %s WHERE id = %s",
+                                (json.dumps(banner_urls, ensure_ascii=False), id))
+
+                conn.commit()
+
+                # 查询最终的商品数据
+                select_sql = build_dynamic_select(
+                    cur,
+                    "products",
+                    where_clause="id = %s"
+                )
+                cur.execute(select_sql, (id,))
+                updated_product = cur.fetchone()
+
+                # 获取 SKUs
+                select_sql = build_dynamic_select(
+                    cur,
+                    "product_skus",
+                    where_clause="product_id = %s",
+                    select_fields=["id", "sku_code", "price", "original_price", "stock", "specifications"]
+                )
+                cur.execute(select_sql, (id,))
+                skus_result = cur.fetchall()
+                skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']),
+                         "original_price": float(s['original_price']) if s['original_price'] else None,
+                         "stock": s['stock'], "specifications": s['specifications']} for s in skus_result]
+
+                # 获取 attributes
+                select_sql = build_dynamic_select(
+                    cur,
+                    "product_attributes",
+                    where_clause="product_id = %s",
+                    select_fields=["name", "value"]
+                )
+                cur.execute(select_sql, (id,))
+                attributes_result = cur.fetchall()
+                attributes = [{"name": a['name'], "value": a['value']} for a in attributes_result]
+
+                return {
+                    "status": "success",
+                    "message": f"已上传 {len(files)} 张{image_type}图",
+                    "data": build_product_dict(updated_product, skus, attributes)
+                }
+            except HTTPException:
+                raise
+            except Exception as e:
+                conn.rollback()
+                raise HTTPException(status_code=400, detail=f"更新图片失败: {str(e)}")
