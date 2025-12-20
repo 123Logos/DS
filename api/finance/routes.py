@@ -962,6 +962,93 @@ async def get_monthly_merchant_points_report(
         logger.error(f"商家积分月报表查询失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+# ==================== 联创星级点数流水报表接口 ====================
+@router.get("/api/reports/unilevel/points-flow", response_model=ResponseModel, summary="联创星级点数流水报表")
+async def get_unilevel_points_flow_report(
+    user_id: Optional[int] = Query(None, gt=0, description="用户ID（可选）"),
+    level: Optional[int] = Query(None, ge=1, le=3, description="星级（1-3，可选）"),
+    start_date: Optional[str] = Query(None, description="开始日期 yyyy-MM-dd"),
+    end_date: Optional[str] = Query(None, description="结束日期 yyyy-MM-dd"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+    service: FinanceService = Depends(get_finance_service)
+):
+    """查询联创星级分红点数的流水明细"""
+    try:
+        data = service.get_unilevel_points_flow_report(
+            user_id=user_id,
+            level=level,
+            start_date=start_date,
+            end_date=end_date,
+            page=page,
+            page_size=page_size
+        )
+        return ResponseModel(
+            success=True,
+            message=f"联创星级点数流水报表查询成功: 共{len(data['records'])}条记录",
+            data=data
+        )
+    except Exception as e:
+        logger.error(f"查询联创星级点数流水报表失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+# ==================== 1. 提现申请处理报表接口 ====================
+@router.get("/api/reports/withdrawal", response_model=ResponseModel, summary="提现申请处理报表")
+async def get_withdrawal_report(
+    start_date: str = Query(..., description="开始日期 yyyy-MM-dd"),
+    end_date: str = Query(..., description="结束日期 yyyy-MM-dd"),
+    user_id: Optional[int] = Query(None, gt=0, description="用户ID（可选）"),
+    status: Optional[str] = Query(None, pattern=r'^(pending_auto|pending_manual|approved|rejected)$', description="状态筛选"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+    service: FinanceService = Depends(get_finance_service)
+):
+    """查询提现申请的处理情况统计和明细"""
+    try:
+        data = service.get_withdrawal_report(
+            start_date=start_date,
+            end_date=end_date,
+            user_id=user_id,
+            status=status,
+            page=page,
+            page_size=page_size
+        )
+        return ResponseModel(
+            success=True,
+            message=f"提现申请报表查询成功: 共{len(data['records'])}条记录",
+            data=data
+        )
+    except Exception as e:
+        logger.error(f"查询提现申请报表失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== 2. 平台资金池变动报表接口 ====================
+@router.get("/api/reports/pool-flow", response_model=ResponseModel, summary="平台资金池变动报表")
+async def get_pool_flow_report(
+    account_type: str = Query(..., pattern=r'^(public_welfare|subsidy_pool|honor_director|company_points|platform_revenue_pool)$', description="资金池类型"),
+    start_date: str = Query(..., description="开始日期 yyyy-MM-dd"),
+    end_date: str = Query(..., description="结束日期 yyyy-MM-dd"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+    service: FinanceService = Depends(get_finance_service)
+):
+    """查询指定资金池的流水明细和汇总统计"""
+    try:
+        data = service.get_pool_flow_report(
+            account_type=account_type,
+            start_date=start_date,
+            end_date=end_date,
+            page=page,
+            page_size=page_size
+        )
+        return ResponseModel(
+            success=True,
+            message=f"资金池流水报表查询成功: {data['summary']['account_name']}",
+            data=data
+        )
+    except Exception as e:
+        logger.error(f"查询资金池流水报表失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 def register_finance_routes(app: FastAPI):
     """注册财务管理系统路由到主应用"""
     app.include_router(router, tags=["财务系统"])

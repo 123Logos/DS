@@ -2012,6 +2012,336 @@ class FinanceService:
             logger.error(f"❌ 使用优惠券失败: {e}")
             raise
 
+    # ==================== 提现申请处理报表（高优先级） ====================
+    def get_withdrawal_report(self, start_date: str, end_date: str,
+                              user_id: Optional[int] = None,
+                              status: Optional[str] = None,
+                              page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        """
+        提现申请处理报表
+
+        统计提现申请的数量、金额、税费、实际到账金额及各状态分布
+        """
+        logger.info(f"生成提现申请报表: 日期范围={start_date}至{end_date}, 用户={user_id}, 状态={status}")
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 构建WHERE条件 - ✅ 使用表别名w.避免歧义
+                where_conditions = ["DATE(w.created_at) BETWEEN %s AND %s"]  # ✅ w.created_at
+                params = [start_date, end_date]
+
+                if user_id:
+                    where_conditions.append("w.user_id = %s")  # ✅ w.user_id
+                    params.append(user_id)
+
+                if status:
+                    where_conditions.append("w.status = %s")  # ✅ w.status
+                    params.append(status)
+
+                where_sql = " AND ".join(where_conditions)
+
+                # 汇总统计 - ✅ 所有表名都使用别名w.
+                summary_sql = f"""
+                    SELECT 
+                        COUNT(*) as total_applications,
+                        SUM(w.amount) as total_amount,
+                        SUM(w.tax_amount) as total_tax,
+                        SUM(w.actual_amount) as total_actual_amount,
+                        SUM(CASE WHEN w.status = 'approved' THEN 1 ELSE 0 END) as approved_count,
+                        SUM(CASE WHEN w.status = 'rejected' THEN 1 ELSE 0 END) as rejected_count,
+                        SUM(CASE WHEN w.status = 'pending_auto' THEN 1 ELSE 0 END) as pending_auto_count,
+                        SUM(CASE WHEN w.status = 'pending_manual' THEN 1 ELSE 0 END) as pending_manual_count
+                    FROM withdrawals w
+                    WHERE {where_sql}
+                """
+                cur.execute(summary_sql, tuple(params))
+                summary = cur.fetchone()
+
+                # 总记录数 - ✅ 使用别名w.
+                count_sql = f"SELECT COUNT(*) as total FROM withdrawals w WHERE {where_sql}"
+                cur.execute(count_sql, tuple(params))
+                total_count = cur.fetchone()['total'] or 0
+
+                # 明细查询 - ✅ 使用别名w.和u.
+                offset = (page - 1) * page_size
+                detail_sql = f"""
+                    SELECT 
+                        w.id, w.user_id, u.name as user_name,
+                        w.amount, w.tax_amount, w.actual_amount, w.status,
+                        w.created_at, w.processed_at, w.audit_remark
+                    FROM withdrawals w
+                    JOIN users u ON w.user_id = u.id
+                    WHERE {where_sql}
+                    ORDER BY w.created_at DESC
+                    LIMIT %s OFFSET %s
+                """
+                params.extend([page_size, offset])
+                cur.execute(detail_sql, tuple(params))
+                records = cur.fetchall()
+
+                # 返回数据
+                return {
+                    "summary": {
+                        "report_type": "withdrawal_processing",
+                        "total_applications": summary['total_applications'] or 0,
+                        "total_amount": float(summary['total_amount'] or 0),
+                        "total_tax": float(summary['total_tax'] or 0),
+                        "total_actual_amount": float(summary['total_actual_amount'] or 0),
+                        "approved_count": summary['approved_count'] or 0,
+                        "rejected_count": summary['rejected_count'] or 0,
+                        "pending_auto_count": summary['pending_auto_count'] or 0,
+                        "pending_manual_count": summary['pending_manual_count'] or 0,
+                        "pending_total_count": (summary['pending_auto_count'] or 0) + (
+                                    summary['pending_manual_count'] or 0)
+                    },
+                    "pagination": {
+                        "page": page,
+                        "page_size": page_size,
+                        "total": total_count,
+                        "total_pages": (total_count + page_size - 1) // page_size if total_count > 0 else 1
+                    },
+                    "records": [
+                        {
+                            "withdrawal_id": r['id'],
+                            "user_id": r['user_id'],
+                            "user_name": r['user_name'],
+                            "amount": float(r['amount']),
+                            "tax_amount": float(r['tax_amount']),
+                            "actual_amount": float(r['actual_amount']),
+                            "status": r['status'],
+                            "status_text": {
+                                "pending_auto": "自动审核中",
+                                "pending_manual": "人工审核中",
+                                "approved": "已批准",
+                                "rejected": "已拒绝"
+                            }.get(r['status'], "未知"),
+                            "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S"),
+                            "processed_at": r['processed_at'].strftime("%Y-%m-%d %H:%M:%S") if r[
+                                'processed_at'] else None,
+                            "audit_remark": r['audit_remark']
+                        } for r in records
+                    ]
+                }
+    # ==================== 平台资金池变动报表（中优先级） ====================
+    def get_pool_flow_report(self, account_type: str,
+                             start_date: str, end_date: str,
+                             page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        """
+        平台资金池变动明细报表
+
+        查询指定资金池的每一笔流水，包括收入、支出和余额变化
+
+        Args:
+            account_type: 资金池类型（如 'public_welfare', 'subsidy_pool' 等）
+            start_date: 开始日期 yyyy-MM-dd
+            end_date: 结束日期 yyyy-MM-dd
+            page: 页码
+            page_size: 每页条数
+
+        Returns:
+            包含汇总统计和流水明细的报表数据
+        """
+        logger.info(f"生成资金池流水报表: 账户={account_type}, 日期范围={start_date}至{end_date}")
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 汇总统计
+                cur.execute("""
+                    SELECT 
+                        COUNT(*) as total_transactions,
+                        SUM(CASE WHEN flow_type = 'income' THEN change_amount ELSE 0 END) as total_income,
+                        SUM(CASE WHEN flow_type = 'expense' THEN change_amount ELSE 0 END) as total_expense,
+                        MAX(balance_after) as ending_balance
+                    FROM account_flow
+                    WHERE account_type = %s AND DATE(created_at) BETWEEN %s AND %s
+                """, (account_type, start_date, end_date))
+
+                summary = cur.fetchone()
+
+                # 总记录数
+                cur.execute("""
+                    SELECT COUNT(*) as total 
+                    FROM account_flow
+                    WHERE account_type = %s AND DATE(created_at) BETWEEN %s AND %s
+                """, (account_type, start_date, end_date))
+                total_count = cur.fetchone()['total'] or 0
+
+                # 明细查询
+                offset = (page - 1) * page_size
+                cur.execute("""
+                    SELECT 
+                        id, related_user, change_amount, balance_after, 
+                        flow_type, remark, created_at
+                    FROM account_flow
+                    WHERE account_type = %s AND DATE(created_at) BETWEEN %s AND %s
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                """, (account_type, start_date, end_date, page_size, offset))
+
+                records = cur.fetchall()
+
+                # 获取用户名称
+                def get_user_name(uid):
+                    if not uid:
+                        return "系统"
+                    try:
+                        cur.execute("SELECT name FROM users WHERE id = %s", (uid,))
+                        row = cur.fetchone()
+                        return row['name'] if row else "未知用户"
+                    except:
+                        return f"未知用户:{uid}"
+
+                return {
+                    "summary": {
+                        "report_type": "pool_flow",
+                        "account_type": account_type,
+                        "account_name": {
+                            "public_welfare": "公益基金",
+                            "subsidy_pool": "周补贴池",
+                            "honor_director": "荣誉董事分红池",
+                            "company_points": "公司积分池",
+                            "platform_revenue_pool": "平台收入池"
+                        }.get(account_type, account_type),
+                        "total_transactions": summary['total_transactions'] or 0,
+                        "total_income": float(summary['total_income'] or 0),
+                        "total_expense": float(summary['total_expense'] or 0),
+                        "net_change": float((summary['total_income'] or 0) - (summary['total_expense'] or 0)),
+                        "ending_balance": float(summary['ending_balance'] or 0)
+                    },
+                    "pagination": {
+                        "page": page,
+                        "page_size": page_size,
+                        "total": total_count,
+                        "total_pages": (total_count + page_size - 1) // page_size if total_count > 0 else 1
+                    },
+                    "records": [
+                        {
+                            "flow_id": r['id'],
+                            "related_user": r['related_user'],
+                            "user_name": get_user_name(r['related_user']),
+                            "change_amount": float(r['change_amount']),
+                            "balance_after": float(r['balance_after']) if r['balance_after'] else None,
+                            "flow_type": r['flow_type'],
+                            "remark": r['remark'],
+                            "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S")
+                        } for r in records
+                    ]
+                }
+    # ==================== 联创星级点数流水报表 ====================
+    def get_unilevel_points_flow_report(self, user_id: Optional[int] = None,
+                                        level: Optional[int] = None,
+                                        start_date: Optional[str] = None,
+                                        end_date: Optional[str] = None,
+                                        page: int = 1,
+                                        page_size: int = 20) -> Dict[str, Any]:
+        """
+        联创星级点数流水报表
+
+        查询联创会员的星级分红发放记录，支持按用户、星级、日期筛选
+
+        Args:
+            user_id: 用户ID（可选）
+            level: 星级（1-3，可选）
+            start_date: 开始日期 yyyy-MM-dd（可选）
+            end_date: 结束日期 yyyy-MM-dd（可选）
+            page: 页码
+            page_size: 每页条数
+
+        Returns:
+            包含汇总、分页和明细的字典
+        """
+        logger.info(f"生成联创星级点数流水报表: 用户={user_id}, 星级={level}, 日期范围={start_date}至{end_date}")
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 构建WHERE条件
+                where_conditions = []
+                params = []
+
+                if user_id:
+                    where_conditions.append("d.user_id = %s")
+                    params.append(user_id)
+
+                if level:
+                    where_conditions.append("u.level = %s")
+                    params.append(level)
+
+                if start_date:
+                    where_conditions.append("DATE(d.created_at) >= %s")
+                    params.append(start_date)
+
+                if end_date:
+                    where_conditions.append("DATE(d.created_at) <= %s")
+                    params.append(end_date)
+
+                where_sql = " AND ".join(where_conditions) if where_conditions else "1=1"
+
+                # 总记录数查询
+                count_sql = f"""
+                    SELECT COUNT(*) as total 
+                    FROM director_dividends d
+                    JOIN user_unilevel u ON d.user_id = u.user_id
+                    WHERE {where_sql}
+                """
+                cur.execute(count_sql, tuple(params))
+                total_count = cur.fetchone()['total'] or 0
+
+                # 明细查询
+                offset = (page - 1) * page_size
+                detail_sql = f"""
+                    SELECT d.user_id, us.name as user_name, u.level as unilevel_level,
+                           d.dividend_amount, d.new_sales, d.weight, d.period_date, d.created_at
+                    FROM director_dividends d
+                    JOIN user_unilevel u ON d.user_id = u.user_id
+                    JOIN users us ON d.user_id = us.id
+                    WHERE {where_sql}
+                    ORDER BY d.period_date DESC, d.user_id
+                    LIMIT %s OFFSET %s
+                """
+                params.extend([page_size, offset])
+                cur.execute(detail_sql, tuple(params))
+                records = cur.fetchall()
+
+                # 汇总统计
+                summary_sql = f"""
+                    SELECT COUNT(DISTINCT d.user_id) as total_users,
+                           SUM(d.dividend_amount) as total_dividend_amount,
+                           SUM(d.new_sales) as total_new_sales
+                    FROM director_dividends d
+                    JOIN user_unilevel u ON d.user_id = u.user_id
+                    WHERE {where_sql}
+                """
+                cur.execute(summary_sql, tuple(params[:-2]))
+                summary = cur.fetchone()
+
+                return {
+                    "summary": {
+                        "report_type": "unilevel_points_flow",
+                        "total_users": summary['total_users'] or 0,
+                        "total_dividend_amount": float(summary['total_dividend_amount'] or 0),
+                        "total_new_sales": float(summary['total_new_sales'] or 0)
+                    },
+                    "pagination": {
+                        "page": page,
+                        "page_size": page_size,
+                        "total": total_count,
+                        "total_pages": (total_count + page_size - 1) // page_size if total_count > 0 else 1
+                    },
+                    "records": [
+                        {
+                            "user_id": r['user_id'],
+                            "user_name": r['user_name'],
+                            "unilevel_level": r['unilevel_level'],
+                            "level_name": f"{r['unilevel_level']}星级联创",
+                            "points": float(r['dividend_amount'] or 0),
+                            "new_sales": float(r['new_sales'] or 0),
+                            "weight": r['weight'] or 1,
+                            "period_date": r['period_date'].strftime("%Y-%m-%d"),
+                            "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S"),
+                            "remark": f"{r['unilevel_level']}星级联创分红，权重{r['weight']}"
+                        } for r in records
+                    ]
+                }
     def clear_fund_pools(self, pool_types: List[str]) -> Dict[str, Any]:
         """清空指定的资金池"""
         logger.info(f"开始清空资金池: {pool_types}")
