@@ -1,7 +1,6 @@
-# order.py
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from core.database import get_conn
 from services.finance_service import split_order_funds
 from core.config import VALID_PAY_WAYS
@@ -9,7 +8,8 @@ from core.table_access import build_dynamic_select, get_table_structure, _quote_
 from decimal import Decimal
 import uuid
 from datetime import datetime, timedelta
-from typing import Dict, Any
+from enum import Enum
+import json
 
 router = APIRouter()
 
@@ -30,47 +30,30 @@ class OrderManager:
         user_id: int,
         address_id: Optional[int],
         custom_addr: Optional[dict],
+        specifications: Optional[str] = None,      # 新增：规格 JSON 字符串
         buy_now: bool = False,
-        buy_now_items: Optional[List[Dict[str, Any]]] = None
+        buy_now_items: Optional[List[Dict[str, Any]]] = None,
+        delivery_way: str = "platform"
     ) -> Optional[str]:
-        """
-        buy_now=False  -> 购物车结算（老逻辑）
-        buy_now=True   -> 立即购买（新逻辑）
-        buy_now_items 字段在 buy_now=True 时必填，格式：
-        [
-          {
-            "product_id": 123,
-            "quantity": 2,
-            "price": 10.5
-          }
-        ]
-        """
         with get_conn() as conn:
             with conn.cursor() as cur:
                 # ---------- 1. 组装订单明细 ----------
                 if buy_now:
-                    # 立即购买场景
                     if not buy_now_items:
                         raise HTTPException(status_code=422, detail="立即购买时 buy_now_items 不能为空")
                     items = []
                     for it in buy_now_items:
-                        cur.execute(
-                            "SELECT is_member_product FROM products WHERE id = %s",
-                            (it["product_id"],)
-                        )
+                        cur.execute("SELECT is_member_product FROM products WHERE id = %s", (it["product_id"],))
                         prod = cur.fetchone()
                         if not prod:
-                            raise HTTPException(
-                                status_code=404,
-                                detail=f"products 表中不存在 id={it['product_id']}"
-                            )
+                            raise HTTPException(status_code=404, detail=f"products 表中不存在 id={it['product_id']}")
                         items.append({
+                            "sku_id": it["sku_id"],
                             "product_id": it["product_id"],
                             "quantity": it["quantity"],
                             "price": Decimal(str(it["price"])),
                             "is_vip": prod["is_member_product"]
                         })
-                    # ====== 方案2：立即购买时，把地址写进变量 ======
                     if custom_addr:
                         consignee_name = custom_addr.get("consignee_name")
                         consignee_phone = custom_addr.get("consignee_phone")
@@ -81,21 +64,21 @@ class OrderManager:
                     else:
                         raise HTTPException(status_code=422, detail="立即购买必须上传 custom_address")
                 else:
-                    # 购物车结算场景
                     cur.execute("""
                         SELECT c.product_id,
-                               c.quantity,
-                               s.price,
-                               p.is_member_product AS is_vip
+                            c.sku_id,            
+                            c.quantity,
+                            s.price,
+                            p.is_member_product AS is_vip,
+                            c.specifications
                         FROM cart c
-                        JOIN products p ON c.product_id = p.id
-                        JOIN product_skus s ON s.product_id = p.id
+                        JOIN product_skus s ON s.id = c.sku_id
+                        JOIN products p ON p.id = c.product_id
                         WHERE c.user_id = %s AND c.selected = 1
                     """, (user_id,))
                     items = cur.fetchall()
                     if not items:
                         return None
-                    # 购物车场景，先留空，后续可扩展去默认地址表读
                     consignee_name = consignee_phone = province = city = district = shipping_address = None
 
                 # ---------- 2. 订单主表 ----------
@@ -103,21 +86,22 @@ class OrderManager:
                 has_vip = any(i["is_vip"] for i in items)
                 order_number = datetime.now().strftime("%Y%m%d%H%M%S") + str(user_id) + str(uuid.uuid4().int)[:6]
 
-                # ====== 把 6 个地址字段一次性写进去 ======
+                # 规格 JSON 写进 refund_reason（下单时该字段一定空）
                 cur.execute("""
                     INSERT INTO orders(
                         user_id, order_number, total_amount, status, is_vip_item,
                         consignee_name, consignee_phone,
-                        province, city, district, shipping_address,
-                        pay_way, auto_recv_time)
+                        province, city, district, shipping_address, delivery_way,
+                        pay_way, auto_recv_time, refund_reason)
                     VALUES (%s, %s, %s, 'pending_pay', %s,
-                            %s, %s, %s, %s, %s, %s,
-                            'wechat', %s)
+                            %s, %s, %s, %s, %s, %s, %s,
+                            'wechat', %s, %s)
                 """, (
                     user_id, order_number, total, has_vip,
                     consignee_name, consignee_phone,
-                    province, city, district, shipping_address,
-                    datetime.now() + timedelta(days=7)
+                    province, city, district, shipping_address, delivery_way,
+                    datetime.now() + timedelta(days=7),
+                    specifications
                 ))
                 oid = cur.lastrowid
 
@@ -149,16 +133,16 @@ class OrderManager:
                 # ---------- 4. 写订单明细 ----------
                 for i in items:
                     cur.execute("""
-                        INSERT INTO order_items(order_id, product_id, quantity, unit_price, total_price)
-                        VALUES (%s, %s, %s, %s, %s)
+                        INSERT INTO order_items(order_id, product_id, sku_id, quantity, unit_price, total_price)
+                        VALUES (%s, %s, %s, %s, %s, %s)
                     """, (
                         oid,
                         i["product_id"],
+                        i["sku_id"],          # 新增
                         i["quantity"],
                         i["price"],
                         Decimal(str(i["quantity"])) * Decimal(str(i["price"]))
-                    ))
-
+                    ))      
                 # ---------- 5. 扣库存 ----------
                 if has_stock_field:
                     for i in items:
@@ -179,8 +163,15 @@ class OrderManager:
 
     @staticmethod
     def list_by_user(user_id: int, status: Optional[str] = None):
+        """
+        返回订单列表，每条订单带：
+        - 订单主信息
+        - 第一条商品明细（含规格）
+        - 规格取自 orders.refund_reason（JSON 字符串）
+        """
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # 1. 主订单
                 select_fields = OrderManager._build_orders_select(cur)
                 sql = f"SELECT {select_fields} FROM orders WHERE user_id = %s"
                 params = [user_id]
@@ -189,23 +180,34 @@ class OrderManager:
                     params.append(status)
                 sql += " ORDER BY created_at DESC"
                 cur.execute(sql, tuple(params))
-                return cur.fetchall()
+                orders = cur.fetchall()
+
+                # 2. 补齐第一条商品 + 规格
+                for o in orders:
+                    cur.execute("""
+                        SELECT oi.*, p.name
+                        FROM order_items oi
+                        JOIN products p ON oi.product_id = p.id
+                        WHERE oi.order_id = %s
+                        LIMIT 1
+                    """, (o["id"],))
+                    first_item = cur.fetchone()
+                    o["first_product"] = first_item
+                    # 规格 JSON 原样透出
+                    o["specifications"] = o.get("refund_reason")
+
+                return orders
 
     @staticmethod
     def detail(order_number: str) -> Optional[dict]:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # 1. 只查 orders 单表
                 select_fields = OrderManager._build_orders_select(cur)
-                cur.execute(
-                    f"SELECT {select_fields} FROM orders WHERE order_number = %s",
-                    (order_number,)
-                )
+                cur.execute(f"SELECT {select_fields} FROM orders WHERE order_number = %s", (order_number,))
                 order_info = cur.fetchone()
                 if not order_info:
                     return None
 
-                # 2. 订单明细
                 cur.execute("""
                     SELECT oi.*, p.name
                     FROM order_items oi
@@ -214,7 +216,6 @@ class OrderManager:
                 """, (order_info["id"],))
                 items = cur.fetchall()
 
-                # 3. 地址就是 orders 自身的 6 个字段
                 addr = {
                     "consignee_name": order_info.get("consignee_name"),
                     "consignee_phone": order_info.get("consignee_phone"),
@@ -230,8 +231,10 @@ class OrderManager:
                 return {
                     "order_info": order_info,
                     "address": addr,
-                    "items": items
+                    "items": items,
+                    "specifications": order_info.get("refund_reason")  # 原样透出
                 }
+
     @staticmethod
     def update_status(order_number: str, new_status: str, reason: Optional[str] = None) -> bool:
         with get_conn() as conn:
@@ -242,14 +245,20 @@ class OrderManager:
                 )
                 conn.commit()
                 return cur.rowcount > 0
+
 # ---------------- 请求模型 ----------------
+class DeliveryWay(str, Enum):
+    platform = "platform"   # 平台配送
+    pickup   = "pickup"
+    
 class OrderCreate(BaseModel):
-    user_id: int
-    address_id: Optional[int] = None
-    custom_address: Optional[dict] = None
-    # 新增字段
-    buy_now: bool = False
-    buy_now_items: Optional[List[Dict[str, Any]]] = None
+    user_id:int
+    delivery_way:DeliveryWay = DeliveryWay.platform   # 新增
+    address_id:Optional[int]=None
+    custom_address:Optional[dict]=None
+    specifications:Optional[str]=None
+    buy_now:bool=False
+    buy_now_items:Optional[List[Dict[str,Any]]]=None
 
 class OrderPay(BaseModel):
     order_number: str
@@ -267,8 +276,10 @@ def create_order(body: OrderCreate):
         body.user_id,
         body.address_id,
         body.custom_address,
+        specifications=body.specifications,   # 透传
         buy_now=body.buy_now,
-        buy_now_items=body.buy_now_items
+        buy_now_items=body.buy_now_items,
+        delivery_way=body.delivery_way
     )
     if not no:
         raise HTTPException(status_code=422, detail="购物车为空或地址缺失")

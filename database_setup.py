@@ -137,6 +137,7 @@ class DatabaseManager:
                     refund_reason TEXT,
                     auto_recv_time DATETIME NULL COMMENT '7 天后自动收货',
                     tracking_number VARCHAR(64) NULL COMMENT '快递单号',
+                    delivery_way VARCHAR(20) NOT NULL DEFAULT 'platform' COMMENT '配送方式：platform-平台配送/pickup-自提',
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_user (user_id),
@@ -283,11 +284,13 @@ class DatabaseManager:
                     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                     user_id BIGINT UNSIGNED NOT NULL,
                     product_id BIGINT UNSIGNED NOT NULL,
+                    sku_id BIGINT UNSIGNED NULL,
                     quantity INT DEFAULT 1,
+                    specifications JSON DEFAULT NULL,
                     selected TINYINT DEFAULT 1,
                     added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                    UNIQUE KEY uk_user_product (user_id, product_id),
+                    UNIQUE KEY uk_user_product_sku (user_id, product_id, sku_id),
                     INDEX idx_user_id (user_id),
                     INDEX idx_product_id (product_id)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
@@ -446,6 +449,11 @@ class DatabaseManager:
             },
             'orders': {
                 'tracking_number': 'tracking_number VARCHAR(64) NULL COMMENT \'快递单号\'',
+                'delivery_way': 'delivery_way VARCHAR(20) NOT NULL DEFAULT \'platform\' COMMENT \'配送方式：platform-平台配送/pickup-自提\'',
+            },
+            'cart': {
+                'specifications': 'specifications JSON DEFAULT NULL',
+                'sku_id': 'sku_id BIGINT UNSIGNED NULL',
             }
         }
         
