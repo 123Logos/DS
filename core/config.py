@@ -140,7 +140,7 @@ WECHAT_APP_SECRET: Final[str] = os.getenv('WECHAT_APP_SECRET', '')
 
 # ==================== 商品图片配置 ====================
 # 挂载静态文件目录（/pic -> pic_data）
-PIC_PATH: Final[Path] = Path(__file__).resolve().parent.parent / "pic_data"
+PIC_PATH: Final[Path] = Path(__file__).resolve().parent.parent / "user_pic"
 
 # 向后兼容：Wechat_ID 字典
 Wechat_ID: Final[dict] = {
