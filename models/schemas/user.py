@@ -183,3 +183,16 @@ class CouponStats(BaseModel):
     expired_count: int
     total_amount: float
     unused_amount: float
+
+
+class UnilevelStatusResponse(BaseModel):
+    """联创状态响应"""
+    current_level: int = Field(..., description="当前联创等级（0=未获得）")
+    target_level: int = Field(..., description="应得等级")
+    can_promote: bool = Field(..., description="是否可以自动晋升")
+    reason: Optional[str] = Field(None, description="不可晋升原因")
+
+class UnilevelPromoteResponse(BaseModel):
+    """联创晋升响应"""
+    new_level: int = Field(..., description="晋升后的等级")
+    message: str = Field(..., description="提示信息")

@@ -5,7 +5,8 @@ import datetime
 from models.schemas.user import (
     SetStatusReq, AuthReq, AuthResp, UpdateProfileReq, SelfDeleteReq,
     FreezeReq, ResetPwdReq, AdminResetPwdReq, SetLevelReq, AddressReq,
-    PointsReq, UserInfoResp, BindReferrerReq,MobileResp,Query,AvatarUploadResp
+    PointsReq, UserInfoResp, BindReferrerReq,MobileResp,Query,AvatarUploadResp,
+    UnilevelStatusResponse, UnilevelPromoteResponse
 )
 
 from core.database import get_conn
@@ -1144,19 +1145,6 @@ def change_mobile(
 
 
 # 后台晋升
-@router.post("/admin/unilevel/promote", summary="晋升联创（1-3星）")
-def promote_unilevel(
-    user_id: int = Query(..., gt=0, description="用户ID"),
-    level: int = Query(..., ge=1, le=3, description="目标等级 1-3"),
-    admin_key: str = Query(..., description="后台口令"),
-):
-    if admin_key != "gm2025":
-        raise HTTPException(status_code=403, detail="口令错误")
-    try:
-        new_level = UserService.promote_unilevel(user_id, level)
-        return {"msg": "晋升成功", "new_level": new_level}
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
 
 # 前端查询
 @router.get("/user/unilevel", summary="当前联创等级")
@@ -1209,3 +1197,39 @@ def get_my_coupons(
         page=page,
         page_size=page_size
     )
+
+@router.get("/unilevel/status", response_model=UnilevelStatusResponse, summary="查询联创状态")
+def get_unilevel_status(
+    user_id: int = Query(..., description="用户ID")
+):
+    """
+    查询用户的联创等级和晋升状态
+    - 返回当前等级、应得等级、是否可晋升
+    """
+    try:
+        service = UserService()
+        status = service.get_unilevel_status(user_id)
+        return status
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/unilevel/promote", response_model=UnilevelPromoteResponse, summary="自动晋升联创")
+def promote_unilevel(
+    user_id: int = Query(..., description="用户ID")
+):
+    """
+    后端自动计算并晋升联创等级
+    - 无需传入level，自动晋升到应得等级
+    - 如果已是最高等级返回错误
+    """
+    try:
+        service = UserService()
+        new_level = service.promote_unilevel_auto(user_id)
+        return {
+            "new_level": new_level,
+            "message": f"晋升成功！当前为联创{new_level}星"
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

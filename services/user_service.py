@@ -252,22 +252,7 @@ class UserService:
                 conn.commit()
                 return cur.rowcount > 0
 
-    @staticmethod
-    def promote_unilevel(user_id: int, level: int) -> int:
-        from core.config import UnilevelLevel
-        if level not in {1, 2, 3}:
-            raise ValueError("联创等级只能是 1-3")
-        if not UserService._check_unilevel_rules(user_id, level):
-            raise ValueError("晋升条件未达标")
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO user_unilevel(user_id, level) VALUES (%s,%s) "
-                    "ON DUPLICATE KEY UPDATE level=%s",
-                    (user_id, level, level),
-                )
-                conn.commit()
-                return level
+
 
     @staticmethod
     def get_unilevel(user_id: int) -> int:
@@ -277,20 +262,7 @@ class UserService:
                 row = cur.fetchone()
                 return row["level"] if row else 0
 
-    # ---------- 私有校验 ----------
-    @staticmethod
-    def _check_unilevel_rules(uid: int, target: int) -> bool:
-        """最新规则：前 N 条直推线各存在 1 个【直推≥3六星】的六星"""
-        if UserService.get_level(uid) != 6:
-            return False
-        direct = UserService._count_direct_6star(uid)
-        need = {1: 3, 2: 5, 3: 7}[target]
-        if direct < need:
-            print(f"直推六星不足：需要 {need}，实际 {direct}")
-            return False
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                return UserService._top_n_lines_have_6star_with_3direct_dynamic(cur, uid, need)
+
 
     @staticmethod
     def _count_direct_6star(uid: int) -> int:
@@ -312,42 +284,7 @@ class UserService:
                 row = cur.fetchone()
                 return row["member_level"] if row else 0
 
-    @staticmethod
-    def _top_n_lines_have_6star_with_3direct_dynamic(cur, uid: int, n: int) -> bool:
-        """动态版：前 n 条直推线各存在≥1 个【直推≥3六星】的六星"""
-        cur.execute(
-            "SELECT user_id FROM user_referrals WHERE referrer_id=%s ORDER BY id LIMIT %s",
-            (uid, n),
-        )
-        lines = [r["user_id"] for r in cur.fetchall()]
-        if len(lines) < n:
-            return False
-        for top_id in lines:
-            cur.execute(
-                """
-                WITH RECURSIVE team AS (
-                    SELECT %s AS id
-                    UNION ALL
-                    SELECT r.user_id
-                    FROM user_referrals r
-                    JOIN team t ON t.id=r.referrer_id
-                )
-                SELECT 1
-                FROM team
-                JOIN users u ON u.id=team.id
-                WHERE u.member_level=6
-                  AND (SELECT COUNT(*)
-                       FROM user_referrals r2
-                       JOIN users u2 ON u2.id=r2.user_id
-                       WHERE r2.referrer_id=team.id
-                         AND u2.member_level=6) >= 3
-                LIMIT 1
-                """,
-                (top_id,),
-            )
-            if not cur.fetchone():
-                return False
-        return True
+
 
     @staticmethod
     def upload_avatar(user_id: int, files: List[UploadFile]) -> List[str]:
@@ -435,3 +372,132 @@ class UserService:
                     "page": page,
                     "page_size": page_size
                 }
+
+    # ==================== 联创自动计算功能（后端计算） ====================
+
+    @staticmethod
+    def get_unilevel_status(user_id: int) -> Dict[str, Any]:
+        """
+        获取联创状态（等级+是否可晋升）
+        前端直接调用此方法获取完整信息
+        """
+        try:
+            current_level = UserService.get_unilevel(user_id)
+            target_level = UserService._calculate_unilevel_target(user_id)
+
+            return {
+                "current_level": current_level,
+                "target_level": target_level,
+                "can_promote": target_level > current_level,
+                "reason": None if target_level > current_level else "已到达最高等级或条件未达标"
+            }
+        except Exception as e:
+            print(f"获取联创状态失败: {e}")
+            return {
+                "current_level": 0,
+                "target_level": 0,
+                "can_promote": False,
+                "reason": str(e)
+            }
+
+    @staticmethod
+    def _calculate_unilevel_target(uid: int) -> int:
+        """
+        计算用户应得的联创等级（核心逻辑）
+        返回值：0=未获得, 1=一星, 2=二星, 3=三星
+        """
+        if UserService.get_level(uid) != 6:
+            return 0
+
+        # 获取前7条直推线（按注册顺序）
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT user_id FROM user_referrals "
+                    "WHERE referrer_id=%s ORDER BY created_at LIMIT 7",
+                    (uid,),
+                )
+                lines = [r["user_id"] for r in cur.fetchall()]
+
+                # 统计每条线是否满足条件（用单SQL优化）
+                valid_lines = UserService._count_valid_lines(cur, lines)
+
+                # 正确的业务逻辑：满足条件的线数 ≥ 要求线数
+                if valid_lines >= 7:
+                    return 3  # 联创三星
+                elif valid_lines >= 5:
+                    return 2  # 联创二星
+                elif valid_lines >= 3:
+                    return 1  # 联创一星
+
+        return 0
+
+    @staticmethod
+    def _count_valid_lines(cur, line_ids: List[int]) -> int:
+        """
+        核心优化：一次性查出所有直推线中有多少条满足条件
+        解决N+1问题（兼容MySQL 5.7+）
+        """
+        if not line_ids:
+            return 0
+
+        # 使用UNION ALL构造临时表（兼容所有MySQL版本）
+        union_parts = " UNION ALL ".join([f"SELECT {uid} as user_id" for uid in line_ids])
+
+        cur.execute(
+            f"""
+            WITH RECURSIVE all_teams AS (
+                -- 使用UNION ALL构造临时表
+                SELECT user_id AS id, user_id AS root_id, 1 as level
+                FROM ({union_parts}) AS roots
+                UNION ALL
+                SELECT r.user_id, at.root_id, at.level + 1
+                FROM user_referrals r
+                JOIN all_teams at ON at.id = r.referrer_id
+                WHERE at.level < 6  -- 限制递归深度
+            ),
+            line_stats AS (
+                SELECT 
+                    root_id,
+                    EXISTS (
+                        SELECT 1
+                        FROM all_teams at2
+                        JOIN users u ON u.id = at2.id
+                        WHERE at2.root_id = at.root_id
+                          AND u.member_level = 6
+                          AND (
+                              SELECT COUNT(DISTINCT r2.user_id)
+                              FROM user_referrals r2
+                              JOIN users u2 ON u2.id = r2.user_id
+                              WHERE r2.referrer_id = at2.id
+                                AND u2.member_level = 6
+                          ) >= 3
+                    ) as has_valid_6star
+                FROM (SELECT DISTINCT root_id FROM all_teams) at
+            )
+            SELECT COUNT(*) as valid_count
+            FROM line_stats
+            WHERE has_valid_6star = TRUE
+            """
+        )
+        return cur.fetchone()['valid_count'] or 0
+
+    @staticmethod
+    def promote_unilevel_auto(user_id: int) -> int:
+        """自动晋升联创（后端计算）"""
+        status = UserService.get_unilevel_status(user_id)
+
+        if not status["can_promote"]:
+            raise ValueError(f"无法晋升：{status['reason']}")
+
+        target_level = status["target_level"]
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO user_unilevel(user_id, level) VALUES (%s,%s) "
+                    "ON DUPLICATE KEY UPDATE level=%s",
+                    (user_id, target_level, target_level),
+                )
+                conn.commit()
+                return target_level
