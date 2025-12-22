@@ -831,12 +831,12 @@ async def distribute_coupon(
     coupon_type: str = Query('user', pattern=r'^(user|merchant)$', description="优惠券类型"),
     service: FinanceService = Depends(get_finance_service)
 ):
-    """直接给用户发放优惠券，无需审核流程"""
+    """直接给用户发放优惠券，需扣除等额的 true_total_points（1:1）"""
     try:
         coupon_id = service.distribute_coupon_directly(user_id, amount, coupon_type)
         return ResponseModel(
             success=True,
-            message=f"优惠券发放成功",
+            message=f"优惠券发放成功（已扣除 true_total_points ¥{amount:.4f}）",
             data={"coupon_id": coupon_id, "amount": amount}
         )
     except FinanceException as e:
@@ -1208,6 +1208,35 @@ async def get_platform_revenue_balance(
         )
     except Exception as e:
         logger.error(f"查询平台资金余额失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# 在 api/finance/routes.py 中添加
+
+@router.get("/api/reports/points/all-flows", response_model=ResponseModel, summary="综合点数流水报表")
+async def get_all_points_flow_report(
+        user_id: Optional[int] = Query(None, gt=0, description="用户ID（可选）"),
+        start_date: Optional[str] = Query(None, description="开始日期 yyyy-MM-dd"),
+        end_date: Optional[str] = Query(None, description="结束日期 yyyy-MM-dd"),
+        page: int = Query(1, ge=1, description="页码"),
+        page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+        service: FinanceService = Depends(get_finance_service)
+):
+    try:
+        data = service.get_all_points_flow_report_v2(
+            user_id=user_id,
+            start_date=start_date,
+            end_date=end_date,
+            page=page,
+            page_size=page_size
+        )
+        return ResponseModel(
+            success=True,
+            message=f"综合点数流水报表查询成功: 共{len(data['records'])}条记录",
+            data=data
+        )
+    except Exception as e:
+        logger.error(f"查询综合点数流水报表失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 def register_finance_routes(app: FastAPI):
     """注册财务管理系统路由到主应用"""

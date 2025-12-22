@@ -194,7 +194,7 @@ class FinanceService:
 
                     # 7. 处理订单逻辑（会员商品 vs 普通商品）
                     if product['is_member_product']:
-                        self._process_member_order_v2(cur, order_id, user_id, user, unit_price, quantity)
+                        self._process_member_order_v2(cur, order_id, user_id, user, unit_price, quantity, final_amount)
                     else:
                         self._process_normal_order_v2(cur, order_id, user_id, merchant_id,
                                                       final_amount, original_amount, points_discount,
@@ -234,8 +234,9 @@ class FinanceService:
 
     # ==================== 会员订单处理（v2版本） ====================
     def _process_member_order_v2(self, cur, order_id: int, user_id: int, user,
-                                 unit_price: Decimal, quantity: int) -> None:
-        """处理会员订单（v2：接受cursor参数）"""
+                                 unit_price: Decimal, quantity: int,
+                                 final_amount: Decimal) -> None:
+        """处理会员订单（v2：接受cursor参数，按实付金额发放积分）"""
         total_amount = unit_price * quantity
 
         # 资金池分配
@@ -249,27 +250,26 @@ class FinanceService:
             (new_level, user_id)
         )
 
-        # 发放积分
-        points_earned = unit_price * quantity
+        # 关键修改：按实付金额发放积分（而非原价）
+        points_earned = final_amount  # ← 修改为实付金额
         cur.execute(
             "UPDATE users SET member_points = member_points + %s WHERE id = %s",
             (points_earned, user_id)
         )
 
-        # 记录积分日志
+        # 记录积分日志（保持不变）
         cur.execute(
             """INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at)
                VALUES (%s, %s, (SELECT member_points FROM users WHERE id = %s), 
                       'member', %s, %s, NOW())""",
             (user_id, points_earned, user_id, '购买会员商品获得积分', order_id)
         )
-
         logger.debug(f"用户升级: {old_level}星 → {new_level}星, 获得积分: {points_earned:.4f}")
 
-        # 发放推荐和团队奖励
+        # 发放推荐和团队奖励（保持不变）
         self._create_pending_rewards_v2(cur, order_id, user_id, old_level, new_level)
 
-        # 公司积分池
+        # 公司积分池（保持不变）
         company_points = total_amount * Decimal('0.20')
         cur.execute(
             "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'company_points'",
@@ -382,6 +382,10 @@ class FinanceService:
                     "UPDATE users SET referral_points = COALESCE(referral_points, 0) + %s WHERE id = %s",
                     (reward_amount, referrer['referrer_id'])
                 )
+                cur.execute(
+                    "UPDATE users SET true_total_points = true_total_points + %s WHERE id = %s",
+                    (reward_amount, referrer['referrer_id'])
+                )
 
                 # 记录流水
                 cur.execute(
@@ -401,12 +405,12 @@ class FinanceService:
             logger.debug("0星升级1星，不产生团队奖励")
             return
 
-        # 计算目标层级：升级到N星，就找第N层上线的团队奖励资格
-        target_layer = new_level  # 例如：升级到3星，找第3层上线
+        # 关键修改：升级到N星，从第N层开始逐级向上查找符合条件的推荐人
+        target_layer = new_level  # 目标层级要求
         current_id = buyer_id
-        target_referrer = None
+        found_eligible_referrer = None
 
-        # 向上追溯目标层级的推荐人
+        # 先追溯到第N层
         for _ in range(target_layer):
             cur.execute(
                 "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
@@ -414,42 +418,70 @@ class FinanceService:
             )
             ref = cur.fetchone()
             if not ref or not ref['referrer_id']:
-                logger.debug(f"第{target_layer}层推荐人不存在")
+                logger.debug(f"第{target_layer}层及以上无推荐人，无法发放团队奖励")
                 return
-            target_referrer = ref['referrer_id']
             current_id = ref['referrer_id']
 
-        if target_referrer:
-            # 获取推荐人等级
-            cur.execute("SELECT member_level FROM users WHERE id = %s", (target_referrer,))
+        # 从第N层开始逐级向上检查，直到找到符合条件的推荐人或到顶层
+        check_layer = target_layer
+        while current_id and check_layer >= 1:
+            # 获取当前层级的推荐人信息
+            cur.execute("SELECT member_level FROM users WHERE id = %s", (current_id,))
             row = cur.fetchone()
             referrer_level = row['member_level'] if row else 0
 
-            # 检查推荐人等级是否达标（必须 >= 目标层级）
+            # 检查是否满足等级要求
             if referrer_level >= target_layer:
-                reward_amount = MEMBER_PRODUCT_PRICE * Decimal('0.50')
-
-                # 直接发放到 team_reward_points
-                cur.execute(
-                    "UPDATE users SET team_reward_points = COALESCE(team_reward_points, 0) + %s WHERE id = %s",
-                    (reward_amount, target_referrer)
-                )
-
-                # 记录流水
-                cur.execute(
-                    """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
-                       flow_type, remark, created_at)
-                       VALUES (%s, %s, %s, 
-                              (SELECT team_reward_points FROM users WHERE id = %s), 
-                              %s, %s, NOW())""",
-                    ('team_reward_points', target_referrer, reward_amount,
-                     target_referrer, 'income', f"团队L{target_layer}奖励自动发放（订单#{order_id}）")
-                )
-
+                found_eligible_referrer = current_id
                 logger.debug(
-                    f"团队奖励自动发放: 用户{target_referrer} L{target_layer} +{reward_amount:.2f} team_reward_points")
-            else:
-                logger.debug(f"推荐人等级不足: 需要{target_layer}星，实际{referrer_level}星")
+                    f"在第{check_layer}层找到符合条件的推荐人: 用户{found_eligible_referrer} (等级{referrer_level}星)")
+                break
+
+            # 不满足条件，继续向上一层追溯
+            logger.debug(f"第{check_layer}层推荐人等级不足: 需要{target_layer}星，实际{referrer_level}星，继续向上查找")
+
+            # 获取上一层的推荐人
+            cur.execute(
+                "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
+                (current_id,)
+            )
+            ref = cur.fetchone()
+            if not ref or not ref['referrer_id']:
+                logger.debug(f"已追溯到顶层，未找到符合条件的推荐人")
+                break
+
+            current_id = ref['referrer_id']
+            check_layer += 1  # 层级递增（向上追溯）
+
+        # 如果找到符合条件的推荐人，发放奖励
+        if found_eligible_referrer:
+            reward_amount = MEMBER_PRODUCT_PRICE * Decimal('0.50')
+
+            # 直接发放到 team_reward_points
+            cur.execute(
+                "UPDATE users SET team_reward_points = COALESCE(team_reward_points, 0) + %s WHERE id = %s",
+                (reward_amount, found_eligible_referrer)
+            )
+            cur.execute(
+                "UPDATE users SET true_total_points = true_total_points + %s WHERE id = %s",
+                (reward_amount, found_eligible_referrer)
+            )
+            # 记录流水
+            cur.execute(
+                """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
+                   flow_type, remark, created_at)
+                   VALUES (%s, %s, %s, 
+                          (SELECT team_reward_points FROM users WHERE id = %s), 
+                          %s, %s, NOW())""",
+                ('team_reward_points', found_eligible_referrer, reward_amount,
+                 found_eligible_referrer, 'income',
+                 f"团队L{target_layer}奖励自动发放（订单#{order_id}），向上追溯至第{check_layer}层")
+            )
+
+            logger.debug(
+                f"团队奖励自动发放: 用户{found_eligible_referrer} L{target_layer} +{reward_amount:.2f} team_reward_points（向上追溯）")
+        else:
+            logger.debug(f"团队奖励未发放: 在推荐链中未找到等级≥{target_layer}星的用户")
 
     def _create_order(self, order_no: str, user_id: int, merchant_id: int,
                       product_id: int, total_amount: Decimal, original_amount: Decimal,
@@ -864,7 +896,10 @@ class FinanceService:
                             "UPDATE users SET subsidy_points = %s WHERE id = %s",
                             (new_subsidy_points, user_id)
                         )
-
+                        cur.execute(
+                            "UPDATE users SET true_total_points = true_total_points + %s WHERE id = %s",
+                            (points_to_add, user_id)
+                        )
                         # ====== 核心修复：扣减 member_points 并记录流水 ======
                         # 1. 扣减积分
                         cur.execute(
@@ -1720,7 +1755,10 @@ class FinanceService:
                             "UPDATE users SET points = COALESCE(points, 0) + %s WHERE id = %s",
                             (points_to_add, user_id)
                         )
-
+                        cur.execute(
+                            "UPDATE users SET true_total_points = true_total_points + %s WHERE id = %s",
+                            (points_to_add, user_id)
+                        )
                         # 记录流水
                         cur.execute(
                             """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
@@ -2011,27 +2049,72 @@ class FinanceService:
                 }
 
     # ==================== 1. 优惠券直接发放 ====================
+    # 在 services/finance_service.py 中
+
     def distribute_coupon_directly(self, user_id: int, amount: float,
                                    coupon_type: str = 'user',
                                    valid_days: int = COUPON_VALID_DAYS) -> int:
-        """直接发放优惠券给用户（无需审核）"""
+        """直接发放优惠券给用户（需扣除 true_total_points）"""
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
+                    # ========== 新增：检查 true_total_points 余额 ==========
+                    select_sql = build_dynamic_select(
+                        cur,
+                        "users",
+                        where_clause="id=%s",
+                        select_fields=["true_total_points"]
+                    )
+                    cur.execute(select_sql, (user_id,))
+                    user_row = cur.fetchone()
+
+                    if not user_row:
+                        raise FinanceException(f"用户不存在: {user_id}")
+
+                    current_balance = Decimal(str(user_row.get('true_total_points', 0) or 0))
+                    coupon_amount = Decimal(str(amount))
+
+                    if current_balance < coupon_amount:
+                        raise FinanceException(
+                            f"用户 true_total_points 余额不足，当前余额: {current_balance:.4f}，"
+                            f"需要 {coupon_amount:.4f}（发放优惠券 ¥{amount:.2f}）"
+                        )
+
+                    # ========== 原有逻辑：发放优惠券 ==========
                     today = datetime.now().date()
                     valid_to = today + timedelta(days=valid_days)
 
                     cur.execute(
                         """INSERT INTO coupons (user_id, coupon_type, amount, valid_from, valid_to, status)
                            VALUES (%s, %s, %s, %s, %s, 'unused')""",
-                        (user_id, coupon_type, Decimal(str(amount)), today, valid_to)
+                        (user_id, coupon_type, coupon_amount, today, valid_to)
                     )
                     coupon_id = cur.lastrowid
+
+                    # ========== 新增：扣除 true_total_points ==========
+                    new_balance = current_balance - coupon_amount
+                    cur.execute(
+                        "UPDATE users SET true_total_points = %s WHERE id = %s",
+                        (new_balance, user_id)
+                    )
+
+                    # ========== 新增：记录扣除流水 ==========
+                    cur.execute(
+                        """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
+                           flow_type, remark, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+                        ('true_total_points', user_id, -coupon_amount, new_balance, 'expense',
+                         f"发放优惠券扣除 - 优惠券#{coupon_id}，金额¥{coupon_amount:.2f}")
+                    )
+
                     conn.commit()
 
-                    logger.debug(f"直接发放优惠券给用户{user_id}: ID={coupon_id}, 金额¥{amount}")
+                    logger.debug(f"发放优惠券给用户{user_id}: ID={coupon_id}, 金额¥{coupon_amount:.2f}, "
+                                 f"扣除 true_total_points {coupon_amount:.4f}")
                     return coupon_id
 
+        except FinanceException:
+            raise
         except Exception as e:
             logger.error(f"❌ 直接发放优惠券失败: {e}")
             raise FinanceException(f"发放失败: {e}")
@@ -4024,6 +4107,280 @@ class FinanceService:
                         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     },
                     "users": result
+                }
+
+    def get_all_points_flow_report_v2(self, user_id: Optional[int] = None,
+                                      start_date: Optional[str] = None,
+                                      end_date: Optional[str] = None,
+                                      page: int = 1,
+                                      page_size: int = 20) -> Dict[str, Any]:
+        """
+        综合点数流水报表（整合四种点数收入和优惠券扣减）
+
+        重要字段映射：
+        - honor_director     → users.points              （联创星级）
+        - subsidy_points     → users.subsidy_points      （周补贴）
+        - referral_points    → users.referral_points     （推荐奖励）
+        - team_reward_points → users.team_reward_points  （团队奖励）
+        - true_total_points  → users.true_total_points   （真实总点数）
+        """
+        logger.info(f"生成综合点数流水报表: 用户={user_id or '所有用户'}, 日期={start_date}至{end_date}")
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # ==================== 1. 构建查询参数（统一处理） ====================
+                params_account_flow = []
+                params_wsr = []
+                where_conditions = []
+
+                if user_id:
+                    # account_flow 使用 related_user，weekly_subsidy_records 使用 user_id
+                    where_conditions.append("related_user = %s")
+                    params_account_flow.append(user_id)
+                    params_wsr.append(user_id)
+
+                if start_date:
+                    where_conditions.append("DATE(created_at) >= %s")
+                    params_account_flow.append(start_date)
+                    params_wsr.append(start_date)
+
+                if end_date:
+                    where_conditions.append("DATE(created_at) <= %s")
+                    params_account_flow.append(end_date)
+                    params_wsr.append(end_date)
+
+                # 为 account_flow 构建 WHERE 子句
+                base_where_account = "WHERE account_type IN ('subsidy_points', 'referral_points', 'team_reward_points', 'honor_director', 'true_total_points')"
+                if where_conditions:
+                    account_where = base_where_account + " AND " + " AND ".join(where_conditions)
+                else:
+                    account_where = base_where_account
+
+                # 为 weekly_subsidy_records 构建 WHERE 子句
+                base_where_wsr = "WHERE 1=1"
+                if where_conditions:
+                    # 替换字段名以适应 weekly_subsidy_records 的字段名
+                    wsr_conditions = [cond.replace("related_user", "user_id") for cond in where_conditions]
+                    wsr_where = base_where_wsr + " AND " + " AND ".join(wsr_conditions)
+                else:
+                    wsr_where = base_where_wsr
+
+                # ==================== 2. 查询 account_flow 数据 ====================
+                # 先查询总数
+                count_sql = f"SELECT COUNT(*) as total FROM account_flow af {account_where}"
+                cur.execute(count_sql, tuple(params_account_flow))
+                af_total = cur.fetchone()['total'] or 0
+
+                # 查询明细
+                offset = (page - 1) * page_size
+                detail_sql = f"""
+                    SELECT 
+                        af.id as flow_id,
+                        af.related_user as user_id,
+                        u.name as user_name,
+                        af.account_type,
+                        af.change_amount,
+                        af.balance_after,
+                        af.flow_type,
+                        af.remark,
+                        af.created_at
+                    FROM account_flow af
+                    JOIN users u ON af.related_user = u.id
+                    {account_where}
+                    ORDER BY af.created_at DESC
+                    LIMIT %s OFFSET %s
+                """
+                # 确保参数是列表，最后添加分页参数
+                af_params = list(params_account_flow) + [page_size, offset]
+                cur.execute(detail_sql, tuple(af_params))
+                # 强制转换为列表
+                af_records = list(cur.fetchall())
+
+                # ==================== 3. 查询 weekly_subsidy_records 补充数据 ====================
+                # 查询补充数据源的总数
+                count_wsr_sql = f"SELECT COUNT(*) as total FROM weekly_subsidy_records wsr {wsr_where}"
+                cur.execute(count_wsr_sql, tuple(params_wsr))
+                wsr_total = cur.fetchone()['total'] or 0
+
+                # 如果 account_flow 的记录不足一页，从 wsr 补充
+                wsr_records = []
+                if len(af_records) < page_size:
+                    # 计算在 wsr 中的偏移量
+                    wsr_offset = max(0, offset - af_total)
+                    wsr_limit = page_size - len(af_records)
+
+                    # 查询 wsr 数据
+                    wsr_sql = f"""
+                        SELECT 
+                            wsr.id as record_id,
+                            wsr.user_id,
+                            u.name as user_name,
+                            wsr.subsidy_amount as change_amount,
+                            wsr.week_start as created_at,
+                            wsr.points_deducted,
+                            wsr.points_before
+                        FROM weekly_subsidy_records wsr
+                        JOIN users u ON wsr.user_id = u.id
+                        {wsr_where}
+                        ORDER BY wsr.week_start DESC, wsr.id DESC
+                        LIMIT %s OFFSET %s
+                    """
+                    wsr_params = list(params_wsr) + [wsr_limit, wsr_offset]
+                    cur.execute(wsr_sql, tuple(wsr_params))
+                    wsr_raw = list(cur.fetchall())
+
+                    # 转换格式：将 wsr 记录转换为与 account_flow 一致的格式
+                    for r in wsr_raw:
+                        # 查询该用户的当前 subsidy_points 余额
+                        cur.execute(
+                            "SELECT COALESCE(subsidy_points, 0) as balance FROM users WHERE id = %s",
+                            (r['user_id'],)
+                        )
+                        balance_row = cur.fetchone()
+                        current_balance = Decimal(str(balance_row['balance'] if balance_row else 0))
+
+                        # 转换记录格式
+                        wsr_records.append({
+                            'flow_id': f"wsr_{r['record_id']}",  # 构造唯一ID
+                            'user_id': r['user_id'],
+                            'user_name': r['user_name'],
+                            'account_type': 'subsidy_points',
+                            'change_amount': Decimal(str(r['change_amount'] or 0)),  # 补贴金额即点数
+                            'balance_after': current_balance,
+                            'flow_type': 'income',
+                            'remark': f"周补贴发放（扣减积分{r['points_before'] or 0:.4f}分，发放点数{r['change_amount'] or 0:.4f}点）",
+                            'created_at': r['created_at']
+                        })
+
+                # ==================== 4. 合并并排序结果（确保都是列表） ====================
+                # 强制转换为列表（即使 cur.fetchall 返回 tuple）
+                all_records = list(af_records) + list(wsr_records)
+
+                # 统一 created_at 类型：将 date 转换为 datetime
+                for record in all_records:
+                    created_at = record['created_at']
+                    if hasattr(created_at, 'year') and hasattr(created_at, 'month') and hasattr(created_at, 'day'):
+                        # 如果是 date 类型，转换为 datetime
+                        if not hasattr(created_at, 'hour'):
+                            from datetime import datetime
+                            record['created_at'] = datetime.combine(created_at, datetime.min.time())
+
+                # 按创建时间降序排序
+                all_records.sort(key=lambda x: x['created_at'], reverse=True)
+
+                # ==================== 5. 汇总统计（双表合并） ====================
+                # account_flow 汇总
+                summary_af_sql = f"""
+                    SELECT 
+                        SUM(CASE WHEN flow_type = 'income' THEN change_amount ELSE 0 END) as total_income,
+                        SUM(CASE WHEN flow_type = 'expense' THEN change_amount ELSE 0 END) as total_expense,
+                        SUM(CASE WHEN account_type = 'subsidy_points' THEN change_amount ELSE 0 END) as total_subsidy,
+                        SUM(CASE WHEN account_type = 'referral_points' THEN change_amount ELSE 0 END) as total_referral,
+                        SUM(CASE WHEN account_type = 'team_reward_points' THEN change_amount ELSE 0 END) as total_team,
+                        SUM(CASE WHEN account_type = 'honor_director' THEN change_amount ELSE 0 END) as total_unilevel,
+                        SUM(CASE WHEN account_type = 'true_total_points' THEN change_amount ELSE 0 END) as total_coupon_deduction
+                    FROM account_flow af
+                    {account_where}
+                """
+                cur.execute(summary_af_sql, tuple(params_account_flow))
+                af_summary = cur.fetchone()
+
+                # weekly_subsidy_records 汇总（补贴收入）
+                summary_wsr_sql = f"""
+                    SELECT COALESCE(SUM(subsidy_amount), 0) as total_subsidy
+                    FROM weekly_subsidy_records wsr
+                    {wsr_where}
+                """
+                cur.execute(summary_wsr_sql, tuple(params_wsr))
+                wsr_summary = cur.fetchone()
+
+                total_count = af_total + wsr_total
+
+                # ==================== 6. 格式化返回数据 ====================
+                flow_type_mapping = {
+                    'subsidy_points': '周补贴收入',
+                    'referral_points': '推荐奖励收入',
+                    'team_reward_points': '团队奖励收入',
+                    'honor_director': '联创星级收入',
+                    'true_total_points': '优惠券扣减'
+                }
+
+                detailed_records = []
+                for r in all_records:
+                    account_type = r['account_type']
+                    flow_type_label = flow_type_mapping.get(account_type, account_type)
+
+                    flow_category = '支出' if account_type == 'true_total_points' else '收入'
+                    change_amount = float(r['change_amount'])
+                    if account_type == 'true_total_points':
+                        change_amount = -abs(change_amount)  # 确保是负值
+
+                    # 确保 created_at 是 datetime 对象
+                    created_at = r['created_at']
+                    if hasattr(created_at, 'strftime'):
+                        created_at_str = created_at.strftime("%Y-%m-%d %H:%M:%S")
+                    else:
+                        created_at_str = str(created_at)
+
+                    detailed_records.append({
+                        'flow_id': str(r['flow_id']),
+                        'user_id': r['user_id'],
+                        'user_name': r['user_name'],
+                        'flow_type': flow_type_label,
+                        'flow_category': flow_category,
+                        'change_amount': change_amount,
+                        'balance_after': float(r['balance_after']) if r['balance_after'] is not None else None,
+                        'remark': r['remark'],
+                        'created_at': created_at_str
+                    })
+
+                # ==================== 7. 获取当前余额快照（单用户查询时） ====================
+                current_balances = {}
+                if user_id:
+                    cur.execute("""
+                        SELECT 
+                            COALESCE(u.subsidy_points, 0) as subsidy_points,
+                            COALESCE(u.referral_points, 0) as referral_points,
+                            COALESCE(u.team_reward_points, 0) as team_reward_points,
+                            COALESCE(u.points, 0) as unilevel_points,
+                            COALESCE(u.true_total_points, 0) as true_total_points
+                        FROM users u
+                        WHERE id = %s
+                    """, (user_id,))
+                    balance_row = cur.fetchone()
+                    if balance_row:
+                        current_balances = {k: float(v) for k, v in balance_row.items()}
+
+                return {
+                    'summary': {
+                        'report_type': 'all_points_flow_combined',
+                        'total_records': total_count,
+                        'total_income': float((af_summary['total_income'] or 0) + (wsr_summary['total_subsidy'] or 0)),
+                        'total_expense': float(af_summary['total_expense'] or 0),
+                        'net_flow': float((af_summary['total_income'] or 0) + (af_summary['total_expense'] or 0) + (
+                                    wsr_summary['total_subsidy'] or 0)),
+                        'breakdown': {
+                            'subsidy_points_income': float(
+                                (af_summary.get('total_subsidy', 0) or 0) + (wsr_summary['total_subsidy'] or 0)),
+                            'referral_points_income': float(af_summary.get('total_referral', 0) or 0),
+                            'team_reward_points_income': float(af_summary.get('total_team', 0) or 0),
+                            'unilevel_points_income': float(af_summary.get('total_unilevel', 0) or 0),
+                            'coupon_deduction_expense': float(af_summary.get('total_coupon_deduction', 0) or 0)
+                        },
+                        'current_balances': current_balances
+                    },
+                    'pagination': {
+                        'page': page,
+                        'page_size': page_size,
+                        'total': total_count,
+                        'total_pages': (total_count + page_size - 1) // page_size if total_count > 0 else 1
+                    },
+                    'data_sources': {
+                        'account_flow_records': af_total,
+                        'weekly_subsidy_records': wsr_total,
+                        'merged_records': len(detailed_records)
+                    },
+                    'records': detailed_records
                 }
 # ==================== 订单系统财务功能（来自 order/finance.py） ====================
 
