@@ -625,6 +625,84 @@ async def get_pending_rewards(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ==================== 周补贴点数报表接口 ====================
+@router.get("/api/reports/points/subsidy", response_model=ResponseModel, summary="周补贴用户点数报表")
+async def get_subsidy_points_report(
+        user_id: Optional[int] = Query(None, gt=0, description="用户ID（可选）"),
+        service: FinanceService = Depends(get_finance_service)
+):
+    """查询周补贴点数明细"""
+    try:
+        data = service.get_subsidy_points_report(user_id)
+        return ResponseModel(
+            success=True,
+            message=f"周补贴点数报表查询成功: 共{len(data['users'])}个用户",
+            data=data
+        )
+    except Exception as e:
+        logger.error(f"查询周补贴点数报表失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==================== 联创星级点数报表接口 ====================
+@router.get("/api/reports/points/unilevel", response_model=ResponseModel, summary="联创星级用户点数报表")
+async def get_unilevel_points_report(
+        user_id: Optional[int] = Query(None, gt=0, description="用户ID（可选）"),
+        service: FinanceService = Depends(get_finance_service)
+):
+    """查询联创星级点数明细"""
+    try:
+        data = service.get_unilevel_points_report(user_id)
+        return ResponseModel(
+            success=True,
+            message=f"联创星级点数报表查询成功: 共{len(data['users'])}个用户",
+            data=data
+        )
+    except Exception as e:
+        logger.error(f"查询联创星级点数报表失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== 推荐+团队合并点数报表接口 ====================
+@router.get("/api/reports/points/referral-team", response_model=ResponseModel, summary="推荐+团队合并用户点数报表")
+async def get_referral_and_team_points_report(
+        user_id: Optional[int] = Query(None, gt=0, description="用户ID（可选）"),
+        service: FinanceService = Depends(get_finance_service)
+):
+    """
+    查询推荐奖励和团队奖励合并点数报表
+
+    返回三项数据：
+    1. referral_points - 推荐奖励点数
+    2. team_points - 团队奖励点数
+    3. combined_total - 推荐和团队点数合计
+    """
+    try:
+        data = service.get_referral_and_team_points_report(user_id)
+        return ResponseModel(
+            success=True,
+            message=f"推荐+团队合并点数报表查询成功: 共{len(data['users'])}个用户",
+            data=data
+        )
+    except Exception as e:
+        logger.error(f"查询推荐+团队合并点数报表失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+# ==================== 所有点数流水报表接口 ====================
+@router.get("/api/reports/points/all", response_model=ResponseModel, summary="所有点数流水报表")
+async def get_all_points_flow_report(
+    user_id: Optional[int] = Query(None, gt=0, description="用户ID（可选）"),
+    service: FinanceService = Depends(get_finance_service)
+):
+    """查询所有点数类型的流水报表（周补贴、推荐奖励、团队奖励、联创星级），包括没有点数的用户"""
+    try:
+        data = service.get_all_points_flow_report(user_id)
+        return ResponseModel(
+            success=True,
+            message=f"所有点数流水报表查询成功: 共{len(data['users'])}个用户",
+            data=data
+        )
+    except Exception as e:
+        logger.error(f"查询所有点数流水报表失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 @router.get("/api/reports/finance", response_model=ResponseModel, summary="财务总览报告")
 async def get_finance_report(
         service: FinanceService = Depends(get_finance_service)
