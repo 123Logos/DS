@@ -6,7 +6,8 @@ from models.schemas.user import (
     SetStatusReq, AuthReq, AuthResp, UpdateProfileReq, SelfDeleteReq,
     FreezeReq, ResetPwdReq, AdminResetPwdReq, SetLevelReq, AddressReq,
     PointsReq, UserInfoResp, BindReferrerReq,MobileResp,Query,AvatarUploadResp,
-    UnilevelStatusResponse, UnilevelPromoteResponse
+    UnilevelStatusResponse, UnilevelPromoteResponse,UserSpecialPointsResponse,UserSubsidyPointsResponse,
+    UserUnilevelPointsResponse,UserAllPointsResponse,ClearRewardPointsReq,ClearSubsidyPointsReq,ClearUnilevelPointsReq
 )
 
 from core.database import get_conn
@@ -1233,3 +1234,128 @@ def promote_unilevel(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/special-points", response_model=UserSpecialPointsResponse, summary="查询推荐和团队奖励点数")
+def get_user_special_points(
+    user_id: int = Query(..., description="用户ID", gt=0)
+):
+    """
+    查询用户的团队奖励和推荐奖励专用点数
+    """
+    try:
+        service = UserService()
+        points_data = service.get_user_special_points(user_id)
+        return points_data
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
+
+@router.get("/subsidy-points", response_model=UserSubsidyPointsResponse, summary="查询周补贴专用点数")
+def get_user_subsidy_points(
+    user_id: int = Query(..., description="用户ID", gt=0)
+):
+    """
+    查询用户的周补贴专用点数余额
+    """
+    try:
+        service = UserService()
+        points_data = service.get_user_subsidy_points(user_id)
+        return points_data
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
+
+@router.get("/unilevel-points", response_model=UserUnilevelPointsResponse, summary="查询联创星级专用点数")
+def get_user_unilevel_points(
+    user_id: int = Query(..., description="用户ID", gt=0)
+):
+    """
+    查询用户的联创星级专用点数余额
+    """
+    try:
+        service = UserService()
+        points_data = service.get_user_unilevel_points(user_id)
+        return points_data
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
+
+@router.get("/all-points", response_model=UserAllPointsResponse, summary="查询用户四个点数总和")
+def get_user_all_points(
+    user_id: int = Query(..., description="用户ID", gt=0)
+):
+    """
+    查询用户的四个专用点数（联创星级、周补贴、团队奖励、推荐奖励）及总和
+    """
+    try:
+        points_data = UserService.get_user_all_points(user_id)
+        return points_data
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
+
+
+@router.post("/points/clear-reward", summary="后台一键清除推荐和团队奖励点数")
+def clear_reward_points(body: ClearRewardPointsReq):
+    """
+    清除用户的团队奖励专用点数和推荐奖励专用点数
+
+    权限验证：需要正确的admin_key
+    操作记录：自动记录到points_clear_log审计表
+    幂等性：如果点数已为0，返回无需清除提示
+    """
+    if body.admin_key != "admin2025":
+        raise HTTPException(status_code=403, detail="后台口令错误")
+
+    try:
+        result = UserService.clear_reward_points(body.user_id, body.reason)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"清除失败: {str(e)}")
+
+
+@router.post("/points/clear-subsidy", summary="后台一键清除周补贴点数")
+def clear_subsidy_points(body: ClearSubsidyPointsReq):
+    """
+    清除用户的周补贴专用点数
+
+    权限验证：需要正确的admin_key
+    幂等性：如果点数已为0，返回无需清除提示
+    """
+    if body.admin_key != "admin2025":
+        raise HTTPException(status_code=403, detail="后台口令错误")
+
+    try:
+        result = UserService.clear_subsidy_points(body.user_id, body.reason)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"清除失败: {str(e)}")
+
+
+@router.post("/points/clear-unilevel", summary="后台一键清除联创星级点数")
+def clear_unilevel_points(body: ClearUnilevelPointsReq):
+    """
+    清除用户的联创星级专用点数
+
+    权限验证：需要正确的admin_key
+    幂等性：如果点数已为0，返回无需清除提示
+    """
+    if body.admin_key != "admin2025":
+        raise HTTPException(status_code=403, detail="后台口令错误")
+
+    try:
+        result = UserService.clear_unilevel_points(body.user_id, body.reason)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"清除失败: {str(e)}")

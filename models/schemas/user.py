@@ -8,6 +8,7 @@ from typing import List
 
 
 
+
 class SetStatusReq(BaseModel):
     mobile: str
     new_status: UserStatus          # 现在只能输入 0、1、2，且自动带校验/文档
@@ -196,3 +197,42 @@ class UnilevelPromoteResponse(BaseModel):
     """联创晋升响应"""
     new_level: int = Field(..., description="晋升后的等级")
     message: str = Field(..., description="提示信息")
+
+class UserSpecialPointsResponse(BaseModel):
+    """团队和推荐点数查询响应"""
+    team_reward_points: float = Field(..., description="团队奖励专用点数", example=89.1234)
+    referral_points: float = Field(..., description="推荐奖励专用点数", example=45.6789)
+class UserSubsidyPointsResponse(BaseModel):
+    """周补贴专用点数查询响应"""
+    subsidy_points: float = Field(..., description="周补贴专用点数", example=1234.5678)
+
+class UserUnilevelPointsResponse(BaseModel):
+    """联创星级专用点数查询响应"""
+    unilevel_points: float = Field(..., description="联创星级专用点数", example=9876.5432)
+
+class UserAllPointsResponse(BaseModel):
+    """用户所有点数查询响应"""
+    unilevel_points: float = Field(..., description="联创星级专用点数", example=9876.5432)
+    subsidy_points: float = Field(..., description="周补贴专用点数", example=1234.5678)
+    team_reward_points: float = Field(..., description="团队奖励专用点数", example=89.1234)
+    referral_points: float = Field(..., description="推荐奖励专用点数", example=45.6789)
+    total_points: float = Field(..., description="四个点数总和", example=11245.9133)
+
+class ClearRewardPointsReq(BaseModel):
+    """清除奖励点数请求"""
+    user_id: int = Field(..., description="用户ID", gt=0)
+    admin_key: str = Field(..., description="后台口令")
+    reason: str = Field("后台清除", description="操作原因")
+
+class ClearSubsidyPointsReq(BaseModel):
+    """清除周补贴点数请求"""
+    user_id: int = Field(..., description="用户ID", gt=0)
+    admin_key: str = Field(..., description="后台口令")
+    reason: str = Field("后台清除", description="操作原因")
+
+class ClearUnilevelPointsReq(BaseModel):
+    """清除联创星级点数请求"""
+    user_id: int = Field(..., description="用户ID", gt=0)
+    admin_key: str = Field(..., description="后台口令")
+    reason: str = Field("后台清除", description="操作原因")
+

@@ -501,3 +501,327 @@ class UserService:
                 )
                 conn.commit()
                 return target_level
+
+    @staticmethod
+    def get_user_special_points(user_id: int) -> Dict[str, float]:
+        """
+        查询用户团队奖励和推荐奖励专用点数
+
+        返回字段：
+        - team_reward_points: 团队奖励专用点数
+        - referral_points: 推荐奖励专用点数
+        """
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 直接查询两个字段，避免不必要的字段检查
+                cur.execute(
+                    """
+                    SELECT 
+                        COALESCE(team_reward_points, 0) as team_reward_points,
+                        COALESCE(referral_points, 0) as referral_points
+                    FROM users
+                    WHERE id = %s
+                    """,
+                    (user_id,)
+                )
+
+                row = cur.fetchone()
+
+                if not row:
+                    raise ValueError("用户不存在")
+
+                return {
+                    "team_reward_points": float(row['team_reward_points']),
+                    "referral_points": float(row['referral_points'])
+                }
+
+    @staticmethod
+    def get_user_subsidy_points(user_id: int) -> Dict[str, float]:
+        """
+        查询用户周补贴专用点数
+        """
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 直接查询周补贴专用点数
+                cur.execute(
+                    """
+                    SELECT COALESCE(subsidy_points, 0) as subsidy_points
+                    FROM users
+                    WHERE id = %s
+                    """,
+                    (user_id,)
+                )
+
+                row = cur.fetchone()
+
+                if not row:
+                    raise ValueError("用户不存在")
+
+                return {
+                    "subsidy_points": float(row['subsidy_points'])
+                }
+
+    @staticmethod
+    def get_user_unilevel_points(user_id: int) -> Dict[str, float]:
+        """
+        查询用户联创星级专用点数
+        """
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 直接查询points字段（联创星级专用点数）
+                cur.execute(
+                    """
+                    SELECT COALESCE(points, 0) as unilevel_points
+                    FROM users
+                    WHERE id = %s
+                    """,
+                    (user_id,)
+                )
+
+                row = cur.fetchone()
+
+                if not row:
+                    raise ValueError("用户不存在")
+
+                return {
+                    "unilevel_points": float(row['unilevel_points'])
+                }
+
+    @staticmethod
+    def get_user_all_points(user_id: int) -> Dict[str, float]:
+        """
+        查询用户所有专用点数及总和
+
+        返回四个点数字段的值及其总和：
+        - unilevel_points: 联创星级专用点数
+        - subsidy_points: 周补贴专用点数
+        - team_reward_points: 团队奖励专用点数
+        - referral_points: 推荐奖励专用点数
+        - total_points: 四个点数总和
+        """
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 直接查询四个点数字段
+                cur.execute(
+                    """
+                    SELECT 
+                        COALESCE(points, 0) as unilevel_points,
+                        COALESCE(subsidy_points, 0) as subsidy_points,
+                        COALESCE(team_reward_points, 0) as team_reward_points,
+                        COALESCE(referral_points, 0) as referral_points
+                    FROM users
+                    WHERE id = %s
+                    """,
+                    (user_id,)
+                )
+
+                row = cur.fetchone()
+
+                if not row:
+                    raise ValueError("用户不存在")
+
+                # 计算总和
+                total = (
+                        float(row['unilevel_points']) +
+                        float(row['subsidy_points']) +
+                        float(row['team_reward_points']) +
+                        float(row['referral_points'])
+                )
+
+                return {
+                    "unilevel_points": float(row['unilevel_points']),
+                    "subsidy_points": float(row['subsidy_points']),
+                    "team_reward_points": float(row['team_reward_points']),
+                    "referral_points": float(row['referral_points']),
+                    "total_points": total
+                }
+
+    @staticmethod
+    def clear_reward_points(user_id: int, reason: str = "后台清除") -> Dict[str, Any]:
+        """
+        一键清除用户的团队奖励和推荐奖励专用点数
+
+        参数:
+            user_id: 用户ID
+            reason: 操作原因（返回提示用）
+
+        返回:
+            dict: 包含清除前后的点数信息
+        """
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 1. 检查用户是否存在并获取当前点数
+                cur.execute(
+                    """
+                    SELECT 
+                        COALESCE(team_reward_points, 0) as team_reward_points,
+                        COALESCE(referral_points, 0) as referral_points
+                    FROM users
+                    WHERE id = %s
+                    """,
+                    (user_id,)
+                )
+
+                row = cur.fetchone()
+                if not row:
+                    raise ValueError("用户不存在")
+
+                # 2. 记录清除前的点数
+                old_team_points = float(row['team_reward_points'])
+                old_referral_points = float(row['referral_points'])
+
+                # 3. 如果已经是0，无需操作
+                if old_team_points == 0 and old_referral_points == 0:
+                    return {
+                        "cleared": False,
+                        "message": "点数已为0，无需清除",
+                        "old_team_points": old_team_points,
+                        "old_referral_points": old_referral_points,
+                        "new_team_points": 0,
+                        "new_referral_points": 0
+                    }
+
+                # 4. 执行清除操作（设置为0）
+                cur.execute(
+                    """
+                    UPDATE users 
+                    SET team_reward_points = 0, 
+                        referral_points = 0,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (user_id,)
+                )
+
+                conn.commit()
+
+                return {
+                    "cleared": True,
+                    "message": f"奖励点数已清除（原因：{reason}）",
+                    "old_team_points": old_team_points,
+                    "old_referral_points": old_referral_points,
+                    "new_team_points": 0,
+                    "new_referral_points": 0
+                }
+
+    @staticmethod
+    def clear_subsidy_points(user_id: int, reason: str = "后台清除") -> Dict[str, Any]:
+        """
+        一键清除用户的周补贴专用点数
+
+        参数:
+            user_id: 用户ID
+            reason: 操作原因（返回提示用）
+
+        返回:
+            dict: 包含清除前后的点数信息
+        """
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 1. 检查用户是否存在并获取当前点数
+                cur.execute(
+                    """
+                    SELECT 
+                        COALESCE(subsidy_points, 0) as subsidy_points
+                    FROM users
+                    WHERE id = %s
+                    """,
+                    (user_id,)
+                )
+
+                row = cur.fetchone()
+                if not row:
+                    raise ValueError("用户不存在")
+
+                # 2. 记录清除前的点数
+                old_points = float(row['subsidy_points'])
+
+                # 3. 如果已经是0，无需操作
+                if old_points == 0:
+                    return {
+                        "cleared": False,
+                        "message": "周补贴点数已为0，无需清除",
+                        "old_subsidy_points": old_points,
+                        "new_subsidy_points": 0
+                    }
+
+                # 4. 执行清除操作（设置为0）
+                cur.execute(
+                    """
+                    UPDATE users 
+                    SET subsidy_points = 0,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (user_id,)
+                )
+
+                conn.commit()
+
+                return {
+                    "cleared": True,
+                    "message": f"周补贴点数已清除（原因：{reason}）",
+                    "old_subsidy_points": old_points,
+                    "new_subsidy_points": 0
+                }
+
+    @staticmethod
+    def clear_unilevel_points(user_id: int, reason: str = "后台清除") -> Dict[str, Any]:
+        """
+        一键清除用户的联创星级专用点数
+
+        参数:
+            user_id: 用户ID
+            reason: 操作原因（返回提示用）
+
+        返回:
+            dict: 包含清除前后的点数信息
+        """
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 1. 检查用户是否存在并获取当前点数
+                cur.execute(
+                    """
+                    SELECT 
+                        COALESCE(points, 0) as unilevel_points
+                    FROM users
+                    WHERE id = %s
+                    """,
+                    (user_id,)
+                )
+
+                row = cur.fetchone()
+                if not row:
+                    raise ValueError("用户不存在")
+
+                # 2. 记录清除前的点数
+                old_points = float(row['unilevel_points'])
+
+                # 3. 如果已经是0，无需操作
+                if old_points == 0:
+                    return {
+                        "cleared": False,
+                        "message": "联创星级点数已为0，无需清除",
+                        "old_unilevel_points": old_points,
+                        "new_unilevel_points": 0
+                    }
+
+                # 4. 执行清除操作（设置为0）
+                cur.execute(
+                    """
+                    UPDATE users 
+                    SET points = 0,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (user_id,)
+                )
+
+                conn.commit()
+
+                return {
+                    "cleared": True,
+                    "message": f"联创星级点数已清除（原因：{reason}）",
+                    "old_unilevel_points": old_points,
+                    "new_unilevel_points": 0
+                }
