@@ -199,7 +199,7 @@ class ImageUpdateRequest(BaseModel):
 @router.get("/products/search", summary="🔍 商品模糊搜索")
 def search_products(
         keyword: str = Query(..., min_length=1,
-                             description="搜索关键词（名称/描述/SKU/拼音/分类/商家/属性值）。同时搜索多个关键词时，请在关键词与关键词之间添加空格")
+                             description="搜索关键词（名称/描述/SKU/拼音/分类/商家）。同时搜索多个关键词时，请在关键词与关键词之间添加空格")
 ):
     """
     1. 按空格拆词，所有词必须同时命中（AND）
@@ -236,11 +236,8 @@ def search_products(
                 params.append(word_pattern)
                 word_conditions.append("ps.sku_code LIKE %s")
                 params.append(word_pattern)
-                word_conditions.append("u.name LIKE %s")
-                params.append(word_pattern)
-
-                # ✅ 修改：只搜索商品属性值，不搜索属性名
-                word_conditions.append("pa.value LIKE %s")
+                # ✅ 修改：搜索商家名称（仅搜索 is_merchant=1 的商家用户）
+                word_conditions.append("(u.name LIKE %s AND u.is_merchant = 1)")
                 params.append(word_pattern)
 
                 # 每个词至少匹配一个字段
@@ -251,12 +248,11 @@ def search_products(
 
             # 构建排序：同时命中全部词的置顶（通过计算匹配的字段数）
             # 简化版：按商品ID排序，实际可以优化为按匹配度排序
-            # ✅ 修改：添加 LEFT JOIN product_attributes 表（仅用于搜索value）
+            # ✅ 修改：移除 product_attributes 表的 JOIN（不再搜索属性值）
             sql = f"""
                 SELECT DISTINCT p.*, u.name as merchant_name
                 FROM products p
                 INNER JOIN product_skus ps ON ps.product_id = p.id
-                LEFT JOIN product_attributes pa ON pa.product_id = p.id  -- ✅ 仅用于搜索value
                 LEFT JOIN users u ON u.id = p.user_id
                 WHERE {where_clause}
                 ORDER BY p.id DESC
