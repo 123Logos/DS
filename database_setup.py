@@ -143,12 +143,14 @@ class DatabaseManager:
                     auto_recv_time DATETIME NULL COMMENT '7 天后自动收货',
                     tracking_number VARCHAR(64) NULL COMMENT '快递单号',
                     delivery_way VARCHAR(20) NOT NULL DEFAULT 'platform' COMMENT '配送方式：platform-平台配送/pickup-自提',
+                    expire_at DATETIME NULL COMMENT '订单过期时间（未支付订单7天后自动过期）',
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_user (user_id),
                     INDEX idx_order_number (order_number),
                     INDEX idx_created_at (created_at),
-                    INDEX idx_status (status)
+                    INDEX idx_status (status),
+                    INDEX idx_expire_at (expire_at)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
             'order_items': """
@@ -458,6 +460,7 @@ class DatabaseManager:
             'orders': {
                 'tracking_number': 'tracking_number VARCHAR(64) NULL COMMENT \'快递单号\'',
                 'delivery_way': 'delivery_way VARCHAR(20) NOT NULL DEFAULT \'platform\' COMMENT \'配送方式：platform-平台配送/pickup-自提\'',
+                'expire_at': 'expire_at DATETIME NULL COMMENT \'订单过期时间（未支付订单7天后自动过期）\'',
             },
             'cart': {
                 'specifications': 'specifications JSON DEFAULT NULL',
