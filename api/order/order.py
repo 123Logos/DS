@@ -14,8 +14,12 @@ import json
 import threading
 import time
 from core.logging import get_logger
+
 logger = get_logger(__name__)
 router = APIRouter()
+
+
+# 在 order.py 的 _cancel_expire_orders 函数中
 
 def _cancel_expire_orders():
     """每分钟扫描一次，把过期的 pending_pay 订单取消"""
@@ -33,6 +37,19 @@ def _cancel_expire_orders():
                     """, (now,))
                     for o in cur.fetchall():
                         oid, ono = o["id"], o["order_number"]
+
+                        # ✅ 新增：删除该订单的待发放奖励记录
+                        cur.execute(
+                            "SELECT id FROM pending_rewards WHERE order_id = %s AND status = 'pending'",
+                            (oid,)
+                        )
+                        rewards = cur.fetchall()
+                        for reward in rewards:
+                            cur.execute(
+                                "DELETE FROM pending_rewards WHERE id = %s",
+                                (reward['id'],)
+                            )
+                            print(f"[expire] 删除订单 {ono} 的待发放奖励记录: ID={reward['id']}")
 
                         # 回滚库存
                         cur.execute(
@@ -56,11 +73,13 @@ def _cancel_expire_orders():
             print(f"[expire] error: {e}")
         time.sleep(60)
 
+
 def start_order_expire_task():
     """由 api.order 包初始化时调用一次即可"""
     t = threading.Thread(target=_cancel_expire_orders, daemon=True)
     t.start()
     print("[expire] 订单过期守护线程已启动")
+
 
 class OrderManager:
     @staticmethod
@@ -76,13 +95,13 @@ class OrderManager:
 
     @staticmethod
     def create(
-        user_id: int,
-        address_id: Optional[int],
-        custom_addr: Optional[dict],
-        specifications: Optional[str] = None,      # 新增：规格 JSON 字符串
-        buy_now: bool = False,
-        buy_now_items: Optional[List[Dict[str, Any]]] = None,
-        delivery_way: str = "platform"
+            user_id: int,
+            address_id: Optional[int],
+            custom_addr: Optional[dict],
+            specifications: Optional[str] = None,  # 新增：规格 JSON 字符串
+            buy_now: bool = False,
+            buy_now_items: Optional[List[Dict[str, Any]]] = None,
+            delivery_way: str = "platform"
     ) -> Optional[str]:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -151,7 +170,7 @@ class OrderManager:
                     province, city, district, shipping_address, delivery_way,
                     datetime.now() + timedelta(days=7),
                     specifications,
-                    datetime.now() + timedelta(hours=12)  
+                    datetime.now() + timedelta(hours=12)
                 ))
                 oid = cur.lastrowid
 
@@ -188,11 +207,11 @@ class OrderManager:
                     """, (
                         oid,
                         i["product_id"],
-                        i["sku_id"],          # 新增
+                        i["sku_id"],  # 新增
                         i["quantity"],
                         i["price"],
                         Decimal(str(i["quantity"])) * Decimal(str(i["price"]))
-                    ))      
+                    ))
                 # ---------- 5. 扣库存 ----------
                 if has_stock_field:
                     for i in items:
@@ -252,12 +271,6 @@ class OrderManager:
     def detail(order_number: str) -> Optional[dict]:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                select_fields = OrderManager._build_orders_select(cur)
-
-    @staticmethod
-    def detail(order_number: str) -> Optional[dict]:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
                 # 1. 构造 orders 表字段（全部带 o. 前缀，避免歧义）
                 structure = get_table_structure(cur, "orders")
                 select_parts = []
@@ -301,8 +314,8 @@ class OrderManager:
                     "id": order_info.get("user_id"),
                     "name": order_info.get("user_name"),
                     "mobile": (
-                        order_info.get("user_mobile")
-                        or order_info.get("consignee_phone")
+                            order_info.get("user_mobile")
+                            or order_info.get("consignee_phone")
                     )
                 }
 
@@ -340,40 +353,80 @@ class OrderManager:
                     "items": items,
                     "specifications": order_info.get("refund_reason")
                 }
+
     @staticmethod
     def update_status(order_number: str, new_status: str, reason: Optional[str] = None) -> bool:
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # 查询订单并加锁（防并发）
+                cur.execute(
+                    "SELECT id, status FROM orders WHERE order_number = %s FOR UPDATE",
+                    (order_number,)
+                )
+                result = cur.fetchone()
+                if not result:
+                    return False
+
+                old_status = result['status']
+                order_id = result['id']
+
+                # 更新状态
                 cur.execute(
                     "UPDATE orders SET status = %s, refund_reason = %s WHERE order_number = %s",
                     (new_status, reason, order_number)
                 )
+
+                # 如果状态从pending_recv变为completed时发放积分
+                if old_status == 'pending_recv' and new_status == 'completed':
+                    try:
+                        # 幂等性检查：确认是否已发放过积分
+                        cur.execute(
+                            "SELECT id FROM points_log WHERE related_order = %s AND type = 'member' AND reason LIKE '%确认收货%' LIMIT 1",
+                            (order_id,)
+                        )
+                        if cur.fetchone():
+                            logger.info(f"订单{order_number}积分已发放，跳过")
+                        else:
+                            fs = FinanceService()
+                            # 调用积分发放并检查返回值
+                            if not fs.grant_points_on_receive(order_number, external_conn=conn):
+                                logger.error(f"订单{order_number}积分发放返回失败")
+                    except Exception as e:
+                        logger.error(f"订单{order_number}确认收货后积分发放失败: {e}", exc_info=True)
+                        # 不抛出异常，避免影响订单状态更新
+
                 conn.commit()
                 return cur.rowcount > 0
 
+
 # ---------------- 请求模型 ----------------
 class DeliveryWay(str, Enum):
-    platform = "platform"   # 平台配送
-    pickup   = "pickup"
-    
+    platform = "platform"  # 平台配送
+    pickup = "pickup"
+
+
 class OrderCreate(BaseModel):
-    user_id:int
-    delivery_way:DeliveryWay = DeliveryWay.platform   # 新增
-    address_id:Optional[int]=None
-    custom_address:Optional[dict]=None
-    specifications:Optional[str]=None
-    buy_now:bool=False
-    buy_now_items:Optional[List[Dict[str,Any]]]=None
+    user_id: int
+    delivery_way: DeliveryWay = DeliveryWay.platform  # 新增
+    address_id: Optional[int] = None
+    custom_address: Optional[dict] = None
+    specifications: Optional[str] = None
+    buy_now: bool = False
+    buy_now_items: Optional[List[Dict[str, Any]]] = None
+
 
 class OrderPay(BaseModel):
     order_number: str
     pay_way: str
     coupon_id: Optional[int] = None  # 新增：使用的优惠券ID（如果有）
     points_to_use: Optional[Decimal] = Decimal('0')
+
+
 class StatusUpdate(BaseModel):
     order_number: str
     new_status: str
     reason: Optional[str] = None
+
 
 # ---------------- 路由 ----------------
 @router.post("/create", summary="创建订单")
@@ -382,7 +435,7 @@ def create_order(body: OrderCreate):
         body.user_id,
         body.address_id,
         body.custom_address,
-        specifications=body.specifications,   # 透传
+        specifications=body.specifications,  # 透传
         buy_now=body.buy_now,
         buy_now_items=body.buy_now_items,
         delivery_way=body.delivery_way
@@ -390,6 +443,7 @@ def create_order(body: OrderCreate):
     if not no:
         raise HTTPException(status_code=422, detail="购物车为空或地址缺失")
     return {"order_number": no}
+
 
 @router.post("/pay", summary="订单支付")
 def order_pay(body: OrderPay):
@@ -443,9 +497,9 @@ def order_pay(body: OrderPay):
                 # 积分抵扣金额
                 points_discount = body.points_to_use * POINTS_DISCOUNT_RATE
 
-                # 校验：积分抵扣不能超过订单金额的50%
-                if points_discount > total_amt * Decimal('0.5'):
-                    raise HTTPException(status_code=400, detail="积分抵扣不能超过订单金额的50%")
+                # ✅ 移除：50%限制检查
+                # if points_discount > total_amt * Decimal('0.5'):
+                #     raise HTTPException(status_code=400, detail="积分抵扣不能超过订单金额的50%")
 
                 total_points_to_use = body.points_to_use
                 logger.debug(f"用户{user_id}使用积分{total_points_to_use}分，抵扣金额¥{points_discount}")
@@ -474,19 +528,21 @@ def order_pay(body: OrderPay):
 
                 logger.debug(f"用户{user_id}使用优惠券#{body.coupon_id}: 金额¥{coupon_amount}, 等效积分{coupon_points}")
 
-            # 3.3 再次校验总抵扣金额不超过50%
-            total_discount = (total_points_to_use * POINTS_DISCOUNT_RATE) + total_coupon_discount
-            if total_discount > total_amt * Decimal('0.5'):
-                raise HTTPException(status_code=400, detail="总优惠金额不能超过订单金额的50%")
+            # ✅ 移除：总抵扣金额50%限制检查
+            # total_discount = (total_points_to_use * POINTS_DISCOUNT_RATE) + total_coupon_discount
+            # if total_discount > total_amt * Decimal('0.5'):
+            #     raise HTTPException(status_code=400, detail="总优惠金额不能超过订单金额的50%")
 
-            # 4. 财务结算（传入总积分抵扣量）
+            # 4. 财务结算（传入总积分抵扣量和优惠券抵扣金额，使用同一连接避免死锁）
             fs = FinanceService()
             fs.settle_order(
                 order_no=body.order_number,
                 user_id=user_id,
                 product_id=product_id,
                 quantity=quantity,
-                points_to_use=total_points_to_use  # 包含积分+优惠券的总额
+                points_to_use=total_points_to_use,
+                coupon_discount=total_coupon_discount,  # ✅ 新增：传递优惠券抵扣金额
+                external_conn=conn  # ✅ 关键修复：传递连接避免卡死
             )
 
             # 5. 更新订单状态
@@ -503,6 +559,7 @@ def order_pay(body: OrderPay):
 def list_orders(user_id: int, status: Optional[str] = None):
     return OrderManager.list_by_user(user_id, status)
 
+
 @router.get("/detail/{order_number}", summary="查询订单详情")
 def order_detail(order_number: str):
     d = OrderManager.detail(order_number)
@@ -510,9 +567,67 @@ def order_detail(order_number: str):
         raise HTTPException(status_code=404, detail="订单不存在")
     return d
 
+
 @router.post("/status", summary="更新订单状态")
 def update_status(body: StatusUpdate):
     return {"ok": OrderManager.update_status(body.order_number, body.new_status, body.reason)}
+
+
+def auto_receive_task(db_cfg: dict = None):
+    """自动收货和结算守护进程
+
+    该函数会启动一个后台线程，每小时检查一次待收货订单，
+    如果订单超过自动收货时间，则自动完成订单并发放积分。
+    """
+    import threading
+    import time
+    from datetime import datetime
+
+    def run():
+        while True:
+            try:
+                from core.database import get_conn
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        now = datetime.now()
+                        cur.execute(
+                            "SELECT id, order_number, total_amount FROM orders "
+                            "WHERE status='pending_recv' AND auto_recv_time<=%s",
+                            (now,)
+                        )
+                        for row in cur.fetchall():
+                            order_id = row["id"]
+                            order_number = row["order_number"]
+
+                            # 更新订单状态
+                            cur.execute(
+                                "UPDATE orders SET status='completed' WHERE id=%s",
+                                (order_id,)
+                            )
+
+                            # ✅ 新增：确认收货后发放积分
+                            try:
+                                fs = FinanceService()
+                                # 使用同一连接调用grant_points_on_receive以避免死锁
+                                fs.grant_points_on_receive(order_number, external_conn=conn)
+                                logger.debug(
+                                    f"[auto_receive] 订单 {order_number} 已自动完成并发放积分。")
+                            except Exception as e:
+                                logger.error(
+                                    f"[auto_receive] 订单{order_number}积分发放失败: {e}",
+                                    exc_info=True
+                                )
+
+                            conn.commit()
+                            logger.debug(f"[auto_receive] 订单 {order_number} 已自动完成。")
+            except Exception as e:
+                logger.error(f"[auto_receive] 异常: {e}")
+            time.sleep(3600)  # 每小时检查一次
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    logger.info("自动收货守护进程已启动（包含积分发放）")
+
 
 # 模块被导入时自动启动守护线程
 start_order_expire_task()

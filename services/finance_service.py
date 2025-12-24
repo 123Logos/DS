@@ -88,7 +88,7 @@ class FinanceService:
             logger.error(f"查询用户余额失败: {e}")
             return Decimal('0')
 
-    # ==================== 关键修改1：积分字段从points改为member_points ====================
+    # ==================== 关键修改：支持外部连接复用，分离优惠券逻辑 ====================
     def settle_order(self, order_no: str, user_id: int, product_id: int, quantity: int = 1,
                      points_to_use: Decimal = Decimal('0')) -> int:
         """订单结算（修复版：统一使用 get_conn() 管理事务）"""
@@ -239,12 +239,11 @@ class FinanceService:
     # ==================== 积分抵扣逻辑（v2版本） ====================
     def _apply_points_discount_v2(self, cur, user_id: int, user, points_to_use: Decimal, amount: Decimal) -> None:
         """积分抵扣处理（v2：接受cursor参数）"""
-        # 业务限制：积分抵扣不能超过订单金额的50%
-        max_discount_points = amount * Decimal('0.5') / POINTS_DISCOUNT_RATE
-        if points_to_use > max_discount_points:
-            raise OrderException(f"积分抵扣不能超过订单金额的50%（最多{max_discount_points:.4f}分）")
-
-        # 原子性扣减：使用条件更新确保并发安全（只有当用户积分足够时才会更新）
+        user_points = Decimal(str(user.member_points))
+        if user_points < points_to_use:
+            raise OrderException(f"积分不足，当前{user_points:.4f}分")
+        # 已移除：50%限制检查
+        # 扣减member_points
         cur.execute(
             "UPDATE users SET member_points = member_points - %s WHERE id = %s AND member_points >= %s",
             (points_to_use, user_id, points_to_use)
@@ -258,18 +257,26 @@ class FinanceService:
             "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'company_points'",
             (points_to_use,)
         )
+        # 记录流水
+        cur.execute(
+            """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
+               flow_type, remark, created_at)
+               VALUES (%s, %s, %s, 
+                      (SELECT balance FROM finance_accounts WHERE account_type = 'company_points'), 
+                      %s, %s, NOW())""",
+            ('company_points', user_id, points_to_use, 'income', f"用户{user_id}积分抵扣转入")
+        )
 
     # ==================== 会员订单处理（v2版本） ====================
     def _process_member_order_v2(self, cur, order_id: int, user_id: int, user,
                                  unit_price: Decimal, quantity: int,
                                  final_amount: Decimal) -> None:
-        """处理会员订单（v2：接受cursor参数，按实付金额发放积分）"""
         total_amount = unit_price * quantity
 
-        # 资金池分配
+        # 1. 资金池分配
         self._allocate_funds_to_pools_v2(cur, order_id, total_amount)
 
-        # 升级会员等级
+        # 2. 升级会员等级（立即执行）
         old_level = user.member_level
         new_level = min(old_level + quantity, 6)
         cur.execute(
@@ -277,53 +284,35 @@ class FinanceService:
             (new_level, user_id)
         )
 
-        # 关键修改：按实付金额发放积分
-        points_earned = final_amount
-        cur.execute(
-            "UPDATE users SET member_points = member_points + %s WHERE id = %s",
-            (points_earned, user_id)
-        )
+        # 3. 发放推荐和团队奖励（立即执行，基于实付金额）
+        self._create_pending_rewards_v2(cur, order_id, user_id, old_level, new_level, final_amount)
 
-        # 记录积分日志
-        cur.execute(
-            """INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at)
-               VALUES (%s, %s, (SELECT member_points FROM users WHERE id = %s), 
-                      'member', %s, %s, NOW())""",
-            (user_id, points_earned, user_id, '购买会员商品获得积分', order_id)
-        )
-        logger.debug(f"用户升级: {old_level}星 → {new_level}星, 获得积分: {points_earned:.4f}")
-
-        # 发放推荐和团队奖励
-        self._create_pending_rewards_v2(cur, order_id, user_id, old_level, new_level)
-
-        # ==================== 关键修复：公司积分池增加 + 写入流水 ====================
+        # 4. 公司积分池增加
         company_points = total_amount * Decimal('0.20')
         cur.execute(
             "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'company_points'",
             (company_points,)
         )
 
-        # 新增：查询更新后的余额
-        cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'company_points'")
+        # 记录流水
+        cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", ('company_points',))
         new_balance = Decimal(str(cur.fetchone()['balance'] or 0))
 
-        # 新增：插入流水记录
         cur.execute(
             """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
                flow_type, remark, created_at)
                VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
-            ('company_points', PLATFORM_MERCHANT_ID, company_points,
-             new_balance, 'income', f"会员订单#{order_id} 公司积分（销售金额¥{total_amount:.2f}的20%）")
+            ('company_points', user_id, company_points, new_balance, 'income',
+             f"会员订单#{order_id} 公司积分（销售金额¥{total_amount:.2f}的20%）")
         )
-        logger.debug(f"公司积分池增加: {company_points:.4f}（已写入流水）")
+
+        logger.debug(f"用户升级: {old_level}星 → {new_level}星, 奖励已发放（积分将在收货后到账）")
 
     # ==================== 普通订单处理（v2版本） ====================
     def _process_normal_order_v2(self, cur, order_id: int, user_id: int, merchant_id: int,
                                  final_amount: Decimal, original_amount: Decimal,
                                  points_discount: Decimal, member_level: int) -> None:
-        """处理普通订单（v2：接受cursor参数）"""
-        # 关键修改：所有商品都是平台自营，直接分配到平台池子
-        # 1. 平台池子分配（所有金额都进入平台收入池）
+        # 1. 平台池子分配
         platform_amount = final_amount
         cur.execute(
             "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'platform_revenue_pool'",
@@ -331,7 +320,7 @@ class FinanceService:
         )
         logger.debug(f"平台收入池增加: ¥{platform_amount:.4f}")
 
-        # 2. 从平台收入池分配到其他池子（按原有比例）
+        # 2. 分配到其他池子
         for purpose, percent in ALLOCATIONS.items():
             if purpose == AllocationKey.PLATFORM_REVENUE_POOL:
                 continue
@@ -342,36 +331,9 @@ class FinanceService:
             )
             logger.debug(f"池子分配 {purpose.value}: ¥{alloc_amount:.4f}")
 
-        # 3. 用户积分发放（一星及以上）
-        if member_level >= 1:
-            points_earned = final_amount
-            cur.execute(
-                "UPDATE users SET member_points = member_points + %s WHERE id = %s",
-                (points_earned, user_id)
-            )
-            cur.execute(
-                """INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at)
-                   VALUES (%s, %s, (SELECT member_points FROM users WHERE id = %s), 
-                          'member', %s, %s, NOW())""",
-                (user_id, points_earned, user_id, '购买获得积分', order_id)
-            )
-            logger.debug(f"用户获得积分: {points_earned:.4f}")
+        # 3. 用户积分发放 - 已移除（延迟到收货后）
+        # 4. 商户积分发放 - 已移除（平台自营）
 
-        # 4. 商户积分发放 - 已取消，所有商品都是平台自营
-        # 注释掉原有的商户积分发放代码
-        # if merchant_id != PLATFORM_MERCHANT_ID:
-        #     merchant_points = final_amount * Decimal('0.20')
-        #     cur.execute(
-        #         "UPDATE users SET merchant_points = merchant_points + %s WHERE id = %s",
-        #         (merchant_points, merchant_id)
-        #     )
-        #     cur.execute(
-        #         """INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at)
-        #            VALUES (%s, %s, (SELECT merchant_points FROM users WHERE id = %s),
-        #                   'merchant', %s, %s, NOW())""",
-        #         (merchant_id, merchant_points, merchant_id, '销售获得积分', order_id)
-        #     )
-        # else:
         # 平台自营商品，公司积分池增加
         platform_merchant_points = final_amount * Decimal('0.20')
         cur.execute(
@@ -429,34 +391,111 @@ class FinanceService:
             )
             logger.debug(f"池子 {purpose.value} 增加: {alloc_amount:.4f}（已写入流水）")
 
-    # ==================== 创建待发放奖励（v2版本） ====================
-    def _create_pending_rewards_v2(self, cur, order_id: int, buyer_id: int,
-                                   old_level: int, new_level: int) -> None:
+    def grant_points_on_receive(self, order_no: str, external_conn=None) -> bool:
         """
-        创建推荐和团队奖励（v2：接受cursor参数）
+        用户确认收货后发放 member_points 和奖励点数（生产级加固版）
+        """
+        logger.info(f"[积分发放] 订单{order_no}确认收货，开始处理...")
 
-        关键逻辑：
-        1. 0星升级1星：只发放推荐奖励，不产生团队奖励
-        2. 其他升级：按升级到的星级层级发放团队奖励
-        """
-        # 1. 推荐奖励（仅首次购买会员商品时发放）
-        if old_level == 0:
+        def _process_points_and_rewards(cur):
+            # 1. 查询订单并加行锁（防并发）
             cur.execute(
-                "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
-                (buyer_id,)
+                "SELECT id, user_id, total_amount, is_member_order, status, refund_status FROM orders WHERE order_number = %s FOR UPDATE",
+                (order_no,)
             )
-            referrer = cur.fetchone()
-            if referrer and referrer['referrer_id']:
-                reward_amount = MEMBER_PRODUCT_PRICE * Decimal('0.50')
+            order = cur.fetchone()
+            if not order:
+                raise OrderException(f"订单不存在: {order_no}")
 
-                # 直接发放到 referral_points
+            # 2. 状态与退款检查（幂等性保障）
+            if order['status'] != 'completed':
+                logger.warning(f"[积分发放] 订单{order_no}状态为{order['status']}，跳过")
+                return True
+
+            if order.get('refund_status') in ['refunded', 'partial_refunded']:
+                logger.info(f"[积分发放] 订单{order_no}已退款，跳过")
+                return True
+
+            # 3. 防重复发放检查（查询是否已有积分流水）
+            cur.execute(
+                "SELECT 1 FROM points_log WHERE related_order = %s AND type = 'member' AND reason LIKE '%确认收货%' LIMIT 1",
+                (order['id'],)
+            )
+            if cur.fetchone():
+                logger.info(f"[积分发放] 订单{order_no}积分已发放，跳过重复操作")
+                return True
+
+            # 4. 积分计算与发放（保持不变）
+            user_id = order['user_id']
+            total_amount = Decimal(str(order['total_amount']))
+
+            cur.execute("SELECT product_id FROM order_items WHERE order_id = %s LIMIT 1", (order['id'],))
+            item = cur.fetchone()
+            if not item:
+                logger.warning(f"[积分发放] 订单{order_no}无商品明细")
+                return True
+
+            cur.execute("SELECT is_member_product FROM products WHERE id = %s", (item['product_id'],))
+            product = cur.fetchone()
+
+            cur.execute("SELECT member_level, member_points FROM users WHERE id = %s", (user_id,))
+            user_row = cur.fetchone()
+
+            points_earned = Decimal('0')
+            if product and product.get('is_member_product'):
+                points_earned = total_amount
+            elif user_row and user_row.get('member_level', 0) >= 1:
+                points_earned = total_amount
+
+            if points_earned > Decimal('0'):
+                # 原子性发放（更新+流水）
+                new_balance = Decimal(str(user_row['member_points'])) + points_earned
                 cur.execute(
-                    "UPDATE users SET referral_points = COALESCE(referral_points, 0) + %s WHERE id = %s",
-                    (reward_amount, referrer['referrer_id'])
+                    "UPDATE users SET member_points = %s WHERE id = %s",
+                    (new_balance, user_id)
                 )
                 cur.execute(
+                    """INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at)
+                       VALUES (%s, %s, %s, 'member', %s, %s, NOW())""",
+                    (user_id, points_earned, new_balance, '购买商品获得积分（确认收货后）', order['id'])
+                )
+                logger.info(f"[积分发放] 成功: 订单{order_no} 用户{user_id} +{points_earned:.4f}分")
+
+            # 5. ✅ 新增：查询并发放待发放奖励点数
+            # 查询待发放的推荐和团队奖励
+            cur.execute(
+                """SELECT id, user_id, reward_type, amount, layer 
+                   FROM pending_rewards 
+                   WHERE order_id = %s AND status = 'pending'""",
+                (order['id'],)
+            )
+            pending_rewards = cur.fetchall()
+
+            for reward in pending_rewards:
+                reward_id = reward['id']
+                reward_user_id = reward['user_id']
+                reward_type = reward['reward_type']
+                reward_amount = Decimal(str(reward['amount']))
+                layer = reward['layer']
+
+                # 根据奖励类型发放到对应的点数字段
+                if reward_type == 'referral':
+                    points_field = 'referral_points'
+                    reason_text = '推荐奖励（确认收货后）'
+                else:  # team
+                    points_field = 'team_reward_points'
+                    reason_text = f'团队L{layer}奖励（确认收货后）'
+
+                # 发放点数到用户账户
+                cur.execute(
+                    f"UPDATE users SET {points_field} = COALESCE({points_field}, 0) + %s WHERE id = %s",
+                    (reward_amount, reward_user_id)
+                )
+
+                # 同时更新真实总点数
+                cur.execute(
                     "UPDATE users SET true_total_points = true_total_points + %s WHERE id = %s",
-                    (reward_amount, referrer['referrer_id'])
+                    (reward_amount, reward_user_id)
                 )
 
                 # 记录流水
@@ -464,21 +503,72 @@ class FinanceService:
                     """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
                        flow_type, remark, created_at)
                        VALUES (%s, %s, %s, 
-                              (SELECT referral_points FROM users WHERE id = %s), 
+                              (SELECT {points_field} FROM users WHERE id = %s), 
                               %s, %s, NOW())""",
-                    ('referral_points', referrer['referrer_id'], reward_amount,
-                     referrer['referrer_id'], 'income', f"推荐奖励自动发放（订单#{order_id}）")
+                    (f'{points_field}', reward_user_id, reward_amount,
+                     reward_user_id, 'income',
+                     f"{reason_text} - 订单#{order['id']}，奖励{reward_amount:.2f}点")
                 )
 
-                logger.debug(f"推荐奖励自动发放: 用户{referrer['referrer_id']} +{reward_amount:.2f} referral_points")
+                # 更新待发放记录状态为已发放
+                cur.execute(
+                    "UPDATE pending_rewards SET status = 'approved' WHERE id = %s",
+                    (reward_id,)
+                )
+
+                logger.info(f"[奖励发放] 用户{reward_user_id} 获得{reward_type}奖励 +{reward_amount:.2f}点")
+
+            return True
+
+        try:
+            if external_conn:
+                with external_conn.cursor() as cur:
+                    return _process_points_and_rewards(cur)
+            else:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        return _process_points_and_rewards(cur)
+        except Exception as e:
+            logger.error(f"[积分/奖励发放] 失败: {e}", exc_info=True)
+            return False
+    # ==================== 创建待发放奖励（v2版本） ====================
+    def _create_pending_rewards_v2(self, cur, order_id: int, buyer_id: int,
+                                   old_level: int, new_level: int, final_amount: Decimal) -> None:
+        """
+        创建推荐和团队奖励的待发放记录（不立即发放点数）
+
+        关键逻辑：
+        1. 0星升级1星：只创建推荐奖励记录，不创建团队奖励
+        2. 其他升级：创建推荐奖励记录，并按升级到的星级层级创建团队奖励记录
+        """
+        # 1. 推荐奖励（仅首次购买会员商品时创建记录）
+        if old_level == 0:
+            cur.execute(
+                "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
+                (buyer_id,)
+            )
+            referrer = cur.fetchone()
+            if referrer and referrer['referrer_id']:
+                # ✅ 基于实付金额计算奖励
+                reward_amount = final_amount * Decimal('0.50')
+
+                # ✅ 创建待发放记录（状态为pending）
+                cur.execute(
+                    """INSERT INTO pending_rewards 
+                       (user_id, reward_type, amount, order_id, status)
+                       VALUES (%s, 'referral', %s, %s, 'pending')""",
+                    (referrer['referrer_id'], reward_amount, order_id)
+                )
+
+                logger.debug(f"创建推荐奖励待发放记录: 用户{referrer['referrer_id']} +{reward_amount:.2f} 点数")
 
         # 2. 团队奖励
         if old_level == 0 and new_level == 1:
             logger.debug("0星升级1星，不产生团队奖励")
             return
 
-        # 关键修改：升级到N星，从第N层开始逐级向上查找符合条件的推荐人
-        target_layer = new_level  # 目标层级要求
+        # 升级到N星，从第N层开始逐级向上查找符合条件的推荐人
+        target_layer = new_level
         current_id = buyer_id
         found_eligible_referrer = None
 
@@ -523,37 +613,25 @@ class FinanceService:
                 break
 
             current_id = ref['referrer_id']
-            check_layer += 1  # 层级递增（向上追溯）
+            check_layer += 1
 
-        # 如果找到符合条件的推荐人，发放奖励
+        # 如果找到符合条件的推荐人，创建待发放记录
         if found_eligible_referrer:
-            reward_amount = MEMBER_PRODUCT_PRICE * Decimal('0.50')
+            # ✅ 基于实付金额计算奖励
+            reward_amount = final_amount * Decimal('0.50')
 
-            # 直接发放到 team_reward_points
+            # ✅ 创建待发放记录（状态为pending）
             cur.execute(
-                "UPDATE users SET team_reward_points = COALESCE(team_reward_points, 0) + %s WHERE id = %s",
-                (reward_amount, found_eligible_referrer)
-            )
-            cur.execute(
-                "UPDATE users SET true_total_points = true_total_points + %s WHERE id = %s",
-                (reward_amount, found_eligible_referrer)
-            )
-            # 记录流水
-            cur.execute(
-                """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
-                   flow_type, remark, created_at)
-                   VALUES (%s, %s, %s, 
-                          (SELECT team_reward_points FROM users WHERE id = %s), 
-                          %s, %s, NOW())""",
-                ('team_reward_points', found_eligible_referrer, reward_amount,
-                 found_eligible_referrer, 'income',
-                 f"团队L{target_layer}奖励自动发放（订单#{order_id}），向上追溯至第{check_layer}层")
+                """INSERT INTO pending_rewards 
+                   (user_id, reward_type, amount, order_id, layer, status)
+                   VALUES (%s, 'team', %s, %s, %s, 'pending')""",
+                (found_eligible_referrer, reward_amount, order_id, target_layer)
             )
 
             logger.debug(
-                f"团队奖励自动发放: 用户{found_eligible_referrer} L{target_layer} +{reward_amount:.2f} team_reward_points（向上追溯）")
+                f"创建团队奖励待发放记录: 用户{found_eligible_referrer} L{target_layer} +{reward_amount:.2f} 点数")
         else:
-            logger.debug(f"团队奖励未发放: 在推荐链中未找到等级≥{target_layer}星的用户")
+            logger.debug(f"团队奖励未创建: 在推荐链中未找到等级≥{target_layer}星的用户")
 
     def _create_order(self, order_no: str, user_id: int, merchant_id: int,
                       product_id: int, total_amount: Decimal, original_amount: Decimal,
@@ -911,6 +989,8 @@ class FinanceService:
 
         关键修复：在扣减积分时同步写入 points_log 流水记录，
         确保积分报表能正确显示周补贴导致的积分支出
+
+        新增：将扣除的积分转入公司积分账户池，并记录资金池流水
         """
         logger.info("周补贴发放开始（发放专用点数并扣减积分）")
 
@@ -937,6 +1017,7 @@ class FinanceService:
         logger.info(f"补贴池: ¥{pool_balance} | 总积分: {total_member_points} | 积分值: ¥{points_value:.4f}/分")
 
         total_distributed = Decimal('0')
+        total_points_deducted = Decimal('0')  # 新增：统计总扣除积分
         today = datetime.now().date()
 
         try:
@@ -994,6 +1075,29 @@ class FinanceService:
                             (user_id, -member_points, new_balance, f"周补贴扣减积分")
                         )
 
+                        # ====== 新增：将扣除的积分转入公司积分池 ======
+                        # 1. 增加公司积分池余额
+                        cur.execute(
+                            "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'company_points'",
+                            (member_points,)
+                        )
+
+                        # 2. 获取更新后的公司积分池余额
+                        cur.execute(
+                            "SELECT balance FROM finance_accounts WHERE account_type = %s",
+                            ('company_points',)
+                        )
+                        company_balance = Decimal(str(cur.fetchone()['balance'] or 0))
+
+                        # 3. 记录资金池流水
+                        cur.execute(
+                            """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
+                               flow_type, remark, created_at)
+                               VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+                            ('company_points', user_id, member_points, company_balance, 'income',
+                             f"周补贴扣除积分转入 - 用户{user_id}扣除{member_points:.4f}分")
+                        )
+
                         # 4. 记录发放历史到 weekly_subsidy_records
                         cur.execute(
                             """INSERT INTO weekly_subsidy_records 
@@ -1003,12 +1107,18 @@ class FinanceService:
                         )
 
                         total_distributed += subsidy_amount
+                        total_points_deducted += member_points  # 累加总扣除积分
                         logger.info(
-                            f"用户{user_id}: 发放补贴点数{points_to_add:.4f}, 扣减积分{member_points:.4f}, 余额{new_balance:.4f}")
+                            f"用户{user_id}: 发放补贴点数{points_to_add:.4f}, "
+                            f"扣减积分{member_points:.4f}, 余额{new_balance:.4f}, "
+                            f"转入公司积分池{member_points:.4f}"
+                        )
 
+                    # 提交事务
                     conn.commit()
 
-            logger.info(f"周补贴完成: 发放¥{total_distributed:.4f}等值点数，涉及{len(users)}个用户")
+            logger.info(f"周补贴完成: 发放¥{total_distributed:.4f}等值点数，"
+                        f"扣除积分{total_points_deducted:.4f}分，涉及{len(users)}个用户")
             return True
 
         except Exception as e:

@@ -218,7 +218,7 @@ class DatabaseManager:
                     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                     user_id BIGINT UNSIGNED NOT NULL,
                     reward_type ENUM('referral','team') NOT NULL,
-                    amount DECIMAL(12,2) NOT NULL,
+                    amount DECIMAL(12,4) NOT NULL,
                     order_id BIGINT UNSIGNED NOT NULL,
                     layer TINYINT DEFAULT NULL,
                     status ENUM('pending','approved','rejected') DEFAULT 'pending',
