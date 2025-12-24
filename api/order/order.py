@@ -313,10 +313,7 @@ class OrderManager:
                 user_info = {
                     "id": order_info.get("user_id"),
                     "name": order_info.get("user_name"),
-                    "mobile": (
-                            order_info.get("user_mobile")
-                            or order_info.get("consignee_phone")
-                    )
+                    "mobile": order_info.get("user_mobile")      # 只取 users.mobile
                 }
 
                 # （推荐）清理 order_info 中的用户字段，避免语义混乱
