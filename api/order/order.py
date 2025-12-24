@@ -352,31 +352,65 @@ class OrderManager:
                 }
 
     @staticmethod
-    def update_status(order_number: str, new_status: str, reason: Optional[str] = None) -> bool:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                # 查询订单并加锁（防并发）
-                cur.execute(
-                    "SELECT id, status FROM orders WHERE order_number = %s FOR UPDATE",
-                    (order_number,)
-                )
-                result = cur.fetchone()
-                if not result:
+    def update_status(order_number: str, new_status: str, reason: Optional[str] = None, external_conn=None) -> bool:
+        # 先读取订单当前状态与 id（避免直接覆盖导致无法得知旧状态）
+        order_id = None
+        old_status = None
+
+        if external_conn:
+            cur = external_conn.cursor()
+            try:
+                cur.execute("SELECT id, status FROM orders WHERE order_number = %s", (order_number,))
+                res = cur.fetchone()
+                if not res:
                     return False
+                order_id = res['id']
+                old_status = res['status']
 
-                old_status = result['status']
-                order_id = result['id']
+                # 如果状态已经是目标状态，则视为成功（幂等）
+                if old_status == new_status:
+                    return True
 
-                # 更新状态
                 cur.execute(
-                    "UPDATE orders SET status = %s, refund_reason = %s WHERE order_number = %s",
-                    (new_status, reason, order_number)
+                    "UPDATE orders SET status = %s, refund_reason = %s, updated_at = NOW() WHERE id = %s",
+                    (new_status, reason, order_id)
                 )
+                if cur.rowcount == 0:
+                    return False
+            finally:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+        else:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id, status FROM orders WHERE order_number = %s", (order_number,))
+                    res = cur.fetchone()
+                    if not res:
+                        return False
+                    order_id = res['id']
+                    old_status = res['status']
 
-                # 如果状态从pending_recv变为completed时发放积分
-                if old_status == 'pending_recv' and new_status == 'completed':
+                    # 如果状态已经是目标状态，则视为成功（幂等）
+                    if old_status == new_status:
+                        return True
+
+                    cur.execute(
+                        "UPDATE orders SET status = %s, refund_reason = %s, updated_at = NOW() WHERE id = %s",
+                        (new_status, reason, order_id)
+                    )
+                    if cur.rowcount == 0:
+                        return False
+
+        # 如果状态从 pending_recv 变为 completed 时发放积分
+        if old_status == 'pending_recv' and new_status == 'completed':
+            try:
+                fs = FinanceService()
+                # 优先在传入的连接上执行发放（避免跨连接锁），否则创建新连接
+                if external_conn:
+                    cur = external_conn.cursor()
                     try:
-                        # 幂等性检查：确认是否已发放过积分
                         cur.execute(
                             "SELECT id FROM points_log WHERE related_order = %s AND type = 'member' AND reason LIKE '%确认收货%' LIMIT 1",
                             (order_id,)
@@ -384,16 +418,29 @@ class OrderManager:
                         if cur.fetchone():
                             logger.info(f"订单{order_number}积分已发放，跳过")
                         else:
-                            fs = FinanceService()
-                            # 调用积分发放并检查返回值
-                            if not fs.grant_points_on_receive(order_number, external_conn=conn):
+                            if not fs.grant_points_on_receive(order_number, external_conn=external_conn):
                                 logger.error(f"订单{order_number}积分发放返回失败")
-                    except Exception as e:
-                        logger.error(f"订单{order_number}确认收货后积分发放失败: {e}", exc_info=True)
-                        # 不抛出异常，避免影响订单状态更新
+                    finally:
+                        try:
+                            cur.close()
+                        except Exception:
+                            pass
+                else:
+                    with get_conn() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT id FROM points_log WHERE related_order = %s AND type = 'member' AND reason LIKE '%确认收货%' LIMIT 1",
+                                (order_id,)
+                            )
+                            if cur.fetchone():
+                                logger.info(f"订单{order_number}积分已发放，跳过")
+                            else:
+                                if not fs.grant_points_on_receive(order_number, external_conn=conn):
+                                    logger.error(f"订单{order_number}积分发放返回失败")
+            except Exception as e:
+                logger.error(f"订单{order_number}确认收货后积分发放失败: {e}", exc_info=True)
 
-                conn.commit()
-                return cur.rowcount > 0
+        return True
 
 
 # ---------------- 请求模型 ----------------
@@ -542,8 +589,8 @@ def order_pay(body: OrderPay):
                 external_conn=conn  # ✅ 关键修复：传递连接避免卡死
             )
 
-            # 5. 更新订单状态
-            ok = OrderManager.update_status(body.order_number, "pending_ship")
+            # 5. 更新订单状态（在同一连接内执行，避免锁等待）
+            ok = OrderManager.update_status(body.order_number, "pending_ship", external_conn=conn)
             if not ok:
                 raise HTTPException(status_code=500, detail="订单状态更新失败")
 
