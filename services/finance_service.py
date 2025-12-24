@@ -8,6 +8,8 @@ import logging
 from decimal import Decimal
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
+import time
+import pymysql
 from core.config import (
     AllocationKey, ALLOCATIONS, MAX_POINTS_VALUE, TAX_RATE,
     POINTS_DISCOUNT_RATE, MEMBER_PRODUCT_PRICE, COUPON_VALID_DAYS,
@@ -88,130 +90,151 @@ class FinanceService:
 
     # ==================== 关键修改：支持外部连接复用，分离优惠券逻辑 ====================
     def settle_order(self, order_no: str, user_id: int, product_id: int, quantity: int = 1,
-                     points_to_use: Decimal = Decimal('0'),
-                     coupon_discount: Decimal = Decimal('0'),
-                     external_conn=None) -> int:
-        """订单结算（修复版：支持外部连接，分离优惠券与积分逻辑）"""
-        logger.debug(f"订单结算开始: {order_no}, 积分抵扣={points_to_use}, 优惠券抵扣={coupon_discount}")
+                     points_to_use: Decimal = Decimal('0')) -> int:
+        """订单结算（修复版：统一使用 get_conn() 管理事务）"""
+        logger.debug(f"订单结算开始: {order_no}")
+        # 针对数据库行锁等待超时进行有限重试（1205 锁等待超时）
+        max_attempts = 3
+        base_delay = 0.5
 
-        # 使用外部连接（如果有），避免嵌套事务
-        if external_conn:
-            conn = external_conn
-            cursor = conn.cursor()
+        for attempt in range(1, max_attempts + 1):
+            conn = None
             try:
-                return self._settle_order_internal(cursor, order_no, user_id, product_id,
-                                                   quantity, points_to_use, coupon_discount)
-            finally:
-                cursor.close()
-        else:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    return self._settle_order_internal(cur, order_no, user_id, product_id,
-                                                       quantity, points_to_use, coupon_discount)
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        # 1. 查询商品信息（带价格）
+                        cur.execute(
+                            """SELECT p.is_member_product, p.user_id, 
+                                      COALESCE(ps.price, p.price) as price
+                               FROM products p
+                               LEFT JOIN product_skus ps ON p.id = ps.product_id
+                               WHERE p.id = %s AND p.status = 1
+                               LIMIT 1""",
+                            (product_id,)
+                        )
+                        product = cur.fetchone()
+                        if not product or product['price'] is None:
+                            raise OrderException(f"商品不存在、已下架或无价格信息: {product_id}")
 
-    def _settle_order_internal(self, cur, order_no: str, user_id: int, product_id: int,
-                               quantity: int, points_to_use: Decimal, coupon_discount: Decimal) -> int:
-        """内部结算逻辑（复用游标，不重复锁定）"""
-        try:
-            # 1. 查询商品信息
-            cur.execute(
-                """SELECT p.is_member_product, p.user_id, 
-                          COALESCE(ps.price, p.price) as price
-                   FROM products p
-                   LEFT JOIN product_skus ps ON p.id = ps.product_id
-                   WHERE p.id = %s AND p.status = 1
-                   LIMIT 1""",
-                (product_id,)
-            )
-            product = cur.fetchone()
-            if not product or product['price'] is None:
-                raise OrderException(f"商品不存在、已下架或无价格信息: {product_id}")
+                        merchant_id = PLATFORM_MERCHANT_ID
 
-            merchant_id = PLATFORM_MERCHANT_ID
+                        # 2. 查询并锁定用户信息（FOR UPDATE）
+                        select_sql = build_dynamic_select(
+                            cur, "users",
+                            where_clause="id=%s",
+                            select_fields=["member_level", "member_points"]
+                        )
+                        # 读取用户信息为只读，避免长事务持有行级锁导致其他并发请求阻塞
+                        cur.execute(select_sql, (user_id,))
+                        user_row = cur.fetchone()
+                        if not user_row:
+                            raise OrderException(f"用户不存在: {user_id}")
 
-            # 2. 查询用户信息（不再 FOR UPDATE，因为外部已锁定）
-            select_sql = build_dynamic_select(
-                cur, "users",
-                where_clause="id=%s",
-                select_fields=["member_level", "member_points"]
-            )
-            # ✅ 关键修复：移除 FOR UPDATE，避免重复锁定
-            cur.execute(select_sql, (user_id,))
-            user_row = cur.fetchone()
-            if not user_row:
-                raise OrderException(f"用户不存在: {user_id}")
+                        user = type('obj', (object,), {
+                            'member_level': user_row.get('member_level', 0) or 0,
+                            'member_points': Decimal(str(user_row.get('member_points', 0) or 0))
+                        })()
 
-            user = type('obj', (object,), {
-                'member_level': user_row.get('member_level', 0) or 0,
-                'member_points': Decimal(str(user_row.get('member_points', 0) or 0))
-            })()
+                        # 3. 计算金额与处理积分抵扣
+                        unit_price = Decimal(str(product['price']))
+                        original_amount = unit_price * quantity
+                        final_amount = original_amount
+                        points_discount = Decimal('0')
 
-            # 3. 计算订单金额
-            unit_price = Decimal(str(product['price']))
-            original_amount = unit_price * quantity
+                        if points_to_use > Decimal('0'):
+                            self._apply_points_discount_v2(cur, user_id, user, points_to_use, original_amount)
+                            points_discount = points_to_use * POINTS_DISCOUNT_RATE
+                            final_amount = original_amount - points_discount
 
-            # 4. 计算总抵扣（积分 + 优惠券）
-            points_discount = points_to_use * POINTS_DISCOUNT_RATE
-            total_discount = points_discount + coupon_discount
+                        # 4. 创建或更新订单以及写入订单项
+                        cur.execute("SELECT id FROM orders WHERE order_number=%s", (order_no,))
+                        existing_order = cur.fetchone()
+                        if existing_order:
+                            order_id = existing_order['id']
+                            cur.execute(
+                                """UPDATE orders SET merchant_id=%s, total_amount=%s, original_amount=%s,
+                                           points_discount=%s, is_member_order=%s, status='completed', updated_at=NOW()
+                                   WHERE id=%s""",
+                                (merchant_id, final_amount, original_amount, points_discount,
+                                 product['is_member_product'], order_id)
+                            )
+                            cur.execute("SELECT COUNT(*) AS cnt FROM order_items WHERE order_id=%s", (order_id,))
+                            cnt = cur.fetchone().get('cnt', 0)
+                            if cnt == 0:
+                                cur.execute(
+                                    """INSERT INTO order_items (order_id, product_id, quantity, unit_price, total_price)
+                                       VALUES (%s, %s, %s, %s, %s)""",
+                                    (order_id, product_id, quantity, unit_price, original_amount)
+                                )
+                        else:
+                            cur.execute(
+                                """INSERT INTO orders (order_number, user_id, merchant_id, total_amount, original_amount, points_discount, is_member_order, status)
+                                   VALUES (%s, %s, %s, %s, %s, %s, %s, 'completed')""",
+                                (order_no, user_id, merchant_id, final_amount, original_amount, points_discount,
+                                 product['is_member_product'])
+                            )
+                            order_id = cur.lastrowid
+                            cur.execute(
+                                """INSERT INTO order_items (order_id, product_id, quantity, unit_price, total_price)
+                                   VALUES (%s, %s, %s, %s, %s)""",
+                                (order_id, product_id, quantity, unit_price, original_amount)
+                            )
 
-            if total_discount > original_amount:
-                raise OrderException("优惠金额不能超过订单总额")
+                        # 5. 执行订单后续处理
+                        if product['is_member_product']:
+                            self._process_member_order_v2(cur, order_id, user_id, user, unit_price, quantity, final_amount)
+                        else:
+                            self._process_normal_order_v2(cur, order_id, user_id, merchant_id,
+                                                          final_amount, original_amount, points_discount,
+                                                          user.member_level)
 
-            final_amount = original_amount - total_discount
+                        # 6. 提交并返回
+                        conn.commit()
+                        logger.debug(f"订单结算成功: ID={order_id}")
+                        return order_id
 
-            logger.debug(
-                f"订单金额计算: 原价¥{original_amount}, 积分抵扣¥{points_discount}, 优惠券抵扣¥{coupon_discount}, 实付¥{final_amount}")
+            except pymysql.err.OperationalError as op_err:
+                # 锁等待超时（1205）通常格式为 (1205, 'Lock wait timeout exceeded; ...')
+                err_no = None
+                try:
+                    err_no = op_err.args[0]
+                except Exception:
+                    pass
 
-            # 5. 处理积分抵扣（只处理真实积分，不处理优惠券）
-            if points_to_use > Decimal('0'):
-                # ✅ 关键修复：只处理真实积分抵扣
-                self._apply_points_discount_v2(cur, user_id, user, points_to_use, original_amount)
+                if err_no == 1205:
+                    # 回滚并在有限次数内重试，指数退避
+                    try:
+                        if conn:
+                            conn.rollback()
+                    except Exception:
+                        pass
 
-            # 6. 创建/更新订单
-            cur.execute("SELECT id FROM orders WHERE order_number=%s", (order_no,))
-            existing_order = cur.fetchone()
-            if existing_order:
-                order_id = existing_order['id']
-                cur.execute(
-                    """UPDATE orders SET merchant_id=%s, total_amount=%s, original_amount=%s,
-                               points_discount=%s, is_member_order=%s, status='pending_ship', updated_at=NOW()
-                       WHERE id=%s""",
-                    (merchant_id, final_amount, original_amount, total_discount,
-                     product['is_member_product'], order_id)
-                )
-            else:
-                cur.execute(
-                    """INSERT INTO orders (order_number, user_id, merchant_id, total_amount, original_amount, 
-                               points_discount, is_member_order, status)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending_ship')""",
-                    (order_no, user_id, merchant_id, final_amount, original_amount,
-                     total_discount, product['is_member_product'])
-                )
-                order_id = cur.lastrowid
+                    if attempt < max_attempts:
+                        delay = base_delay * (2 ** (attempt - 1))
+                        logger.warning(f"锁等待超时 (1205)，第{attempt}次重试，延迟{delay}s")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        logger.error("达到最大重试次数，仍然遇到锁等待超时", exc_info=True)
+                        raise
+                else:
+                    # 非 1205 的 OperationalError，直接回滚并抛出
+                    try:
+                        if conn:
+                            conn.rollback()
+                    except Exception:
+                        pass
+                    logger.error(f"数据库操作失败: {op_err}")
+                    raise
 
-            # 7. 写入订单明细
-            cur.execute(
-                """INSERT INTO order_items (order_id, product_id, quantity, unit_price, total_price)
-                   VALUES (%s, %s, %s, %s, %s)""",
-                (order_id, product_id, quantity, unit_price, original_amount)
-            )
-
-            # 8. 处理订单业务逻辑
-            if product['is_member_product']:
-                # ✅ 关键修复：传递实付金额用于奖励计算
-                self._process_member_order_v2(cur, order_id, user_id, user,
-                                              unit_price, quantity, final_amount)
-            else:
-                self._process_normal_order_v2(cur, order_id, user_id, merchant_id,
-                                              final_amount, original_amount, total_discount,
-                                              user.member_level)
-
-            logger.debug(f"订单结算成功: ID={order_id}")
-            return order_id
-
-        except Exception as e:
-            logger.error(f"订单结算失败: {e}")
-            raise
+            except Exception as e:
+                try:
+                    if conn:
+                        conn.rollback()
+                except Exception:
+                    pass
+                logger.error(f"订单结算失败: {e}")
+                raise
 
     # ==================== 积分抵扣逻辑（v2版本） ====================
     def _apply_points_discount_v2(self, cur, user_id: int, user, points_to_use: Decimal, amount: Decimal) -> None:
@@ -222,10 +245,14 @@ class FinanceService:
         # 已移除：50%限制检查
         # 扣减member_points
         cur.execute(
-            "UPDATE users SET member_points = member_points - %s WHERE id = %s",
-            (points_to_use, user_id)
+            "UPDATE users SET member_points = member_points - %s WHERE id = %s AND member_points >= %s",
+            (points_to_use, user_id, points_to_use)
         )
-        # 更新公司积分池
+        if cur.rowcount == 0:
+            # 说明积分不足或被并发消费
+            raise OrderException(f"积分不足或并发冲突，无法使用{points_to_use:.4f}分")
+
+        # 更新公司积分池（累计到公司积分）
         cur.execute(
             "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'company_points'",
             (points_to_use,)
@@ -1101,36 +1128,44 @@ class FinanceService:
     # ==================== 关键修改4：退款逻辑使用member_points ====================
     def refund_order(self, order_no: str) -> bool:
         try:
-            with self.session.begin():
+            # 先读取订单信息（只读），随后通过条件更新来避免长时间持有行锁
+            result = self.session.execute(
+                "SELECT order_number, status, is_member_order, user_id, total_amount, merchant_id, original_amount FROM orders WHERE order_number = %s",
+                {"order_number": order_no}
+            )
+            order = result.fetchone()
+
+            if not order or order.status == 'refunded':
+                raise FinanceException("订单不存在或已退款")
+
+            # 尝试将订单状态置为 refunded（条件更新保证并发安全且不会长时间锁行）
+            res = self.session.execute(
+                "UPDATE orders SET status = 'refunded' WHERE order_number = %s AND status != 'refunded'",
+                {"order_number": order_no}
+            )
+            if res.rowcount == 0:
+                raise FinanceException("订单已被并发处理或状态已改变")
+
+            is_member = order.is_member_order
+            user_id = order.user_id
+            amount = Decimal(str(order.total_amount))
+            merchant_id = order.merchant_id
+
+            logger.debug(f"订单退款: {order_no} (会员商品: {is_member})")
+
+            if is_member:
                 result = self.session.execute(
-                    "SELECT * FROM orders WHERE order_number = %s FOR UPDATE",
-                    {"order_number": order_no}
+                    "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
+                    {"user_id": user_id}
                 )
-                order = result.fetchone()
-
-                if not order or order.status == 'refunded':
-                    raise FinanceException("订单不存在或已退款")
-
-                is_member = order.is_member_order
-                user_id = order.user_id
-                amount = Decimal(str(order.total_amount))
-                merchant_id = order.merchant_id
-
-                logger.debug(f"订单退款: {order_no} (会员商品: {is_member})")
-
-                if is_member:
-                    result = self.session.execute(
-                        "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
-                        {"user_id": user_id}
+                referrer = result.fetchone()
+                if referrer and referrer.referrer_id:
+                    reward_amount = Decimal(str(order.original_amount)) * Decimal('0.50')
+                    self.session.execute(
+                        """UPDATE users SET promotion_balance = promotion_balance - %s
+                           WHERE id = %s AND promotion_balance >= %s""",
+                        {"amount": reward_amount, "user_id": referrer.referrer_id}
                     )
-                    referrer = result.fetchone()
-                    if referrer and referrer.referrer_id:
-                        reward_amount = Decimal(str(order.original_amount)) * Decimal('0.50')
-                        self.session.execute(
-                            """UPDATE users SET promotion_balance = promotion_balance - %s
-                               WHERE id = %s AND promotion_balance >= %s""",
-                            {"amount": reward_amount, "user_id": referrer.referrer_id}
-                        )
 
                     # 动态构造 SELECT 语句（使用临时连接获取表结构，不影响当前事务）
                     with get_conn() as temp_conn:
@@ -1288,21 +1323,20 @@ class FinanceService:
                     else:
                         select_fields.append(f"`{field_name}`")
 
-                # 查询并锁定记录
-                select_sql = f"SELECT {', '.join(select_fields)} FROM withdrawals WHERE id = %s FOR UPDATE"
-                cur.execute(select_sql, (withdrawal_id,))
-                withdraw = cur.fetchone()
-
-                # ===== 业务校验：直接抛出异常，不被捕获 =====
-                if not withdraw or withdraw['status'] not in ['pending_auto', 'pending_manual']:
-                    raise FinanceException("提现记录不存在或已处理")
-
+                # 使用条件更新避免长时间锁定行：先尝试原子性更新状态
                 new_status = 'approved' if approve else 'rejected'
                 cur.execute(
                     """UPDATE withdrawals SET status = %s, audit_remark = %s, processed_at = NOW()
-                       WHERE id = %s""",
+                       WHERE id = %s AND status IN ('pending_auto','pending_manual')""",
                     (new_status, f"{auditor}审核", withdrawal_id)
                 )
+
+                if cur.rowcount == 0:
+                    raise FinanceException("提现记录不存在或已处理")
+
+                # 读取记录以便后续处理（短查询）
+                cur.execute(f"SELECT {', '.join(select_fields)} FROM withdrawals WHERE id = %s", (withdrawal_id,))
+                withdraw = cur.fetchone()
 
                 if approve:
                     self._record_flow(
@@ -2418,29 +2452,22 @@ class FinanceService:
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    # 查询优惠券信息并锁定行
-                    cur.execute(
-                        """SELECT id, amount, status, valid_from, valid_to, coupon_type
-                           FROM coupons 
-                           WHERE id = %s AND user_id = %s FOR UPDATE""",
-                        (coupon_id, user_id)
-                    )
-                    coupon = cur.fetchone()
-
-                    if not coupon:
-                        raise FinanceException("优惠券不存在")
-
-                    if coupon['status'] != 'unused':
-                        raise FinanceException("优惠券已使用或已过期")
-
-                    # 检查有效期
+                    # 使用条件更新原子性标记优惠券为已使用，避免长事务锁等待
                     today = datetime.now().date()
-                    if coupon['valid_from'] > today or coupon['valid_to'] < today:
-                        raise FinanceException("优惠券不在有效期内")
+                    cur.execute(
+                        """UPDATE coupons SET status = 'used', used_at = NOW()
+                           WHERE id = %s AND user_id = %s AND status = 'unused' AND valid_from <= %s AND valid_to >= %s""",
+                        (coupon_id, user_id, today, today)
+                    )
+                    if cur.rowcount == 0:
+                        raise FinanceException("优惠券不存在、已使用或不在有效期内")
 
+                    # 查询已被标记的优惠券金额
+                    cur.execute("SELECT amount FROM coupons WHERE id = %s", (coupon_id,))
+                    coupon = cur.fetchone()
                     coupon_amount = Decimal(str(coupon['amount'] or 0))
 
-                    # 更新优惠券状态为已使用
+                    # 更新优惠券状态为已使用（已在条件更新中完成）
                     cur.execute(
                         "UPDATE coupons SET status = 'used', used_at = NOW() WHERE id = %s",
                         (coupon_id,)

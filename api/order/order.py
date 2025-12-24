@@ -485,9 +485,9 @@ def order_pay(body: OrderPay):
 
             # 3.1 处理积分抵扣
             if body.points_to_use and body.points_to_use > 0:
-                # 查询用户积分余额
+                # 只读取用户积分用于快速校验（真正的扣减在 finance_service 中使用原子更新）
                 cur.execute(
-                    "SELECT COALESCE(member_points, 0) as points FROM users WHERE id = %s FOR UPDATE",
+                    "SELECT COALESCE(member_points, 0) as points FROM users WHERE id = %s",
                     (user_id,)
                 )
                 user = cur.fetchone()
@@ -506,28 +506,21 @@ def order_pay(body: OrderPay):
 
             # 3.2 处理优惠券抵扣
             if body.coupon_id:
-                # 查询并锁定优惠券记录
+                # 原子性标记优惠券为已使用，避免长事务锁等待
                 cur.execute(
-                    """SELECT id, amount FROM coupons 
-                       WHERE id = %s AND user_id = %s AND status = 'unused' 
-                       FOR UPDATE""",
+                    "UPDATE coupons SET status = 'used', used_at = NOW() WHERE id = %s AND user_id = %s AND status = 'unused'",
                     (body.coupon_id, user_id)
                 )
-                coupon = cur.fetchone()
-
-                if not coupon:
+                if cur.rowcount == 0:
                     raise HTTPException(status_code=400, detail="优惠券不存在或已使用")
 
+                # 查询金额（更新成功则只有本事务拥有该券）
+                cur.execute("SELECT amount FROM coupons WHERE id = %s", (body.coupon_id,))
+                coupon = cur.fetchone()
                 coupon_amount = Decimal(str(coupon['amount']))
 
                 # 将优惠券金额转换为等效积分数量
                 coupon_points = coupon_amount / POINTS_DISCOUNT_RATE if POINTS_DISCOUNT_RATE > 0 else Decimal('0')
-
-                # 标记优惠券为已使用
-                cur.execute(
-                    "UPDATE coupons SET status = 'used', used_at = NOW() WHERE id = %s",
-                    (body.coupon_id,)
-                )
 
                 # 累加到总积分抵扣
                 total_points_to_use += coupon_points
