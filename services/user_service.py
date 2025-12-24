@@ -895,3 +895,64 @@ class UserService:
                     "remaining_points": remaining_points,
                     "used_points": used_points
                 }
+
+    @staticmethod
+    def set_unilevel(user_id: int, level: int) -> Dict[str, Any]:
+        """
+        后台设置用户的联创星级（不包含updated_at字段）
+        """
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 1. 检查用户是否存在
+                cur.execute("SELECT 1 FROM users WHERE id = %s", (user_id,))
+                if not cur.fetchone():
+                    raise ValueError("用户不存在")
+
+                # 2. 检查表是否存在，不存在则创建（简化结构）
+                cur.execute("SHOW TABLES LIKE 'user_unilevel'")
+                if not cur.fetchone():
+                    cur.execute("""
+                        CREATE TABLE user_unilevel (
+                            id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                            user_id BIGINT UNSIGNED NOT NULL UNIQUE,
+                            level TINYINT NOT NULL DEFAULT 0,
+                            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            KEY idx_user_id (user_id)
+                        )
+                    """)
+                    conn.commit()
+
+                # 3. 获取旧等级
+                cur.execute("SELECT level FROM user_unilevel WHERE user_id = %s", (user_id,))
+                old_row = cur.fetchone()
+                old_level = old_row["level"] if old_row else 0
+
+                # 4. 幂等检查
+                if old_level == level:
+                    return {
+                        "user_id": user_id,
+                        "old_level": old_level,
+                        "new_level": level,
+                        "changed": False,
+                        "message": "等级未变化"
+                    }
+
+                # 5. 更新或插入（无需updated_at）
+                cur.execute(
+                    """
+                    INSERT INTO user_unilevel (user_id, level) 
+                    VALUES (%s, %s)
+                    ON DUPLICATE KEY UPDATE level = %s
+                    """,
+                    (user_id, level, level)
+                )
+
+                conn.commit()
+
+                return {
+                    "user_id": user_id,
+                    "old_level": old_level,
+                    "new_level": level,
+                    "changed": True,
+                    "message": "联创星级已更新"
+                }
