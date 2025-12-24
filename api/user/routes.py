@@ -6,7 +6,7 @@ from models.schemas.user import (
     SetStatusReq, AuthReq, AuthResp, UpdateProfileReq, SelfDeleteReq,
     FreezeReq, ResetPwdReq, AdminResetPwdReq, SetLevelReq, AddressReq,
     PointsReq, UserInfoResp, BindReferrerReq,MobileResp,Query,AvatarUploadResp,
-    UnilevelStatusResponse, UnilevelPromoteResponse,UserAllPointsResponse,UserPointsSummaryResponse
+    UnilevelStatusResponse, UnilevelPromoteResponse,UserAllPointsResponse,UserPointsSummaryResponse,SetUnilevelReq
 )
 
 from core.database import get_conn
@@ -1379,3 +1379,25 @@ def get_points_summary(
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
+
+
+@router.post("/admin/unilevel/set", summary="后台设置联创星级")
+def set_unilevel(body: SetUnilevelReq):
+    """
+    后台直接设置用户的联创星级等级
+
+    权限验证：需要正确的admin_key
+    自动建表：user_unilevel 表不存在时自动创建
+    幂等性：等级未变化时返回提示
+    """
+    if body.admin_key != "admin2025":
+        raise HTTPException(status_code=403, detail="后台口令错误")
+
+    try:
+        result = UserService.set_unilevel(body.user_id, body.level)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"操作失败: {str(e)}")
+

@@ -249,3 +249,9 @@ class UserPointsSummaryResponse(BaseModel):
     cumulative_total: float = Field(..., description="累计总值（四个渠道之和）", example=18000.00)
     remaining_points: float = Field(..., description="剩余点数（true_total_points）", example=11000.00)
     used_points: float = Field(..., description="已使用点数", example=7000.00)
+
+class SetUnilevelReq(BaseModel):
+    """后台设置联创星级请求"""
+    user_id: int = Field(..., gt=0, description="用户ID")
+    level: int = Field(..., ge=0, le=3, description="联创等级：0=无, 1=一星, 2=二星, 3=三星")
+    admin_key: str = Field(..., description="后台口令")
