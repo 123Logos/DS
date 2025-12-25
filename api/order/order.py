@@ -477,6 +477,7 @@ def order_pay(body: OrderPay):
             order_info = cur.fetchone()
             if not order_info:
                 raise HTTPException(status_code=404, detail="订单不存在")
+            user_id = order_info.get("user_id")
             if order_info["status"] != "pending_pay":
                 raise HTTPException(status_code=400, detail="订单状态不是待付款")
 
@@ -495,7 +496,7 @@ def order_pay(body: OrderPay):
             if body.points_to_use and body.points_to_use > 0:
                 cur.execute(
                     "SELECT COALESCE(member_points, 0) as points FROM users WHERE id = %s",
-                    (user_id,)
+                    (order_info["user_id"],)
                 )
                 user = cur.fetchone()
                 if not user or Decimal(str(user['points'])) < body.points_to_use:
@@ -522,7 +523,7 @@ def order_pay(body: OrderPay):
             fs = FinanceService()
             fs.settle_order(
                 order_no=body.order_number,
-                user_id=user_id,
+                user_id=order_info["user_id"],
                 order_id=order_id,
                 points_to_use=total_points_to_use,  # 仅积分
                 coupon_discount=coupon_amount,  # 仅优惠券
