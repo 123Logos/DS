@@ -4103,37 +4103,38 @@ class FinanceService:
                 # ==================== 1. 构建查询参数（统一处理） ====================
                 params_account_flow = []
                 params_wsr = []
-                where_conditions = []
+                where_af = []
+                where_wsr = []
 
                 if user_id:
-                    # account_flow 使用 related_user，weekly_subsidy_records 使用 user_id
-                    where_conditions.append("related_user = %s")
+                    where_af.append("af.related_user = %s")
                     params_account_flow.append(user_id)
+                    where_wsr.append("wsr.user_id = %s")
                     params_wsr.append(user_id)
 
                 if start_date:
-                    where_conditions.append("DATE(created_at) >= %s")
+                    where_af.append("DATE(af.created_at) >= %s")
                     params_account_flow.append(start_date)
+                    where_wsr.append("DATE(wsr.week_start) >= %s")
                     params_wsr.append(start_date)
 
                 if end_date:
-                    where_conditions.append("DATE(created_at) <= %s")
+                    where_af.append("DATE(af.created_at) <= %s")
                     params_account_flow.append(end_date)
+                    where_wsr.append("DATE(wsr.week_start) <= %s")
                     params_wsr.append(end_date)
 
                 # 为 account_flow 构建 WHERE 子句
                 base_where_account = "WHERE account_type IN ('subsidy_points', 'referral_points', 'team_reward_points', 'honor_director', 'true_total_points')"
-                if where_conditions:
-                    account_where = base_where_account + " AND " + " AND ".join(where_conditions)
+                if where_af:
+                    account_where = base_where_account + " AND " + " AND ".join(where_af)
                 else:
                     account_where = base_where_account
 
                 # 为 weekly_subsidy_records 构建 WHERE 子句
                 base_where_wsr = "WHERE 1=1"
-                if where_conditions:
-                    # 替换字段名以适应 weekly_subsidy_records 的字段名
-                    wsr_conditions = [cond.replace("related_user", "user_id") for cond in where_conditions]
-                    wsr_where = base_where_wsr + " AND " + " AND ".join(wsr_conditions)
+                if where_wsr:
+                    wsr_where = base_where_wsr + " AND " + " AND ".join(where_wsr)
                 else:
                     wsr_where = base_where_wsr
 
