@@ -539,6 +539,44 @@ async def clear_fund_pools(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class AllocationsRequest(BaseModel):
+    allocations: Dict[str, float]
+
+
+@router.get("/api/fund-pools/allocations", response_model=ResponseModel, summary="查询资金池分配配置")
+async def get_pool_allocations(
+        service: FinanceService = Depends(get_finance_service)
+):
+    """获取当前资金池分配配置"""
+    try:
+        allocs = service.get_pool_allocations()
+        # 将 Decimal 转换为字符串以避免序列化问题
+        data = {k: str(v) for k, v in allocs.items()}
+        return ResponseModel(success=True, message="ok", data=data)
+    except Exception as e:
+        logger.error(f"获取资金池配置失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/fund-pools/allocations", response_model=ResponseModel, summary="更新资金池分配配置")
+async def set_pool_allocations(
+        request: AllocationsRequest,
+        service: FinanceService = Depends(get_finance_service)
+):
+    """管理员更新资金池分配配置（会校验总和不超过20%）"""
+    try:
+        allocs = service.set_pool_allocations(request.allocations)
+        data = {k: str(v) for k, v in allocs.items()}
+        return ResponseModel(success=True, message="配置已更新", data=data)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"更新资金池配置失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ==================== 1. 优惠券发放接口 ====================
 @router.post("/api/coupons/distribute", response_model=ResponseModel, summary="直接发放优惠券")
 async def distribute_coupon(

@@ -5,6 +5,7 @@
 import pymysql
 from core.config import get_db_config
 from core.logging import get_logger
+import json
 
 # 使用统一的日志配置
 logger = get_logger(__name__)
@@ -892,6 +893,62 @@ class DatabaseManager:
             logger.info(f"✅ 初始化 {len(accounts)} 个资金池账户")
         else:
             logger.info(f"⚠️ finance_accounts 表已存在 {count} 条记录，跳过初始化（保留现有余额）")
+
+        # 确保存在 config_params 列（JSON），兼容旧表结构
+        try:
+            cursor.execute("SHOW COLUMNS FROM finance_accounts LIKE 'config_params'")
+            if not cursor.fetchone():
+                cursor.execute("ALTER TABLE finance_accounts ADD COLUMN config_params JSON DEFAULT NULL")
+                logger.info("已为 finance_accounts 添加 config_params 列")
+        except Exception as e:
+            logger.debug(f"⚠️ 添加 config_params 列失败（已忽略）: {e}")
+
+        # 确保每个子资金池的行存在且其 config_params 中包含 allocation 字段（幂等）
+        try:
+            defaults = {
+                'merchant_balance': '0.80',
+                'public_welfare': '0.01',
+                'maintain_pool': '0.01',
+                'subsidy_pool': '0.12',
+                'director_pool': '0.02',
+                'shop_pool': '0.01',
+                'city_pool': '0.01',
+                'branch_pool': '0.005',
+                'fund_pool': '0.015'
+            }
+            for atype, aval in defaults.items():
+                cursor.execute("SELECT id, config_params FROM finance_accounts WHERE account_type=%s LIMIT 1", (atype,))
+                row = cursor.fetchone()
+                if row:
+                    cp = row.get('config_params')
+                    need_update = False
+                    try:
+                        if cp:
+                            parsed = json.loads(cp) if isinstance(cp, str) else cp
+                        else:
+                            parsed = {}
+                        if not isinstance(parsed, dict):
+                            parsed = {}
+                        # 如果没有 allocation 字段或 allocation 不等于默认，则更新
+                        if parsed.get('allocation') != str(aval):
+                            parsed['allocation'] = str(aval)
+                            need_update = True
+                    except Exception:
+                        parsed = {'allocation': str(aval)}
+                        need_update = True
+
+                    if need_update:
+                        cursor.execute("UPDATE finance_accounts SET config_params=%s WHERE id=%s", (json.dumps(parsed, ensure_ascii=False), row['id']))
+                else:
+                    # 插入新的账户行
+                    parsed = {'allocation': str(aval)}
+                    cursor.execute(
+                        "INSERT INTO finance_accounts(account_name, account_type, balance, config_params) VALUES (%s,%s,%s,%s)",
+                        (atype, atype, 0, json.dumps(parsed, ensure_ascii=False))
+                    )
+            logger.info("已确保各资金池行存在且写入默认 allocation 到 config_params")
+        except Exception as e:
+            logger.debug(f"⚠️ 确保各资金池 config_params 写入失败（已忽略）: {e}")
 
     def create_test_data(self, cursor, conn) -> int:
         logger.info("\n--- 创建测试数据 ---")

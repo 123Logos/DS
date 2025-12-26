@@ -5,6 +5,7 @@
 # 3. merchant_points同步支持小数精度处理
 
 import logging
+import json
 from decimal import Decimal
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
@@ -252,8 +253,13 @@ class FinanceService:
                     )
                     logger.debug(f"用户{user_id}获得积分: +{normal_points_earned:.4f}")
 
-            # 9. 更新平台资金池（所有商品总金额×80%）
-            platform_revenue = final_amount * Decimal('0.80')
+            # 9. 更新平台资金池（使用动态配置的 merchant_balance）
+            try:
+                allocs = self.get_pool_allocations()
+                platform_revenue = final_amount * allocs.get('merchant_balance', Decimal('0.80'))
+            except Exception:
+                platform_revenue = final_amount * Decimal('0.80')
+
             cur.execute(
                 "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'platform_revenue_pool'",
                 (platform_revenue,)
@@ -271,28 +277,51 @@ class FinanceService:
                  new_balance, 'income', f"订单#{order_id} 平台收入¥{platform_revenue:.2f}")
             )
 
-            # 10. 分配其他资金池（公益基金、周补贴池等）
-            for purpose, percent in ALLOCATIONS.items():
-                if purpose == AllocationKey.PLATFORM_REVENUE_POOL:
-                    continue
-                alloc_amount = final_amount * percent
+            # 10. 使用动态配置分配其他资金池（按 account_type 的 allocation）
+            try:
+                pools_cfg = allocs
+            except Exception:
+                pools_cfg = None
 
-                cur.execute(
-                    "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = %s",
-                    (alloc_amount, purpose.value)
-                )
-
-                # 记录流水
-                cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (purpose.value,))
-                new_balance = Decimal(str(cur.fetchone()['balance'] or 0))
-
-                cur.execute(
-                    """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
-                       flow_type, remark, created_at)
-                       VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
-                    (purpose.value, PLATFORM_MERCHANT_ID, alloc_amount,
-                     new_balance, 'income', f"订单#{order_id} {purpose.value}池¥{alloc_amount:.2f}")
-                )
+            if pools_cfg:
+                for atype, ratio in pools_cfg.items():
+                    if atype == 'merchant_balance':
+                        continue
+                    try:
+                        alloc_amount = final_amount * ratio
+                        cur.execute(
+                            "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = %s",
+                            (alloc_amount, atype)
+                        )
+                        cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (atype,))
+                        new_balance = Decimal(str(cur.fetchone()['balance'] or 0))
+                        cur.execute(
+                            """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
+                               flow_type, remark, created_at)
+                               VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+                            (atype, PLATFORM_MERCHANT_ID, alloc_amount, new_balance, 'income', f"订单#{order_id} {atype}池¥{alloc_amount:.2f}")
+                        )
+                    except Exception as e:
+                        logger.error(f"动态分配到池子 {atype} 失败: {e}")
+            else:
+                # 回退到旧的 ALLOCATIONS 配置
+                for purpose, percent in ALLOCATIONS.items():
+                    if purpose == AllocationKey.PLATFORM_REVENUE_POOL:
+                        continue
+                    alloc_amount = final_amount * percent
+                    cur.execute(
+                        "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = %s",
+                        (alloc_amount, purpose.value)
+                    )
+                    cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (purpose.value,))
+                    new_balance = Decimal(str(cur.fetchone()['balance'] or 0))
+                    cur.execute(
+                        """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
+                           flow_type, remark, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+                        (purpose.value, PLATFORM_MERCHANT_ID, alloc_amount,
+                         new_balance, 'income', f"订单#{order_id} {purpose.value}池¥{alloc_amount:.2f}")
+                    )
 
             logger.debug(f"订单结算成功: ID={order_id}, 奖励基数¥{single_member_price}")
             return order_id
@@ -447,7 +476,11 @@ class FinanceService:
     # ==================== 资金池分配（v2版本） ====================
     def _allocate_funds_to_pools_v2(self, cur, order_id: int, total_amount: Decimal) -> None:
         """资金池分配（v2：修复版，为所有池子写入流水）"""
-        platform_revenue = total_amount * Decimal('0.80')
+        # 读取运行时配置
+        allocs = self.get_pool_allocations()
+
+        # 商家/平台收入部分使用 merchant_balance
+        platform_revenue = total_amount * allocs.get('merchant_balance', Decimal('0.80'))
 
         # 更新平台收入池余额
         cur.execute(
@@ -468,30 +501,36 @@ class FinanceService:
         )
         logger.debug(f"平台收入池增加: {platform_revenue:.4f}（已写入流水）")
 
-        # 分配其他资金池（公益基金、周补贴池等）
-        for purpose, percent in ALLOCATIONS.items():
-            if purpose == AllocationKey.PLATFORM_REVENUE_POOL:
+        # 使用动态配置按行分配到各池子（排除 merchant_balance）
+        for atype, ratio in allocs.items():
+            if atype == 'merchant_balance':
                 continue
-            alloc_amount = total_amount * percent
+            try:
+                alloc_amount = total_amount * ratio
 
-            # 更新池子余额
-            cur.execute(
-                "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = %s",
-                (alloc_amount, purpose.value)
-            )
+                # 确保对应的 finance_accounts 行存在
+                cur.execute(
+                    "INSERT INTO finance_accounts (account_name, account_type, balance) VALUES (%s, %s, 0) ON DUPLICATE KEY UPDATE account_name=VALUES(account_name)",
+                    (atype, atype)
+                )
 
-            # ==================== 关键修复：为每个池子写入流水 ====================
-            cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (purpose.value,))
-            new_balance = Decimal(str(cur.fetchone()['balance'] or 0))
+                cur.execute(
+                    "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = %s",
+                    (alloc_amount, atype)
+                )
 
-            cur.execute(
-                """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
-                   flow_type, remark, created_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
-                (purpose.value, PLATFORM_MERCHANT_ID, alloc_amount,
-                 new_balance, 'income', f"会员订单#{order_id} {purpose.value}池¥{alloc_amount:.2f}")
-            )
-            logger.debug(f"池子 {purpose.value} 增加: {alloc_amount:.4f}（已写入流水）")
+                cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (atype,))
+                new_balance = Decimal(str(cur.fetchone()['balance'] or 0))
+
+                cur.execute(
+                    """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
+                       flow_type, remark, created_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+                    (atype, PLATFORM_MERCHANT_ID, alloc_amount, new_balance, 'income', f"会员订单#{order_id} {atype}池¥{alloc_amount:.2f}")
+                )
+                logger.debug(f"池子 {atype} 增加: {alloc_amount:.4f}（已写入流水）")
+            except Exception as e:
+                logger.error(f"分配到池子 {atype} 失败: {e}")
 
     def _create_pending_rewards_v2(self, cur, order_id: int, buyer_id: int,
                                    old_level: int, new_level: int,
@@ -714,18 +753,32 @@ class FinanceService:
 
     # ==================== 关键修改3：member_points积分发放 ====================
     def _allocate_funds_to_pools(self, order_id: int, total_amount: Decimal) -> None:
-        platform_revenue = total_amount * Decimal('0.80')
+        try:
+            allocs = self.get_pool_allocations()
+            platform_revenue = total_amount * allocs.get('merchant_balance', Decimal('0.80'))
+        except Exception:
+            allocs = None
+            platform_revenue = total_amount * Decimal('0.80')
+
         # 使用 helper 统一处理平台池子余额变更与流水
         self._add_pool_balance('platform_revenue_pool', platform_revenue, f"订单#{order_id} 平台收入")
 
-        for purpose, percent in ALLOCATIONS.items():
-            if purpose == AllocationKey.PLATFORM_REVENUE_POOL:
-                continue
-            alloc_amount = total_amount * percent
-            # 统一通过 helper 更新各类池子与记录流水
-            self._add_pool_balance(purpose.value, alloc_amount, f"订单#{order_id} 分配到{purpose.value}")
-            if purpose == AllocationKey.PUBLIC_WELFARE:
-                logger.debug(f"公益基金获得: ¥{alloc_amount}")
+        if allocs:
+            for atype, ratio in allocs.items():
+                if atype == 'merchant_balance':
+                    continue
+                alloc_amount = total_amount * ratio
+                self._add_pool_balance(atype, alloc_amount, f"订单#{order_id} 分配到{atype}")
+                if atype == 'public_welfare':
+                    logger.debug(f"公益基金获得: ¥{alloc_amount}")
+        else:
+            for purpose, percent in ALLOCATIONS.items():
+                if purpose == AllocationKey.PLATFORM_REVENUE_POOL:
+                    continue
+                alloc_amount = total_amount * percent
+                self._add_pool_balance(purpose.value, alloc_amount, f"订单#{order_id} 分配到{purpose.value}")
+                if purpose == AllocationKey.PUBLIC_WELFARE:
+                    logger.debug(f"公益基金获得: ¥{alloc_amount}")
 
     def audit_and_distribute_rewards(self, reward_ids: List[int], approve: bool, auditor: str = 'admin') -> bool:
         """批量审核奖励并发放优惠券"""
@@ -1346,6 +1399,164 @@ class FinanceService:
         return result
         # ========== 临时日志结束 ==========
         # return self.get_account_balance('public_welfare')
+
+    # ==================== 可配置资金池分配（新增） ====================
+    def get_pool_allocations(self) -> Dict[str, Decimal]:
+        """
+        获取当前资金池分配配置。
+
+        返回字典：
+        - merchant_balance: Decimal (如 0.80)
+        - 子池键: Decimal（占比，相对于总订单金额，如 0.01 表示 1%）
+        如果数据库中没有配置，返回默认值（与项目原始占比一致）。
+        """
+        # 我们按行读取 finance_accounts 中每个子池的 config_params.allocation
+        account_keys = [
+            'merchant_balance', 'public_welfare', 'maintain_pool', 'subsidy_pool',
+            'director_pool', 'shop_pool', 'city_pool', 'branch_pool', 'fund_pool'
+        ]
+        cfg_map: Dict[str, Any] = {}
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 确保表有 config_params 列；如果没有则尝试添加（容错）
+                try:
+                    cur.execute("SHOW COLUMNS FROM finance_accounts LIKE 'config_params'")
+                    if not cur.fetchone():
+                        try:
+                            cur.execute("ALTER TABLE finance_accounts ADD COLUMN config_params JSON DEFAULT NULL")
+                            conn.commit()
+                        except Exception as e:
+                            logger.debug(f"无法添加 config_params 列: {e}")
+
+                except Exception:
+                    logger.debug("检查 finance_accounts.config_params 列时出错，继续尝试读取行")
+
+                # 查询表中与我们关心的 account_type 列表匹配的行
+                placeholders = ','.join(['%s'] * len(account_keys))
+                try:
+                    cur.execute(f"SELECT account_type, config_params FROM finance_accounts WHERE account_type IN ({placeholders})", tuple(account_keys))
+                    rows = cur.fetchall()
+                except Exception as e:
+                    logger.error(f"读取 finance_accounts 行失败: {e}")
+                    rows = []
+
+                for r in rows:
+                    at = r.get('account_type')
+                    cp = r.get('config_params')
+                    if not cp:
+                        continue
+                    try:
+                        if isinstance(cp, str):
+                            parsed = json.loads(cp)
+                        else:
+                            parsed = cp
+                        # 支持两种存储形态：{"allocation":"0.01"} 或 直接为字符串数值
+                        if isinstance(parsed, dict) and 'allocation' in parsed:
+                            cfg_map[at] = Decimal(str(parsed['allocation']))
+                        else:
+                            # 可能以前误存为单行 allocations_config map
+                            # parsed 可能是 {'city_pool':'0.01',...}
+                            if isinstance(parsed, dict) and at in parsed:
+                                cfg_map[at] = Decimal(str(parsed[at]))
+                    except Exception:
+                        logger.debug(f"解析 finance_accounts.account_type={at} config_params 失败，忽略")
+
+        # 默认配置（数值为相对于总额的占比）
+        defaults = {
+            'merchant_balance': Decimal('0.80'),
+            'public_welfare': Decimal('0.01'),
+            'maintain_pool': Decimal('0.01'),
+            'subsidy_pool': Decimal('0.12'),
+            'director_pool': Decimal('0.02'),
+            'shop_pool': Decimal('0.01'),
+            'city_pool': Decimal('0.01'),
+            'branch_pool': Decimal('0.005'),
+            'fund_pool': Decimal('0.015')
+        }
+
+        # 用读取到的行优先覆盖默认值
+        result: Dict[str, Decimal] = defaults.copy()
+        for k in defaults.keys():
+            if k in cfg_map:
+                result[k] = cfg_map[k]
+
+        return result
+
+    def _validate_allocations(self, allocs: Dict[str, Any]) -> Dict[str, Decimal]:
+        """校验并规范化传入的 allocations 字典，返回 Decimal 值字典。"""
+        allowed_subpools = {
+            'public_welfare', 'maintain_pool', 'subsidy_pool', 'director_pool',
+            'shop_pool', 'city_pool', 'branch_pool', 'fund_pool'
+        }
+        # merchant_balance 可选，但我们不允许设置超过 1
+        out: Dict[str, Decimal] = {}
+        for k, v in allocs.items():
+            if k not in allowed_subpools and k != 'merchant_balance':
+                raise ValueError(f"未知的资金池键: {k}")
+            try:
+                dec = Decimal(str(v))
+            except Exception:
+                raise ValueError(f"资金池比例必须是数值: {k}")
+            if dec < 0 or dec > 1:
+                raise ValueError(f"资金池比例范围必须在 0..1 之间: {k}")
+            out[k] = dec
+
+        # 校验总和：所有子池之和（不包括 merchant_balance）不得超过 0.20
+        sub_sum = sum((out.get(k, Decimal('0')) for k in allowed_subpools), Decimal('0'))
+        if sub_sum > Decimal('0.20'):
+            raise ValueError("所有子资金池的占比之和不得超过20%（0.20）")
+
+        # 若提供 merchant_balance，则确保 merchant_balance + sub_sum <=1
+        if 'merchant_balance' in out:
+            if out['merchant_balance'] + sub_sum > Decimal('1'):
+                raise ValueError("merchant_balance 与子池之和不得超过 100%")
+
+        return out
+
+    def set_pool_allocations(self, allocations: Dict[str, Any]) -> Dict[str, Decimal]:
+        """
+        设置/更新资金池分配配置，按 `account_type` 将 allocation 写入对应的 `finance_accounts.config_params` 字段。
+
+        校验规则：所有子资金池（非 merchant_balance）的占比和不得超过 0.20（即 20%）。
+        返回保存后的配置（Decimal 值）。
+        """
+        normalized = self._validate_allocations(allocations)
+
+        # 将每个 allocation 写入对应的 finance_accounts 行的 config_params 字段
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                for atype, dec in normalized.items():
+                    try:
+                        cur.execute("SELECT id, config_params FROM finance_accounts WHERE account_type=%s LIMIT 1", (atype,))
+                        row = cur.fetchone()
+                        new_cp = None
+                        if row:
+                            cp = row.get('config_params')
+                            try:
+                                if isinstance(cp, str):
+                                    parsed = json.loads(cp)
+                                else:
+                                    parsed = cp or {}
+                            except Exception:
+                                parsed = {}
+                            if not isinstance(parsed, dict):
+                                parsed = {}
+                            parsed['allocation'] = str(dec)
+                            new_cp = json.dumps(parsed, ensure_ascii=False)
+                            cur.execute("UPDATE finance_accounts SET config_params=%s WHERE id=%s", (new_cp, row['id']))
+                        else:
+                            # account_type 不存在则插入新行
+                            parsed = {'allocation': str(dec)}
+                            cur.execute(
+                                "INSERT INTO finance_accounts(account_name, account_type, balance, config_params) VALUES (%s,%s,%s,%s)",
+                                (atype, atype, 0, json.dumps(parsed, ensure_ascii=False))
+                            )
+                    except Exception as e:
+                        logger.error(f"更新 finance_accounts.account_type={atype} 的 config_params 失败: {e}")
+                conn.commit()
+
+        # 返回最新的合并配置（读取每行）
+        return self.get_pool_allocations()
 
     def get_public_welfare_flow(self, limit: int = 50) -> List[Dict[str, Any]]:
         with get_conn() as conn:
@@ -4669,8 +4880,25 @@ def _execute_split(cur, order_number: str, total: Decimal):
         order_number: 订单号
         total: 订单总金额
     """
-    # 商家分得 80%
-    merchant = total * Decimal("0.8")
+    # 动态读取配置（优先从 finance_accounts 行中读取 allocation）
+    try:
+        svc = FinanceService()
+        allocs = svc.get_pool_allocations()
+        merchant = total * allocs.get('merchant_balance', Decimal('0.8'))
+    except Exception:
+        merchant = total * Decimal("0.8")
+
+    # 单元级日志：记录订单与初始分配信息
+    try:
+        logger.debug(f"_execute_split START order={order_number} total={total:.2f} merchant={merchant:.2f}")
+        if 'allocs' in locals():
+            try:
+                ratios_str = {k: str(v) for k, v in allocs.items()}
+                logger.debug(f"_execute_split ratios: {ratios_str}")
+            except Exception:
+                logger.debug("_execute_split: 无法序列化 allocs 比例")
+    except Exception:
+        pass
 
     # 更新商家余额（使用 users 表）
     cur.execute(
@@ -4696,64 +4924,65 @@ def _execute_split(cur, order_number: str, total: Decimal):
         ("merchant_balance", merchant, merchant_balance_after, "income", f"订单分账: {order_number}")
     )
 
-    # 平台分得 20%，再分配到各个资金池
-    pool_total = total * Decimal("0.2")
-    # 池子类型到账户类型的映射
-    pool_mapping = {
-        "public": "public_welfare",  # 公益基金
-        "maintain": "maintain_pool",  # 平台维护
-        "subsidy": "subsidy_pool",  # 周补贴池
-        "director": "director_pool",  # 荣誉董事分红
-        "shop": "shop_pool",  # 社区店
-        "city": "city_pool",  # 城市运营中心
-        "branch": "branch_pool",  # 大区分公司
-        "fund": "fund_pool"  # 事业发展基金
-    }
-    pools = {
-        "public": 0.01,  # 公益基金
-        "maintain": 0.01,  # 平台维护
-        "subsidy": 0.12,  # 周补贴池
-        "director": 0.02,  # 荣誉董事分红
-        "shop": 0.01,  # 社区店
-        "city": 0.01,  # 城市运营中心
-        "branch": 0.005,  # 大区分公司
-        "fund": 0.015  # 事业发展基金
-    }
+    # 按每个子池的配置分配（allocs 中的键是 account_type）
+    try:
+        # pools_to_assign: keys except merchant_balance
+        pools_to_assign = {k: v for k, v in allocs.items() if k != 'merchant_balance'}
+    except Exception:
+        pools_to_assign = {
+            'public_welfare': Decimal('0.01'),
+            'maintain_pool': Decimal('0.01'),
+            'subsidy_pool': Decimal('0.12'),
+            'director_pool': Decimal('0.02'),
+            'shop_pool': Decimal('0.01'),
+            'city_pool': Decimal('0.01'),
+            'branch_pool': Decimal('0.005'),
+            'fund_pool': Decimal('0.015')
+        }
 
-    for pool_key, pool_ratio in pools.items():
-        amt = pool_total * Decimal(str(pool_ratio))
-        account_type = pool_mapping[pool_key]
+    for account_type, ratio in pools_to_assign.items():
+        try:
+            amt = total * ratio
+            # 单元级日志：准备分配到指定资金池的金额与比例
+            logger.debug(f"_execute_split allocating to {account_type}: ratio={ratio} amt={amt:.2f}")
 
-        # 确保 finance_accounts 中存在该账户类型
-        cur.execute(
-            "INSERT INTO finance_accounts (account_name, account_type, balance) VALUES (%s, %s, 0) ON DUPLICATE KEY "
-            "UPDATE account_name=VALUES(account_name)",
-            (pool_key, account_type)
-        )
+            # 确保 finance_accounts 中存在该账户类型
+            cur.execute(
+                "INSERT INTO finance_accounts (account_name, account_type, balance) VALUES (%s, %s, 0) ON DUPLICATE KEY "
+                "UPDATE account_name=VALUES(account_name)",
+                (account_type, account_type)
+            )
 
-        # 更新资金池余额
-        cur.execute(
-            "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = %s",
-            (amt, account_type)
-        )
+            # 更新资金池余额
+            cur.execute(
+                "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = %s",
+                (amt, account_type)
+            )
 
-        # 获取更新后的余额
-        select_sql = build_dynamic_select(
-            cur,
-            "finance_accounts",
-            where_clause="account_type = %s",
-            select_fields=["balance"]
-        )
-        cur.execute(select_sql, (account_type,))
-        balance_row = cur.fetchone()
-        balance_after = balance_row["balance"] if balance_row else amt
+            # 获取更新后的余额
+            select_sql = build_dynamic_select(
+                cur,
+                "finance_accounts",
+                where_clause="account_type = %s",
+                select_fields=["balance"]
+            )
+            cur.execute(select_sql, (account_type,))
+            balance_row = cur.fetchone()
+            balance_after = balance_row["balance"] if balance_row else amt
 
-        # 记录流水到 account_flow
-        cur.execute(
-            """INSERT INTO account_flow (account_type, change_amount, balance_after, flow_type, remark, created_at)
-               VALUES (%s, %s, %s, %s, %s, NOW())""",
-            (account_type, amt, balance_after, "income", f"订单分账: {order_number}")
-        )
+            # 记录流水到 account_flow
+            cur.execute(
+                """INSERT INTO account_flow (account_type, change_amount, balance_after, flow_type, remark, created_at)
+                   VALUES (%s, %s, %s, %s, %s, NOW())""",
+                (account_type, amt, balance_after, "income", f"订单分账: {order_number}")
+            )
+            # 单元级日志：记录分配后余额
+            try:
+                logger.debug(f"_execute_split {account_type} balance_after={Decimal(str(balance_after)):.2f}")
+            except Exception:
+                logger.debug(f"_execute_split {account_type} balance_after (unserializable): {balance_after}")
+        except Exception as e:
+            logger.error(f"分配到池子 {account_type} 时出错: {e}")
 
 
 def reverse_split_on_refund(order_number: str):
