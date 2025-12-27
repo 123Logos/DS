@@ -3076,35 +3076,35 @@ class FinanceService:
                              start_date: str, end_date: str,
                              page: int = 1, page_size: int = 20) -> Dict[str, Any]:
         """
-        平台资金池变动明细报表
+        平台资金池变动明细报表（修复版）
 
-        查询指定资金池的每一笔流水，包括收入、支出和余额变化
-
-        Args:
-            account_type: 资金池类型（如 'public_welfare', 'subsidy_pool' 等）
-            start_date: 开始日期 yyyy-MM-dd
-            end_date: 结束日期 yyyy-MM-dd
-            page: 页码
-            page_size: 每页条数
-
-        Returns:
-            包含汇总统计和流水明细的报表数据
+        关键修复：
+        - ending_balance 改为查询 finance_accounts 表的真实余额，而非 MAX(balance_after)
+        - 净变动(net_change)通过 income - expense 计算，确保数据一致性
         """
         logger.info(f"生成资金池流水报表: 账户={account_type}, 日期范围={start_date}至{end_date}")
 
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # 汇总统计
+                # ==================== ✅ 关键修复：查询真实当前余额 ====================
+                # 直接从 finance_accounts 表获取最新余额，而非从流水表计算
+                cur.execute(
+                    "SELECT balance FROM finance_accounts WHERE account_type = %s",
+                    (account_type,)
+                )
+                account_row = cur.fetchone()
+                actual_current_balance = Decimal(str(account_row['balance'] if account_row else 0))
+                # ====================================================================
+
+                # 汇总统计（不包含 ending_balance）
                 cur.execute("""
                     SELECT 
                         COUNT(*) as total_transactions,
                         SUM(CASE WHEN flow_type = 'income' THEN change_amount ELSE 0 END) as total_income,
-                        SUM(CASE WHEN flow_type = 'expense' THEN change_amount ELSE 0 END) as total_expense,
-                        MAX(balance_after) as ending_balance
+                        SUM(CASE WHEN flow_type = 'expense' THEN change_amount ELSE 0 END) as total_expense
                     FROM account_flow
                     WHERE account_type = %s AND DATE(created_at) BETWEEN %s AND %s
                 """, (account_type, start_date, end_date))
-
                 summary = cur.fetchone()
 
                 # 总记录数
@@ -3115,7 +3115,7 @@ class FinanceService:
                 """, (account_type, start_date, end_date))
                 total_count = cur.fetchone()['total'] or 0
 
-                # 明细查询
+                # 明细查询（按时间倒序）
                 offset = (page - 1) * page_size
                 cur.execute("""
                     SELECT 
@@ -3123,39 +3123,64 @@ class FinanceService:
                         flow_type, remark, created_at
                     FROM account_flow
                     WHERE account_type = %s AND DATE(created_at) BETWEEN %s AND %s
-                    ORDER BY created_at DESC
+                    ORDER BY created_at DESC, id DESC
                     LIMIT %s OFFSET %s
                 """, (account_type, start_date, end_date, page_size, offset))
-
                 records = cur.fetchall()
 
-                # 获取用户名称
+                # ==================== ✅ 获取用户名称（优化） ====================
                 def get_user_name(uid):
                     if not uid:
                         return "系统"
+                    if uid == 0:  # 平台商户ID
+                        return "平台"
                     try:
                         cur.execute("SELECT name FROM users WHERE id = %s", (uid,))
                         row = cur.fetchone()
-                        return row['name'] if row else "未知用户"
-                    except:
-                        return f"未知用户:{uid}"
+                        return row['name'] if row else f"未知用户:{uid}"
+                    except Exception:
+                        return f"查询失败:{uid}"
+
+                # ====================================================================
+
+                # ==================== ✅ 计算净变动 ====================
+                # 净变动 = 总收入 - 总支出（与流水表逻辑一致）
+                total_income = Decimal(str(summary['total_income'] or 0))
+                total_expense = Decimal(str(summary['total_expense'] or 0))
+                net_change = total_income - total_expense
+
+                # 验证数据一致性（可选，调试用）
+                # 当前余额 ≈ 期初余额 + 净变动（如果查询了期初余额）
+                # ====================================================================
+
+                # 账户类型中文名称映射
+                account_name_map = {
+                    "public_welfare": "公益基金",
+                    "subsidy_pool": "周补贴池",
+                    "honor_director": "荣誉董事分红池",
+                    "company_points": "公司积分池",
+                    "platform_revenue_pool": "平台收入池",
+                    "maintain_pool": "平台维护池",
+                    "director_pool": "荣誉董事池",
+                    "shop_pool": "社区店池",
+                    "city_pool": "城市运营中心池",
+                    "branch_pool": "大区分公司池",
+                    "fund_pool": "事业发展基金池",
+                    "merchant_balance": "商户余额池"
+                }
 
                 return {
                     "summary": {
                         "report_type": "pool_flow",
                         "account_type": account_type,
-                        "account_name": {
-                            "public_welfare": "公益基金",
-                            "subsidy_pool": "周补贴池",
-                            "honor_director": "荣誉董事分红池",
-                            "company_points": "公司积分池",
-                            "platform_revenue_pool": "平台收入池"
-                        }.get(account_type, account_type),
+                        "account_name": account_name_map.get(account_type, account_type),
                         "total_transactions": summary['total_transactions'] or 0,
-                        "total_income": float(summary['total_income'] or 0),
-                        "total_expense": float(summary['total_expense'] or 0),
-                        "net_change": float((summary['total_income'] or 0) - (summary['total_expense'] or 0)),
-                        "ending_balance": float(summary['ending_balance'] or 0)
+                        "total_income": float(total_income),
+                        "total_expense": float(total_expense),
+                        "net_change": float(net_change),
+                        # ✅ 修复：使用真实的当前余额
+                        "ending_balance": float(actual_current_balance),
+                        "query_date_range": f"{start_date} 至 {end_date}"
                     },
                     "pagination": {
                         "page": page,
@@ -3169,12 +3194,14 @@ class FinanceService:
                             "related_user": r['related_user'],
                             "user_name": get_user_name(r['related_user']),
                             "change_amount": float(r['change_amount']),
-                            "balance_after": float(r['balance_after']) if r['balance_after'] else None,
+                            "balance_after": float(r['balance_after']) if r['balance_after'] is not None else None,
                             "flow_type": r['flow_type'],
                             "remark": r['remark'],
                             "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S")
                         } for r in records
-                    ]
+                    ],
+                    "data_source": "finance_accounts + account_flow",  # 数据来源说明
+                    "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
     # ==================== 联创星级点数流水报表 ====================
     def get_unilevel_points_flow_report(self, user_id: Optional[int] = None,
