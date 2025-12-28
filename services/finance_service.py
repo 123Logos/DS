@@ -3089,32 +3089,29 @@ class FinanceService:
     def get_pool_flow_report(self, account_type: str,
                              start_date: str, end_date: str,
                              page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        """
+        平台资金池变动明细报表（修复版）
+
+        关键修复：
+        - ending_balance 改为查询 finance_accounts 表的真实余额，而非 MAX(balance_after)
+        - 净变动(net_change)通过 income - expense 计算，确保数据一致性
+        """
         logger.info(f"生成资金池流水报表: 账户={account_type}, 日期范围={start_date}至{end_date}")
 
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # ==================== 查询平台余额（保持不变） ====================
-                cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (account_type,))
+                # ==================== ✅ 关键修复：查询真实当前余额 ====================
+                # 直接从 finance_accounts 表获取最新余额，而非从流水表计算
+                cur.execute(
+                    "SELECT balance FROM finance_accounts WHERE account_type = %s",
+                    (account_type,)
+                )
                 account_row = cur.fetchone()
                 actual_current_balance = Decimal(str(account_row['balance'] if account_row else 0))
+                # ====================================================================
 
-                # ==================== ✅ 智能过滤：只对 honor_director 强制过滤 ====================
-                where_conditions = [
-                    "account_type = %s",
-                    "DATE(created_at) BETWEEN %s AND %s"
-                ]
-                params = [account_type, start_date, end_date]
-
-                # 关键判断：只有联创分红池才过滤 related_user=NULL
-                # 其他池子（如 referral_points, team_reward_points）保留用户记录
-                if account_type == 'honor_director':
-                    where_conditions.append("related_user IS NULL")
-
-                # ==================== 后续查询逻辑（保持不变） ====================
-                where_sql = " AND ".join(where_conditions)
-
-                # 汇总统计
-                cur.execute(f"""
+                # 汇总统计（不包含 ending_balance）
+                cur.execute("""
                     SELECT 
                         COUNT(*) as total_transactions,
                         SUM(CASE WHEN flow_type = 'income' THEN change_amount ELSE 0 END) as total_income,
