@@ -1168,7 +1168,7 @@ class FinanceService:
                         # 使用 _add_pool_balance 来统一处理余额更新和流水记录
                         self._add_pool_balance(cur, 'subsidy_pool', -subsidy_amount,
                                                f"周补贴发放 - 用户{user_id}获得{points_to_add:.4f}点数",
-                                               related_user=user_id)
+                                               related_user=None)
 
                         # 记录发放历史到 weekly_subsidy_records
                         cur.execute(
@@ -2183,20 +2183,31 @@ class FinanceService:
         # 2. 查询所有联创用户
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # === 关键修复：使用 JOIN + BETWEEN 替代 EXISTS ===
+                cur.execute("SET time_zone = '+08:00'")
+
+                # 1. 查询分红池余额
+                cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'honor_director'")
+                row = cur.fetchone()
+                pool_balance = Decimal(str(row['balance'] if row and row['balance'] is not None else 0))
+
+                # 2. ✅ 修正查询：使用 INNER JOIN + GROUP BY
                 cur.execute("""
                     SELECT uu.user_id, uu.level, u.name, u.member_level
                     FROM user_unilevel uu
                     JOIN users u ON uu.user_id = u.id
+                    INNER JOIN (
+                        SELECT DISTINCT o.user_id
+                        FROM orders o
+                        WHERE o.status IN ('pending_ship','pending_recv','completed')
+                          AND o.created_at >= DATE_FORMAT(CURDATE(), '%Y-%m-01')
+                          AND o.created_at < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)
+                    ) AS active_users ON uu.user_id = active_users.user_id
                     WHERE uu.level IN (1, 2, 3)
-                    AND EXISTS (
-                        SELECT 1 FROM orders o
-                        WHERE o.user_id = uu.user_id
-                          AND o.status IN ('pending_ship','pending_recv','completed')
-                          AND o.created_at >= DATE_FORMAT(CURDATE(), '%%Y-%%m-01')
-                          AND o.created_at < DATE_ADD(DATE_FORMAT(CURDATE(), '%%Y-%%m-01'), INTERVAL 1 MONTH)
-                    )
                 """)
                 unilevel_users = cur.fetchall()
+
+                logger.error(f"=== DEBUG: 联创用户数={len(unilevel_users)}，数据={unilevel_users}")
 
         if not unilevel_users:
             return {
@@ -2310,18 +2321,21 @@ class FinanceService:
         # 查询所有联创用户
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # === 使用相同的 JOIN 查询 ===
+                cur.execute("SET time_zone = '+08:00'")
+
                 cur.execute("""
                     SELECT uu.user_id, uu.level, u.name, u.member_level
                     FROM user_unilevel uu
                     JOIN users u ON uu.user_id = u.id
+                    INNER JOIN (
+                        SELECT DISTINCT o.user_id
+                        FROM orders o
+                        WHERE o.status IN ('pending_ship','pending_recv','completed')
+                          AND o.created_at >= DATE_FORMAT(CURDATE(), '%Y-%m-01')
+                          AND o.created_at < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)
+                    ) AS active_users ON uu.user_id = active_users.user_id
                     WHERE uu.level IN (1, 2, 3)
-                    AND EXISTS (
-                        SELECT 1 FROM orders o
-                        WHERE o.user_id = uu.user_id
-                          AND o.status IN ('pending_ship','pending_recv','completed')
-                          AND o.created_at >= DATE_FORMAT(CURDATE(), '%%Y-%%m-01')
-                          AND o.created_at < DATE_ADD(DATE_FORMAT(CURDATE(), '%%Y-%%m-01'), INTERVAL 1 MONTH)
-                    )
                 """)
                 unilevel_users = cur.fetchall()
 
@@ -2393,7 +2407,7 @@ class FinanceService:
                         # 使用 _add_pool_balance 来统一处理余额更新和流水记录
                         self._add_pool_balance(cur, 'honor_director', -points_to_add,
                                                f"联创星级分红发放 - 用户{user_id}获得{points_to_add:.4f}点数",
-                                               related_user=user_id)
+                                               related_user=None)
 
                         total_distributed += points_to_add
                         logger.debug(f"用户{user_id}获得联创星级分红: {points_to_add:.4f}点数")
@@ -3103,29 +3117,29 @@ class FinanceService:
                         SUM(CASE WHEN flow_type = 'income' THEN change_amount ELSE 0 END) as total_income,
                         SUM(CASE WHEN flow_type = 'expense' THEN change_amount ELSE 0 END) as total_expense
                     FROM account_flow
-                    WHERE account_type = %s AND DATE(created_at) BETWEEN %s AND %s
-                """, (account_type, start_date, end_date))
+                    WHERE {where_sql}
+                """, tuple(params))
                 summary = cur.fetchone()
 
                 # 总记录数
-                cur.execute("""
+                cur.execute(f"""
                     SELECT COUNT(*) as total 
                     FROM account_flow
-                    WHERE account_type = %s AND DATE(created_at) BETWEEN %s AND %s
-                """, (account_type, start_date, end_date))
+                    WHERE {where_sql}
+                """, tuple(params))
                 total_count = cur.fetchone()['total'] or 0
 
-                # 明细查询（按时间倒序）
+                # 明细查询（保持不变）
                 offset = (page - 1) * page_size
-                cur.execute("""
+                cur.execute(f"""
                     SELECT 
                         id, related_user, change_amount, balance_after, 
                         flow_type, remark, created_at
                     FROM account_flow
-                    WHERE account_type = %s AND DATE(created_at) BETWEEN %s AND %s
+                    WHERE {where_sql}
                     ORDER BY created_at DESC, id DESC
                     LIMIT %s OFFSET %s
-                """, (account_type, start_date, end_date, page_size, offset))
+                """, tuple(params + [page_size, offset]))
                 records = cur.fetchall()
 
                 # ==================== ✅ 获取用户名称（优化） ====================
@@ -5465,3 +5479,4 @@ def generate_statement():
                 (1, yesterday, opening, income, withdraw_amount, closing)
             )
             conn.commit()
+

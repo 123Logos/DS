@@ -6,6 +6,7 @@ from core.database import get_conn
 from core.table_access import build_dynamic_select, _quote_identifier
 import string
 import random
+from core.logging import get_logger
 import os
 from core.config import AVATAR_UPLOAD_DIR
 from fastapi import UploadFile, HTTPException
@@ -14,7 +15,7 @@ from pathlib import Path
 from PIL import Image
 import json
 
-
+logger = get_logger(__name__)
 
 # ========== 用户状态枚举 ==========
 class UserStatus(IntEnum):
