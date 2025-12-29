@@ -3085,6 +3085,197 @@ class FinanceService:
                         } for r in records
                     ]
                 }
+    # ==================== 总会员积分明细报表（新增） ====================
+    def get_member_points_detail_report(self, user_id: Optional[int] = None,
+                                        start_date: Optional[str] = None,
+                                        end_date: Optional[str] = None,
+                                        page: int = 1,
+                                        page_size: int = 20) -> Dict[str, Any]:
+        """
+        总会员积分明细报表
+
+        查询用户member_points（会员积分）的详细流水，包括：
+        - 积分收入（购买商品获得）
+        - 积分支出（订单抵扣使用）
+        - 期初余额和期末余额
+        - 关联订单信息
+
+        Args:
+            user_id: 用户ID（可选，查询所有用户则留空）
+            start_date: 开始日期 yyyy-MM-dd
+            end_date: 结束日期 yyyy-MM-dd
+            page: 页码
+            page_size: 每页条数
+
+        Returns:
+            包含汇总、分页和明细的字典
+        """
+        logger.info(f"生成总会员积分明细报表: 用户={user_id or '所有用户'}, 日期范围={start_date}至{end_date}")
+
+        from datetime import datetime, date
+
+        # 构建WHERE条件
+        where_conditions = ["pl.type = 'member'"]  # 只查询会员积分类型
+        params = []
+
+        if user_id:
+            where_conditions.append("pl.user_id = %s")
+            params.append(user_id)
+
+        if start_date:
+            where_conditions.append("DATE(pl.created_at) >= %s")
+            params.append(start_date)
+
+            # 计算期初余额：查询开始日期之前的最后一条记录
+            opening_balance_sql = f"""
+                SELECT pl.balance_after 
+                FROM points_log pl
+                WHERE {' AND '.join(where_conditions[:-1])}  # 排除日期条件
+                ORDER BY pl.created_at DESC 
+                LIMIT 1
+            """
+        else:
+            opening_balance_sql = None
+
+        if end_date:
+            where_conditions.append("DATE(pl.created_at) <= %s")
+            params.append(end_date)
+
+        where_sql = " AND ".join(where_conditions)
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 1. 查询总记录数
+                count_sql = f"""
+                    SELECT COUNT(*) as total 
+                    FROM points_log pl
+                    WHERE {where_sql}
+                """
+                cur.execute(count_sql, tuple(params))
+                total_count = cur.fetchone()['total'] or 0
+
+                # 2. 查询期初余额
+                opening_balance = Decimal('0')
+                if start_date and user_id:
+                    # 查询该用户在开始日期前的最后余额
+                    cur.execute("""
+                        SELECT balance_after 
+                        FROM points_log 
+                        WHERE user_id = %s AND type = 'member' AND DATE(created_at) < %s
+                        ORDER BY created_at DESC 
+                        LIMIT 1
+                    """, (user_id, start_date))
+                    opening_row = cur.fetchone()
+                    if opening_row:
+                        opening_balance = Decimal(str(opening_row['balance_after'] or 0))
+
+                # 3. 查询明细（分页）
+                offset = (page - 1) * page_size
+                detail_sql = f"""
+                    SELECT 
+                        pl.id as log_id,
+                        pl.user_id,
+                        u.name as user_name,
+                        pl.change_amount,
+                        pl.balance_after,
+                        pl.reason,
+                        pl.related_order,
+                        o.order_number,
+                        pl.created_at
+                    FROM points_log pl
+                    JOIN users u ON pl.user_id = u.id
+                    LEFT JOIN orders o ON pl.related_order = o.id
+                    WHERE {where_sql}
+                    ORDER BY pl.created_at DESC, pl.id DESC
+                    LIMIT %s OFFSET %s
+                """
+                params.extend([page_size, offset])
+                cur.execute(detail_sql, tuple(params))
+                records = cur.fetchall()
+
+                # 4. 汇总统计
+                summary_sql = f"""
+                    SELECT 
+                        COUNT(*) as total_records,
+                        SUM(CASE WHEN pl.change_amount > 0 THEN pl.change_amount ELSE 0 END) as total_income,
+                        SUM(CASE WHEN pl.change_amount < 0 THEN ABS(pl.change_amount) ELSE 0 END) as total_expense,
+                        SUM(pl.change_amount) as net_change
+                    FROM points_log pl
+                    WHERE {where_sql.replace(' AND pl.user_id = %s', '') if user_id else where_sql}
+                """
+                if user_id:
+                    # 查询单个用户时，汇总统计也按该用户
+                    cur.execute(summary_sql, (user_id, start_date, end_date) if start_date and end_date else (user_id,))
+                else:
+                    # 查询所有用户
+                    if start_date and end_date:
+                        cur.execute(summary_sql, (start_date, end_date))
+                    elif start_date:
+                        cur.execute(summary_sql, (start_date,))
+                    elif end_date:
+                        cur.execute(summary_sql, (end_date,))
+                    else:
+                        cur.execute(summary_sql)
+
+                summary = cur.fetchone()
+
+                # 5. 计算期末余额
+                closing_balance = Decimal('0')
+                if records:
+                    # 如果有记录，期末余额就是最后一条记录的balance_after
+                    closing_balance = Decimal(str(records[0]['balance_after'] or 0))
+                elif user_id:
+                    # 如果没有记录，查询当前余额
+                    cur.execute("""
+                        SELECT COALESCE(member_points, 0) as current_balance
+                        FROM users 
+                        WHERE id = %s
+                    """, (user_id,))
+                    balance_row = cur.fetchone()
+                    closing_balance = Decimal(str(balance_row['current_balance'] if balance_row else 0))
+
+                # 6. 获取用户信息（如果是查询单个用户）
+                user_info = None
+                if user_id and records:
+                    user_info = {
+                        "user_id": records[0]['user_id'],
+                        "user_name": records[0]['user_name']
+                    }
+
+                return {
+                    "summary": {
+                        "report_type": "member_points_detail",
+                        "query_date_range": f"{start_date or '开始'} 至 {end_date or '结束'}",
+                        "user_filter": user_id or "所有用户",
+                        "opening_balance": float(opening_balance),
+                        "closing_balance": float(closing_balance),
+                        "total_records": summary['total_records'] or 0,
+                        "total_income": float(summary['total_income'] or 0),
+                        "total_expense": float(summary['total_expense'] or 0),
+                        "net_change": float(summary['net_change'] or 0)
+                    },
+                    "pagination": {
+                        "page": page,
+                        "page_size": page_size,
+                        "total": total_count,
+                        "total_pages": (total_count + page_size - 1) // page_size if total_count > 0 else 1
+                    },
+                    "user_info": user_info,
+                    "records": [
+                        {
+                            "log_id": r['log_id'],
+                            "user_id": r['user_id'],
+                            "user_name": r['user_name'],
+                            "change_amount": float(r['change_amount'] or 0),
+                            "balance_after": float(r['balance_after'] or 0),
+                            "flow_type": "收入" if r['change_amount'] > 0 else "支出",
+                            "reason": r['reason'],
+                            "related_order_id": r['related_order'],
+                            "order_number": r['order_number'],
+                            "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S") if r['created_at'] else None
+                        } for r in records
+                    ]
+                }
     # ==================== 平台资金池变动报表（中优先级） ====================
     def get_pool_flow_report(self, account_type: str,
                              start_date: str, end_date: str,
@@ -3093,27 +3284,25 @@ class FinanceService:
 
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # ==================== 查询平台余额（保持不变） ====================
+                # 查询平台余额
                 cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (account_type,))
                 account_row = cur.fetchone()
                 actual_current_balance = Decimal(str(account_row['balance'] if account_row else 0))
 
-                # ==================== ✅ 智能过滤：只对 honor_director 强制过滤 ====================
+                # 智能过滤：只对 honor_director 强制过滤
                 where_conditions = [
                     "account_type = %s",
                     "DATE(created_at) BETWEEN %s AND %s"
                 ]
                 params = [account_type, start_date, end_date]
 
-                # 关键判断：只有联创分红池才过滤 related_user=NULL
-                # 其他池子（如 referral_points, team_reward_points）保留用户记录
+                # 只有联创分红池才过滤 related_user=NULL
                 if account_type == 'honor_director':
                     where_conditions.append("related_user IS NULL")
 
-                # ==================== 后续查询逻辑（保持不变） ====================
                 where_sql = " AND ".join(where_conditions)
 
-                # 汇总统计
+                # 汇总统计（保持Decimal类型，不转换为float）
                 cur.execute(f"""
                     SELECT 
                         COUNT(*) as total_transactions,
@@ -3125,14 +3314,10 @@ class FinanceService:
                 summary = cur.fetchone()
 
                 # 总记录数
-                cur.execute(f"""
-                    SELECT COUNT(*) as total 
-                    FROM account_flow
-                    WHERE {where_sql}
-                """, tuple(params))
+                cur.execute(f"SELECT COUNT(*) as total FROM account_flow WHERE {where_sql}", tuple(params))
                 total_count = cur.fetchone()['total'] or 0
 
-                # 明细查询（保持不变）
+                # 明细查询
                 offset = (page - 1) * page_size
                 cur.execute(f"""
                     SELECT 
@@ -3145,11 +3330,11 @@ class FinanceService:
                 """, tuple(params + [page_size, offset]))
                 records = cur.fetchall()
 
-                # ==================== ✅ 获取用户名称（优化） ====================
+                # 获取用户名称
                 def get_user_name(uid):
                     if not uid:
                         return "系统"
-                    if uid == 0:  # 平台商户ID
+                    if uid == 0:
                         return "平台"
                     try:
                         cur.execute("SELECT name FROM users WHERE id = %s", (uid,))
@@ -3158,17 +3343,10 @@ class FinanceService:
                     except Exception:
                         return f"查询失败:{uid}"
 
-                # ====================================================================
-
-                # ==================== ✅ 计算净变动 ====================
-                # 净变动 = 总收入 - 总支出（与流水表逻辑一致）
+                # 计算净变动（保持Decimal类型）
                 total_income = Decimal(str(summary['total_income'] or 0))
                 total_expense = Decimal(str(summary['total_expense'] or 0))
                 net_change = total_income - total_expense
-
-                # 验证数据一致性（可选，调试用）
-                # 当前余额 ≈ 期初余额 + 净变动（如果查询了期初余额）
-                # ====================================================================
 
                 # 账户类型中文名称映射
                 account_name_map = {
@@ -3186,17 +3364,17 @@ class FinanceService:
                     "merchant_balance": "商户余额池"
                 }
 
+                # 返回数据（关键修改：不再转换为float）
                 return {
                     "summary": {
                         "report_type": "pool_flow",
                         "account_type": account_type,
                         "account_name": account_name_map.get(account_type, account_type),
                         "total_transactions": summary['total_transactions'] or 0,
-                        "total_income": float(total_income),
-                        "total_expense": float(total_expense),
-                        "net_change": float(net_change),
-                        # ✅ 修复：使用真实的当前余额
-                        "ending_balance": float(actual_current_balance),
+                        "total_income": total_income,  # 保持Decimal类型
+                        "total_expense": total_expense,  # 保持Decimal类型
+                        "net_change": net_change,  # 保持Decimal类型
+                        "ending_balance": actual_current_balance,  # 保持Decimal类型
                         "query_date_range": f"{start_date} 至 {end_date}"
                     },
                     "pagination": {
@@ -3210,14 +3388,14 @@ class FinanceService:
                             "flow_id": r['id'],
                             "related_user": r['related_user'],
                             "user_name": get_user_name(r['related_user']),
-                            "change_amount": float(r['change_amount']),
-                            "balance_after": float(r['balance_after']) if r['balance_after'] is not None else None,
+                            "change_amount": r['change_amount'],  # 保持原始Decimal类型
+                            "balance_after": r['balance_after'],  # 保持原始Decimal类型
                             "flow_type": r['flow_type'],
                             "remark": r['remark'],
                             "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S")
                         } for r in records
                     ],
-                    "data_source": "finance_accounts + account_flow",  # 数据来源说明
+                    "data_source": "finance_accounts + account_flow",
                     "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
     # ==================== 联创星级点数流水报表 ====================
@@ -4447,12 +4625,16 @@ class FinanceService:
                         "users": []
                     }
 
-                # 批量查询用户的累计收入（从account_flow表）
+                # ============================================================
+                # 修复1：从 account_flow 查询所有点数类型的收入
+                # ============================================================
                 user_ids = [str(u['id']) for u in users]
                 income_map = {}
 
                 if user_ids:
                     placeholders = ','.join(['%s'] * len(user_ids))
+
+                    # 查询 account_flow 中的收入（推荐奖励、团队奖励、联创星级）
                     cur.execute(f"""
                         SELECT 
                             related_user,
@@ -4460,19 +4642,35 @@ class FinanceService:
                             SUM(change_amount) as total_income
                         FROM account_flow
                         WHERE related_user IN ({placeholders})
-                            AND account_type IN ('subsidy_points', 'referral_points', 'team_reward_points', 'honor_director')
+                            AND account_type IN ('referral_points', 'team_reward_points', 'honor_director')
                             AND flow_type = 'income'
                         GROUP BY related_user, account_type
                     """, tuple(user_ids))
 
-                    income_records = cur.fetchall()
-
-                    # 构建收入映射（用户ID -> {点数类型: 累计收入}）
-                    for record in income_records:
+                    for record in cur.fetchall():
                         uid = record['related_user']
                         if uid not in income_map:
                             income_map[uid] = {}
                         income_map[uid][record['account_type']] = Decimal(str(record['total_income'] or 0))
+
+                    # ============================================================
+                    # 修复2：从 weekly_subsidy_records 查询周补贴收入
+                    # ============================================================
+                    cur.execute(f"""
+                        SELECT 
+                            user_id,
+                            SUM(subsidy_amount) as total_subsidy_income
+                        FROM weekly_subsidy_records
+                        WHERE user_id IN ({placeholders})
+                        GROUP BY user_id
+                    """, tuple(user_ids))
+
+                    for record in cur.fetchall():
+                        uid = record['user_id']
+                        if uid not in income_map:
+                            income_map[uid] = {}
+                        # 将周补贴收入存入 subsidy_points 键
+                        income_map[uid]['subsidy_points'] = Decimal(str(record['total_subsidy_income'] or 0))
 
                 # 组装结果（所有用户都包含，没有收入记录的用户显示为0）
                 result = []
@@ -4481,7 +4679,7 @@ class FinanceService:
                     user_income = income_map.get(uid, {})  # 无记录则返回空字典
 
                     # 各点数类型的累计收入（默认为0）
-                    subsidy_income = user_income.get('subsidy_points', Decimal('0'))
+                    subsidy_income = user_income.get('subsidy_points', Decimal('0'))  # ✅ 从weekly_subsidy_records获取
                     referral_income = user_income.get('referral_points', Decimal('0'))
                     team_income = user_income.get('team_reward_points', Decimal('0'))
                     unilevel_income = user_income.get('honor_director', Decimal('0'))
@@ -4492,12 +4690,15 @@ class FinanceService:
                     team_balance = Decimal(str(user['team_balance']))
                     unilevel_balance = Decimal(str(user['unilevel_balance']))
 
+                    # ============================================================
+                    # 修复3：修正变量名错误（earned → income）
+                    # ============================================================
                     # 计算消耗（当前业务无消耗场景，后续有消耗逻辑时可调整）
                     # 消耗 = 累计收入 - 当前余额
                     subsidy_expense = max(Decimal('0'), subsidy_income - subsidy_balance)
-                    referral_expense = max(Decimal('0'), referral_income - referral_balance)
+                    referral_expense = max(Decimal('0'), referral_income - referral_balance)  # ✅ 修正：referral_income
                     team_expense = max(Decimal('0'), team_income - team_balance)
-                    unilevel_expense = max(Decimal('0'), unilevel_income - unilevel_balance)
+                    unilevel_expense = max(Decimal('0'), unilevel_income - unilevel_balance)  # ✅ 修正：unilevel_income
 
                     result.append({
                         "user_id": uid,
@@ -4505,7 +4706,7 @@ class FinanceService:
                         "points_summary": {
                             "subsidy_points": {
                                 "current_balance": float(subsidy_balance),
-                                "total_earned": float(subsidy_income),
+                                "total_earned": float(subsidy_income),  # ✅ 现在包含周补贴收入
                                 "total_used": float(subsidy_expense),
                                 "remark": "周补贴专用点数"
                             },

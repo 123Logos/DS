@@ -1035,6 +1035,50 @@ async def get_all_points_flow_report(
     except Exception as e:
         logger.error(f"查询综合点数流水报表失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+# ==================== 总会员积分明细报表接口 ====================
+@router.get("/api/reports/points/member/detail", response_model=ResponseModel, summary="总会员积分明细报表")
+async def get_member_points_detail_report(
+        user_id: Optional[int] = Query(None, gt=0, description="用户ID（可选，查所有用户则留空）"),
+        start_date: Optional[str] = Query(None, description="开始日期 yyyy-MM-dd"),
+        end_date: Optional[str] = Query(None, description="结束日期 yyyy-MM-dd"),
+        page: int = Query(1, ge=1, description="页码"),
+        page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+        service: FinanceService = Depends(get_finance_service)
+):
+    """
+    查询用户会员积分的详细流水
+
+    功能特点：
+    - 支持按用户ID、日期范围筛选
+    - 自动计算期初余额和期末余额
+    - 显示每条流水的收入/支出类型、金额、关联订单
+    - 提供汇总统计（总收入、总支出、净变动）
+    - 支持分页查询
+    """
+    try:
+        data = service.get_member_points_detail_report(
+            user_id=user_id,
+            start_date=start_date,
+            end_date=end_date,
+            page=page,
+            page_size=page_size
+        )
+
+        message = f"总会员积分明细报表查询成功"
+        if user_id:
+            message += f": 用户 {data['user_info']['user_name'] if data['user_info'] else user_id}"
+        message += f"，共 {len(data['records'])} 条记录"
+
+        return ResponseModel(
+            success=True,
+            message=message,
+            data=data
+        )
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"查询总会员积分明细报表失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 def register_finance_routes(app: FastAPI):
     """注册财务管理系统路由到主应用"""
     app.include_router(router, tags=["财务系统"])
