@@ -176,7 +176,7 @@ class FinanceService:
 
             # 5. 处理积分抵扣（只处理真实积分）
             if points_to_use > Decimal('0'):
-                self._apply_points_discount_v2(cur, user_id, user, points_to_use, total_amount)
+                self._apply_points_discount_v2(cur, user_id, user, points_to_use, total_amount, order_id)
 
             # 6. 更新订单主表
             cur.execute(
@@ -364,12 +364,13 @@ class FinanceService:
             raise
 
     # ==================== 积分抵扣逻辑（v2版本） ====================
-    def _apply_points_discount_v2(self, cur, user_id: int, user, points_to_use: Decimal, amount: Decimal) -> None:
+    def _apply_points_discount_v2(self, cur, user_id: int, user, points_to_use: Decimal, amount: Decimal,
+                                  order_id: int) -> None:
         """积分抵扣处理（v2：接受cursor参数）"""
         user_points = Decimal(str(user.member_points))
         if user_points < points_to_use:
             raise OrderException(f"积分不足，当前{user_points:.4f}分")
-        # 已移除：50%限制检查
+
         # 扣减member_points
         cur.execute(
             "UPDATE users SET member_points = member_points - %s WHERE id = %s AND member_points >= %s",
@@ -379,12 +380,27 @@ class FinanceService:
             # 说明积分不足或被并发消费
             raise OrderException(f"积分不足或并发冲突，无法使用{points_to_use:.4f}分")
 
+        # 【关键修复】获取扣减后的余额用于记录流水
+        cur.execute(
+            "SELECT member_points FROM users WHERE id = %s",
+            (user_id,)
+        )
+        new_balance = Decimal(str(cur.fetchone()['member_points'] or 0))
+
+        # 【关键修复】记录用户积分扣减流水
+        cur.execute(
+            """INSERT INTO points_log 
+               (user_id, change_amount, balance_after, type, reason, related_order, created_at)
+               VALUES (%s, %s, %s, 'member', %s, %s, NOW())""",
+            (user_id, -points_to_use, new_balance, '积分抵扣支付', order_id)
+        )
+
         # 更新公司积分池（累计到公司积分）
         cur.execute(
             "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'company_points'",
             (points_to_use,)
         )
-        # 记录流水
+        # 记录资金池流水
         cur.execute(
             """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
                flow_type, remark, created_at)
@@ -393,7 +409,8 @@ class FinanceService:
                       %s, %s, NOW())""",
             ('company_points', user_id, points_to_use, 'income', f"用户{user_id}积分抵扣转入")
         )
-        # 同步写入积分流水表，记录公司积分池的增加（设 user_id 为平台ID 以示系统入账）
+
+        # 同步写入积分流水表，记录公司积分池的增加（设 user_id 为平台ID以示系统入账）
         try:
             cur.execute(
                 "INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at) VALUES (%s, %s, (SELECT balance FROM finance_accounts WHERE account_type = 'company_points'), %s, %s, %s, NOW())",
@@ -3187,16 +3204,26 @@ class FinanceService:
 
                 # 5. 计算期末余额
                 closing_balance = Decimal('0')
-                if records:
-                    closing_balance = Decimal(str(records[0]['balance_after'] or 0))
-                elif user_id:
+                if user_id:
+                    # 【查询单个用户】从明细记录或用户表获取期末余额
+                    if records:
+                        closing_balance = Decimal(str(records[0]['balance_after'] or 0))
+                    else:
+                        cur.execute("""
+                            SELECT COALESCE(member_points, 0) as current_balance
+                            FROM users 
+                            WHERE id = %s
+                        """, (user_id,))
+                        balance_row = cur.fetchone()
+                        closing_balance = Decimal(str(balance_row['current_balance'] if balance_row else 0))
+                else:
+                    # 【查询所有用户】计算总积分作为期末余额
                     cur.execute("""
-                        SELECT COALESCE(member_points, 0) as current_balance
-                        FROM users 
-                        WHERE id = %s
-                    """, (user_id,))
-                    balance_row = cur.fetchone()
-                    closing_balance = Decimal(str(balance_row['current_balance'] if balance_row else 0))
+                        SELECT COALESCE(SUM(member_points), 0) as total_balance
+                        FROM users
+                    """)
+                    total_row = cur.fetchone()
+                    closing_balance = Decimal(str(total_row['total_balance'] if total_row else 0))
 
                 # 6. 获取用户信息
                 user_info = None
@@ -4545,9 +4572,12 @@ class FinanceService:
 
     def get_all_points_flow_report(self, user_id: Optional[int] = None) -> Dict[str, Any]:
         """
-        查询所有点数类型的流水报表（周补贴、推荐奖励、团队奖励、联创星级）
+        查询所有点数类型的流水报表（仅包含点数，不包含积分）
 
-        关键变更：显示所有用户，包括没有点数余额和流水记录的用户（显示为0）
+        数据来源：
+        1. account_flow: 推荐、团队、联创、true_total_points 流水（收入和支出）
+        2. weekly_subsidy_records: 周补贴点数发放记录（补贴点数收入）
+        3. 不包含 points_log（这是积分流水，不是点数流水）
 
         Args:
             user_id: 用户ID（可选，不传则查询所有用户）
@@ -4555,7 +4585,7 @@ class FinanceService:
         Returns:
             包含各点数类型统计和明细的字典
         """
-        logger.info(f"生成所有点数流水报表: 用户={user_id or '所有用户'}")
+        logger.info(f"生成纯点数流水报表: 用户={user_id or '所有用户'}")
 
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -4563,18 +4593,18 @@ class FinanceService:
                 user_where = "WHERE u.id = %s" if user_id else ""
                 user_params = [user_id] if user_id else []
 
-                # 关键变更：查询所有用户（移除HAVING子句，不再过滤无点数的用户）
+                # 查询所有用户（包括没有点数的，显示为0）
                 sql = f"""
                     SELECT u.id, u.name,
                         COALESCE(u.subsidy_points, 0) as subsidy_balance,
                         COALESCE(u.referral_points, 0) as referral_balance,
                         COALESCE(u.team_reward_points, 0) as team_balance,
-                        COALESCE(u.points, 0) as unilevel_balance
+                        COALESCE(u.points, 0) as unilevel_balance,
+                        COALESCE(u.true_total_points, 0) as true_total_balance
                     FROM users u
                     {user_where}
                     ORDER BY u.id
                 """
-
                 cur.execute(sql, tuple(user_params))
                 users = cur.fetchall()
 
@@ -4588,37 +4618,47 @@ class FinanceService:
                         "users": []
                     }
 
-                # ============================================================
-                # 修复1：从 account_flow 查询所有点数类型的收入
-                # ============================================================
+                # 批量查询各类点数收入
                 user_ids = [str(u['id']) for u in users]
-                income_map = {}
+                income_map = {uid: {
+                    'subsidy_points': Decimal('0'),
+                    'referral_points': Decimal('0'),
+                    'team_reward_points': Decimal('0'),
+                    'honor_director': Decimal('0'),
+                    'true_total_points': Decimal('0')  # 支出用负数表示
+                } for uid in [u['id'] for u in users]}
 
                 if user_ids:
                     placeholders = ','.join(['%s'] * len(user_ids))
 
-                    # 查询 account_flow 中的收入（推荐奖励、团队奖励、联创星级）
+                    # 从 account_flow 查询点数收入（flow_type='income'）
+                    # account_type: referral_points, team_reward_points, honor_director, true_total_points
                     cur.execute(f"""
                         SELECT 
                             related_user,
                             account_type,
-                            SUM(change_amount) as total_income
+                            SUM(CASE WHEN flow_type = 'income' THEN change_amount ELSE 0 END) as total_income,
+                            SUM(CASE WHEN flow_type = 'expense' THEN change_amount ELSE 0 END) as total_expense
                         FROM account_flow
                         WHERE related_user IN ({placeholders})
-                            AND account_type IN ('referral_points', 'team_reward_points', 'honor_director')
-                            AND flow_type = 'income'
+                            AND account_type IN ('referral_points', 'team_reward_points', 'honor_director', 'true_total_points')
                         GROUP BY related_user, account_type
                     """, tuple(user_ids))
 
-                    for record in cur.fetchall():
-                        uid = record['related_user']
-                        if uid not in income_map:
-                            income_map[uid] = {}
-                        income_map[uid][record['account_type']] = Decimal(str(record['total_income'] or 0))
+                    for row in cur.fetchall():
+                        uid = row['related_user']
+                        account_type = row['account_type']
+                        net_change = Decimal(str(row['total_income'] or 0)) - Decimal(
+                            str(abs(row['total_expense'] or 0)))
 
-                    # ============================================================
-                    # 修复2：从 weekly_subsidy_records 查询周补贴收入
-                    # ============================================================
+                        if uid in income_map:
+                            # true_total_points 的支出是负数
+                            if account_type == 'true_total_points':
+                                income_map[uid][account_type] = -Decimal(str(abs(row['total_expense'] or 0)))
+                            else:
+                                income_map[uid][account_type] = Decimal(str(row['total_income'] or 0))
+
+                    # 从 weekly_subsidy_records 查询周补贴点数收入
                     cur.execute(f"""
                         SELECT 
                             user_id,
@@ -4628,40 +4668,44 @@ class FinanceService:
                         GROUP BY user_id
                     """, tuple(user_ids))
 
-                    for record in cur.fetchall():
-                        uid = record['user_id']
-                        if uid not in income_map:
-                            income_map[uid] = {}
-                        # 将周补贴收入存入 subsidy_points 键
-                        income_map[uid]['subsidy_points'] = Decimal(str(record['total_subsidy_income'] or 0))
+                    for row in cur.fetchall():
+                        uid = row['user_id']
+                        if uid in income_map:
+                            income_map[uid]['subsidy_points'] = Decimal(str(row['total_subsidy_income'] or 0))
 
-                # 组装结果（所有用户都包含，没有收入记录的用户显示为0）
+                # 组装结果（不包含积分流水）
                 result = []
                 for user in users:
                     uid = user['id']
-                    user_income = income_map.get(uid, {})  # 无记录则返回空字典
+                    user_income = income_map.get(uid, {
+                        'subsidy_points': Decimal('0'),
+                        'referral_points': Decimal('0'),
+                        'team_reward_points': Decimal('0'),
+                        'honor_director': Decimal('0'),
+                        'true_total_points': Decimal('0')
+                    })
 
-                    # 各点数类型的累计收入（默认为0）
-                    subsidy_income = user_income.get('subsidy_points', Decimal('0'))  # ✅ 从weekly_subsidy_records获取
-                    referral_income = user_income.get('referral_points', Decimal('0'))
-                    team_income = user_income.get('team_reward_points', Decimal('0'))
-                    unilevel_income = user_income.get('honor_director', Decimal('0'))
-
-                    # 当前余额（从users表获取，COALESCE已处理NULL）
+                    # 当前余额
                     subsidy_balance = Decimal(str(user['subsidy_balance']))
                     referral_balance = Decimal(str(user['referral_balance']))
                     team_balance = Decimal(str(user['team_balance']))
                     unilevel_balance = Decimal(str(user['unilevel_balance']))
+                    true_total_balance = Decimal(str(user['true_total_balance']))
 
-                    # ============================================================
-                    # 修复3：修正变量名错误（earned → income）
-                    # ============================================================
-                    # 计算消耗（当前业务无消耗场景，后续有消耗逻辑时可调整）
-                    # 消耗 = 累计收入 - 当前余额
+                    # 各项点数累计收入
+                    subsidy_income = user_income['subsidy_points']
+                    referral_income = user_income['referral_points']
+                    team_income = user_income['team_reward_points']
+                    unilevel_income = user_income['honor_director']
+                    # true_total_points 的变动来自优惠券发放（扣减）
+                    true_total_deduction = abs(user_income['true_total_points'])  # 转换为正数显示
+
+                    # 计算消耗（点数一般没有消耗逻辑，主要计算净收入）
+                    # 如果当前余额 < 总收入，说明有部分已使用
                     subsidy_expense = max(Decimal('0'), subsidy_income - subsidy_balance)
-                    referral_expense = max(Decimal('0'), referral_income - referral_balance)  # ✅ 修正：referral_income
+                    referral_expense = max(Decimal('0'), referral_income - referral_balance)
                     team_expense = max(Decimal('0'), team_income - team_balance)
-                    unilevel_expense = max(Decimal('0'), unilevel_income - unilevel_balance)  # ✅ 修正：unilevel_income
+                    unilevel_expense = max(Decimal('0'), unilevel_income - unilevel_balance)
 
                     result.append({
                         "user_id": uid,
@@ -4669,9 +4713,9 @@ class FinanceService:
                         "points_summary": {
                             "subsidy_points": {
                                 "current_balance": float(subsidy_balance),
-                                "total_earned": float(subsidy_income),  # ✅ 现在包含周补贴收入
+                                "total_earned": float(subsidy_income),
                                 "total_used": float(subsidy_expense),
-                                "remark": "周补贴专用点数"
+                                "remark": "周补贴专用点数（从 member_points 转换而来）"
                             },
                             "referral_points": {
                                 "current_balance": float(referral_balance),
@@ -4690,13 +4734,21 @@ class FinanceService:
                                 "total_earned": float(unilevel_income),
                                 "total_used": float(unilevel_expense),
                                 "remark": "联创星级分红专用点数"
+                            },
+                            "true_total_points": {
+                                "current_balance": float(true_total_balance),
+                                "total_deducted": float(true_total_deduction),  # 优惠券发放导致的扣减
+                                "remark": "真实总点数（用于优惠券兑换）"
                             }
                         },
                         "grand_total": {
                             "total_balance": float(
-                                subsidy_balance + referral_balance + team_balance + unilevel_balance),
-                            "total_earned": float(subsidy_income + referral_income + team_income + unilevel_income),
-                            "total_used": float(subsidy_expense + referral_expense + team_expense + unilevel_expense)
+                                true_total_balance
+                            ),
+                            "total_earned": float(
+                                subsidy_income + referral_income + team_income + unilevel_income
+                            ),
+                            "total_deducted": float(true_total_deduction)  # 优惠券扣减
                         }
                     })
 
@@ -4704,7 +4756,8 @@ class FinanceService:
                     "summary": {
                         "total_users": len(result),
                         "report_type": "all_points_flow",
-                        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "remark": "仅包含点数流水，不包含积分流水（如周补贴扣减积分）"
                     },
                     "users": result
                 }
@@ -5646,4 +5699,5 @@ def generate_statement():
                 (1, yesterday, opening, income, withdraw_amount, closing)
             )
             conn.commit()
+
 
