@@ -374,189 +374,189 @@ class UserService:
                     "page_size": page_size
                 }
 
-        # ==================== 联创自动计算功能（后端计算） ====================
+    # ==================== 联创自动计算功能（后端计算） ====================
 
-        @staticmethod
-        def get_unilevel_status(user_id: int) -> Dict[str, Any]:
-            """
-            获取联创状态（等级+是否可晋升）
-            前端直接调用此方法获取完整信息
-            """
-            try:
-                current_level = UserService.get_unilevel(user_id)
-                target_level = UserService._calculate_unilevel_target(user_id)
+    @staticmethod
+    def get_unilevel_status(user_id: int) -> Dict[str, Any]:
+        """
+        获取联创状态（等级+是否可晋升）
+        前端直接调用此方法获取完整信息
+        """
+        try:
+            current_level = UserService.get_unilevel(user_id)
+            target_level = UserService._calculate_unilevel_target(user_id)
 
-                return {
-                    "current_level": current_level,
-                    "target_level": target_level,
-                    "can_promote": target_level > current_level,
-                    "reason": None if target_level > current_level else "已到达最高等级或条件未达标"
-                }
-            except Exception as e:
-                print(f"获取联创状态失败: {e}")
-                return {
-                    "current_level": 0,
-                    "target_level": 0,
-                    "can_promote": False,
-                    "reason": str(e)
-                }
+            return {
+                "current_level": current_level,
+                "target_level": target_level,
+                "can_promote": target_level > current_level,
+                "reason": None if target_level > current_level else "已到达最高等级或条件未达标"
+            }
+        except Exception as e:
+            print(f"获取联创状态失败: {e}")
+            return {
+                "current_level": 0,
+                "target_level": 0,
+                "can_promote": False,
+                "reason": str(e)
+            }
 
-        @staticmethod
-        def _calculate_unilevel_target(uid: int) -> int:
-            """
-            计算用户应得的联创等级（满足所有ABCD条件）
-            返回值：0=未获得, 1=一星, 2=二星, 3=三星
-            """
-            if UserService.get_level(uid) != 6:
-                return 0
+    @staticmethod
+    def _calculate_unilevel_target(uid: int) -> int:
+        """
+        计算用户应得的联创等级（满足所有ABCD条件）
+        返回值：0=未获得, 1=一星, 2=二星, 3=三星
+        """
+        if UserService.get_level(uid) != 6:
+            return 0
 
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    # ✅ B条件：只获取未注销的六星直推
-                    cur.execute("""
-                        SELECT r.user_id 
-                        FROM user_referrals r
-                        JOIN users u ON r.user_id = u.id
-                        WHERE r.referrer_id=%s 
-                          AND u.member_level=6 
-                          AND u.status != %s  -- 过滤注销用户
-                        ORDER BY r.created_at 
-                        LIMIT 8  -- 允许最多8条，后面会筛选
-                    """, (uid, UserStatus.DELETED.value))
-                    lines = [r["user_id"] for r in cur.fetchall()]
-                    direct_6star_count = len(lines)
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # ✅ B条件：只获取未注销的六星直推
+                cur.execute("""
+                    SELECT r.user_id 
+                    FROM user_referrals r
+                    JOIN users u ON r.user_id = u.id
+                    WHERE r.referrer_id=%s 
+                        AND u.member_level=6 
+                        AND u.status != %s  -- 过滤注销用户
+                    ORDER BY r.created_at 
+                    LIMIT 8  -- 允许最多8条，后面会筛选
+                """, (uid, UserStatus.DELETED.value))
+                lines = [r["user_id"] for r in cur.fetchall()]
+                direct_6star_count = len(lines)
 
-                    if direct_6star_count < 7:
-                        logger.warning(f"B条件不足: 只有{direct_6star_count}个可用直推六星")
-                        return 0
-
-                    # 取前7条（如果有8条，弃用第8条）
-                    lines = lines[:7]
-
-                    # C条件：统计有效线数（过滤注销）
-                    valid_lines = UserService._count_valid_lines(cur, lines)
-
-                    # D条件2：每条线的六星数量（只统计未注销）
-                    lines_6star_counts = []
-                    for idx, line_id in enumerate(lines):
-                        cur.execute("""
-                            WITH RECURSIVE team_line AS (
-                                SELECT id, 0 AS layer FROM users WHERE id=%s
-                                UNION ALL
-                                SELECT r.user_id, tl.layer + 1
-                                FROM user_referrals r
-                                JOIN team_line tl ON tl.id = r.referrer_id
-                                WHERE tl.layer < 6
-                            )
-                            SELECT COUNT(DISTINCT tl.id) as line_6stars
-                            FROM team_line tl
-                            JOIN users u ON u.id = tl.id
-                            WHERE u.member_level = 6 
-                              AND u.status != %s  -- 过滤注销
-                        """, (line_id, UserStatus.DELETED.value))
-                        count = cur.fetchone()['line_6stars'] or 0
-                        lines_6star_counts.append(count)
-
-                    # D条件1：团队整体累计六星（未注销）
-                    cur.execute("""
-                        WITH RECURSIVE team AS (
-                            SELECT id, 0 AS layer FROM users WHERE id=%s
-                            UNION ALL
-                            SELECT r.user_id, t.layer + 1
-                            FROM user_referrals r
-                            JOIN team t ON t.id = r.referrer_id
-                            WHERE t.layer < 6
-                        )
-                        SELECT COUNT(DISTINCT t.id) as total_6stars
-                        FROM team t
-                        JOIN users u ON u.id = t.id
-                        WHERE u.member_level = 6 
-                          AND u.status != %s  -- 过滤注销
-                    """, (uid, UserStatus.DELETED.value))
-                    total_6star_count = cur.fetchone()['total_6stars'] or 0
-
-                    # 日志
-                    logger.info(f"联创计算 - 直推六星:{direct_6star_count}, 有效线:{valid_lines}, "
-                                f"各线六星:{lines_6star_counts}, 团队总六星:{total_6star_count}")
-
-                    # 判断（使用过滤后的数据）
-                    if direct_6star_count >= 7 and valid_lines >= 7 and \
-                            all(c >= 10 for c in lines_6star_counts[:7]):
-                        return 3
-                    elif direct_6star_count >= 5 and valid_lines >= 5 and \
-                            all(c >= 10 for c in lines_6star_counts[:5]):
-                        return 2
-                    elif direct_6star_count >= 3 and valid_lines >= 3 and total_6star_count >= 30:
-                        return 1
-
+                if direct_6star_count < 7:
+                    logger.warning(f"B条件不足: 只有{direct_6star_count}个可用直推六星")
                     return 0
 
-        @staticmethod
-        def _count_valid_lines(cur, line_ids: List[int]) -> int:
-            """
-            统计有效线数（过滤注销用户）
-            """
-            if not line_ids:
+                # 取前7条（如果有8条，弃用第8条）
+                lines = lines[:7]
+
+                # C条件：统计有效线数（过滤注销）
+                valid_lines = UserService._count_valid_lines(cur, lines)
+
+                # D条件2：每条线的六星数量（只统计未注销）
+                lines_6star_counts = []
+                for idx, line_id in enumerate(lines):
+                    cur.execute("""
+                        WITH RECURSIVE team_line AS (
+                            SELECT id, 0 AS layer FROM users WHERE id=%s
+                            UNION ALL
+                            SELECT r.user_id, tl.layer + 1
+                            FROM user_referrals r
+                            JOIN team_line tl ON tl.id = r.referrer_id
+                            WHERE tl.layer < 6
+                        )
+                        SELECT COUNT(DISTINCT tl.id) as line_6stars
+                        FROM team_line tl
+                        JOIN users u ON u.id = tl.id
+                        WHERE u.member_level = 6 
+                            AND u.status != %s  -- 过滤注销
+                    """, (line_id, UserStatus.DELETED.value))
+                    count = cur.fetchone()['line_6stars'] or 0
+                    lines_6star_counts.append(count)
+
+                # D条件1：团队整体累计六星（未注销）
+                cur.execute("""
+                    WITH RECURSIVE team AS (
+                        SELECT id, 0 AS layer FROM users WHERE id=%s
+                        UNION ALL
+                        SELECT r.user_id, t.layer + 1
+                        FROM user_referrals r
+                        JOIN team t ON t.id = r.referrer_id
+                        WHERE t.layer < 6
+                    )
+                    SELECT COUNT(DISTINCT t.id) as total_6stars
+                    FROM team t
+                    JOIN users u ON u.id = t.id
+                    WHERE u.member_level = 6 
+                        AND u.status != %s  -- 过滤注销
+                """, (uid, UserStatus.DELETED.value))
+                total_6star_count = cur.fetchone()['total_6stars'] or 0
+
+                # 日志
+                logger.info(f"联创计算 - 直推六星:{direct_6star_count}, 有效线:{valid_lines}, "
+                            f"各线六星:{lines_6star_counts}, 团队总六星:{total_6star_count}")
+
+                # 判断（使用过滤后的数据）
+                if direct_6star_count >= 7 and valid_lines >= 7 and \
+                        all(c >= 10 for c in lines_6star_counts[:7]):
+                    return 3
+                elif direct_6star_count >= 5 and valid_lines >= 5 and \
+                        all(c >= 10 for c in lines_6star_counts[:5]):
+                    return 2
+                elif direct_6star_count >= 3 and valid_lines >= 3 and total_6star_count >= 30:
+                    return 1
+
                 return 0
 
-            union_parts = " UNION ALL ".join([f"SELECT {uid} as user_id" for uid in line_ids])
+    @staticmethod
+    def _count_valid_lines(cur, line_ids: List[int]) -> int:
+        """
+        统计有效线数（过滤注销用户）
+        """
+        if not line_ids:
+            return 0
 
-            cur.execute(f"""
-                WITH RECURSIVE all_teams AS (
-                    SELECT user_id AS id, user_id AS root_id, 1 as level
-                    FROM ({union_parts}) AS roots
-                    UNION ALL
-                    SELECT r.user_id, at.root_id, at.level + 1
-                    FROM user_referrals r
-                    JOIN all_teams at ON at.id = r.referrer_id
-                    WHERE at.level < 6
-                ),
-                line_stats AS (
-                    SELECT 
-                        root_id,
-                        EXISTS (
-                            SELECT 1
-                            FROM all_teams at2
-                            JOIN users u ON u.id = at2.id
-                            WHERE at2.root_id = at.root_id
-                              AND u.member_level = 6
-                              AND u.status != 2  -- ✅ 过滤注销
-                              AND (
-                                  SELECT COUNT(DISTINCT r2.user_id)
-                                  FROM user_referrals r2
-                                  JOIN users u2 ON u2.id = r2.user_id
-                                  WHERE r2.referrer_id = at2.id
-                                    AND u2.member_level = 6
-                                    AND u2.status != 2  -- ✅ 过滤注销
-                              ) >= 3
-                        ) as has_valid_6star
-                    FROM (SELECT DISTINCT root_id FROM all_teams) at
+        union_parts = " UNION ALL ".join([f"SELECT {uid} as user_id" for uid in line_ids])
+
+        cur.execute(f"""
+            WITH RECURSIVE all_teams AS (
+                SELECT user_id AS id, user_id AS root_id, 1 as level
+                FROM ({union_parts}) AS roots
+                UNION ALL
+                SELECT r.user_id, at.root_id, at.level + 1
+                FROM user_referrals r
+                JOIN all_teams at ON at.id = r.referrer_id
+                WHERE at.level < 6
+            ),
+            line_stats AS (
+                SELECT 
+                    root_id,
+                    EXISTS (
+                        SELECT 1
+                        FROM all_teams at2
+                        JOIN users u ON u.id = at2.id
+                        WHERE at2.root_id = at.root_id
+                            AND u.member_level = 6
+                            AND u.status != 2  -- ✅ 过滤注销
+                            AND (
+                                SELECT COUNT(DISTINCT r2.user_id)
+                                FROM user_referrals r2
+                                JOIN users u2 ON u2.id = r2.user_id
+                                WHERE r2.referrer_id = at2.id
+                                AND u2.member_level = 6
+                                AND u2.status != 2  -- ✅ 过滤注销
+                            ) >= 3
+                    ) as has_valid_6star
+                FROM (SELECT DISTINCT root_id FROM all_teams) at
+            )
+            SELECT COUNT(*) as valid_count
+            FROM line_stats
+            WHERE has_valid_6star = TRUE
+        """)
+        return cur.fetchone()['valid_count'] or 0
+
+    @staticmethod
+    def promote_unilevel_auto(user_id: int) -> int:
+        """自动晋升联创（后端计算）"""
+        status = UserService.get_unilevel_status(user_id)
+
+        if not status["can_promote"]:
+            raise ValueError(f"无法晋升：{status['reason']}")
+
+        target_level = status["target_level"]
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO user_unilevel(user_id, level) VALUES (%s,%s) "
+                    "ON DUPLICATE KEY UPDATE level=%s",
+                    (user_id, target_level, target_level),
                 )
-                SELECT COUNT(*) as valid_count
-                FROM line_stats
-                WHERE has_valid_6star = TRUE
-            """)
-            return cur.fetchone()['valid_count'] or 0
-
-        @staticmethod
-        def promote_unilevel_auto(user_id: int) -> int:
-            """自动晋升联创（后端计算）"""
-            status = UserService.get_unilevel_status(user_id)
-
-            if not status["can_promote"]:
-                raise ValueError(f"无法晋升：{status['reason']}")
-
-            target_level = status["target_level"]
-
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "INSERT INTO user_unilevel(user_id, level) VALUES (%s,%s) "
-                        "ON DUPLICATE KEY UPDATE level=%s",
-                        (user_id, target_level, target_level),
-                    )
-                    conn.commit()
-                    return target_level
+                conn.commit()
+                return target_level
 
     '''
     @staticmethod
