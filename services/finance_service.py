@@ -5317,23 +5317,29 @@ class FinanceService:
                 total_count = af_total + wsr_total
 
                 # ==================== 6. 格式化返回数据 ====================
-                flow_type_mapping = {
+                flow_type_base_mapping = {
                     'subsidy_points': '周补贴收入',
                     'referral_points': '推荐奖励收入',
                     'team_reward_points': '团队奖励收入',
                     'honor_director': '联创星级收入',
-                    'true_total_points': '优惠券扣减'
+                    'true_total_points': '优惠券扣减'  # 默认值
                 }
 
                 detailed_records = []
                 for r in all_records:
                     account_type = r['account_type']
-                    flow_type_label = flow_type_mapping.get(account_type, account_type)
+                    remark = r.get('remark', '')
 
-                    flow_category = '支出' if account_type == 'true_total_points' else '收入'
-                    change_amount = float(r['change_amount'])
-                    if account_type == 'true_total_points':
-                        change_amount = -abs(change_amount)  # 确保是负值
+                    # 智能识别flow_type：如果是true_total_points且remark包含"捐赠"，显示为"用户捐赠"
+                    if account_type == 'true_total_points' and '捐赠' in remark:
+                        flow_type_label = '用户捐赠'
+                        flow_category = '支出'
+                        # 确保change_amount为负值
+                        change_amount = -abs(float(r['change_amount']))
+                    else:
+                        flow_type_label = flow_type_base_mapping.get(account_type, account_type)
+                        flow_category = '支出' if account_type == 'true_total_points' else '收入'
+                        change_amount = float(r['change_amount'])
 
                     # 确保 created_at 是 datetime 对象
                     created_at = r['created_at']
@@ -5402,6 +5408,111 @@ class FinanceService:
                     },
                     'records': detailed_records
                 }
+    def donate_true_total_points(self, user_id: int, amount: float) -> Dict[str, Any]:
+        """
+        用户捐赠 true_total_points 到公益基金账户（1:1兑换为资金）
+
+        Args:
+            user_id: 用户ID
+            amount: 捐赠的点数金额
+
+        Returns:
+            dict: 包含捐赠结果和流水ID的字典
+        """
+        logger.info(f"用户 {user_id} 申请捐赠 true_total_points: {amount:.4f}")
+
+        donation_amount = Decimal(str(amount))
+        if donation_amount <= 0:
+            raise FinanceException("捐赠金额必须大于0")
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    # 1. 查询用户当前 true_total_points 余额
+                    select_sql = build_dynamic_select(
+                        cur,
+                        "users",
+                        where_clause="id=%s",
+                        select_fields=["true_total_points", "name"]
+                    )
+                    cur.execute(select_sql, (user_id,))
+                    user_row = cur.fetchone()
+
+                    if not user_row:
+                        raise FinanceException(f"用户不存在: {user_id}")
+
+                    current_balance = Decimal(str(user_row.get('true_total_points', 0) or 0))
+                    user_name = user_row.get('name', f'用户{user_id}')
+
+                    # 2. 检查余额是否充足
+                    if current_balance < donation_amount:
+                        raise FinanceException(
+                            f"用户 true_total_points 余额不足，当前余额: {current_balance:.4f}，"
+                            f"需要 {donation_amount:.4f}"
+                        )
+
+                    # 3. 扣除用户 true_total_points
+                    new_balance = current_balance - donation_amount
+                    cur.execute(
+                        "UPDATE users SET true_total_points = %s WHERE id = %s",
+                        (new_balance, user_id)
+                    )
+
+                    # 4. 增加公益基金账户余额
+                    cur.execute(
+                        "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'public_welfare'",
+                        (donation_amount,)
+                    )
+
+                    # 5. 查询公益基金更新后的余额
+                    cur.execute(
+                        "SELECT balance FROM finance_accounts WHERE account_type = 'public_welfare'"
+                    )
+                    welfare_balance_row = cur.fetchone()
+                    welfare_balance_after = Decimal(str(welfare_balance_row.get('balance', 0) or 0))
+
+                    # 6. 记录用户点数扣除流水（支出）
+                    cur.execute(
+                        """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
+                           flow_type, remark, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+                        ('true_total_points', user_id, -donation_amount, new_balance, 'expense',
+                         f"用户捐赠true_total_points到公益基金 - 捐赠金额¥{donation_amount:.4f}")
+                    )
+                    expense_flow_id = cur.lastrowid
+
+                    # 7. 记录公益基金账户收入流水
+                    cur.execute(
+                        """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
+                           flow_type, remark, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+                        ('public_welfare', user_id, donation_amount, welfare_balance_after, 'income',
+                         f"用户 {user_name}(ID:{user_id}) 捐赠true_total_points - 捐赠金额¥{donation_amount:.4f}")
+                    )
+                    income_flow_id = cur.lastrowid
+
+                    conn.commit()
+
+                    logger.info(
+                        f"用户 {user_id} 捐赠成功: -{donation_amount:.4f} true_total_points, "
+                        f"公益基金 +{donation_amount:.4f}"
+                    )
+
+                    return {
+                        "success": True,
+                        "donation_amount": float(donation_amount),
+                        "user_balance_after": float(new_balance),
+                        "welfare_balance_after": float(welfare_balance_after),
+                        "expense_flow_id": expense_flow_id,
+                        "income_flow_id": income_flow_id,
+                        "message": f"捐赠成功，感谢您的爱心！"
+                    }
+
+        except FinanceException:
+            raise
+        except Exception as e:
+            logger.error(f"❌ 用户 {user_id} 捐赠失败: {e}")
+            raise FinanceException(f"捐赠失败: {e}")
 # ==================== 订单系统财务功能（来自 order/finance.py） ====================
 
 def _build_team_rewards_select(cursor, asset_fields: List[str] = None) -> tuple:

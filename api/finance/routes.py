@@ -1090,6 +1090,30 @@ async def get_member_points_detail_report(
     except Exception as e:
         logger.error(f"查询总会员积分明细报表失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+@router.post("/api/donate/true-total-points", response_model=ResponseModel, summary="用户捐赠点数到公益基金")
+async def donate_true_total_points(
+    user_id: int = Query(..., gt=0, description="用户ID"),
+    amount: float = Query(..., gt=0, description="捐赠金额"),
+    service: FinanceService = Depends(get_finance_service)
+):
+    """
+    用户将 true_total_points 捐赠到公益基金账户
+    - 点数与资金1:1兑换
+    - 同时记录用户点数减少和公益基金增加的流水
+    - 可在公益基金流水中查询捐赠记录
+    """
+    try:
+        result = service.donate_true_total_points(user_id, amount)
+        return ResponseModel(
+            success=True,
+            message=result["message"],
+            data=result
+        )
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"捐赠接口异常: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"捐赠失败: {str(e)}")
 def register_finance_routes(app: FastAPI):
     """注册财务管理系统路由到主应用"""
     app.include_router(router, tags=["财务系统"])
