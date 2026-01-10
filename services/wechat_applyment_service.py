@@ -363,7 +363,7 @@ class WechatApplymentService:
             with conn.cursor() as cur:
                 # 检查当前状态
                 cur.execute("""
-                    SELECT id, applyment_state, subject_info 
+                    SELECT id, applyment_state, subject_info, subject_type 
                     FROM wx_applyment 
                     WHERE user_id = %s AND applyment_state = 'APPLYMENT_STATE_FINISHED'
                     ORDER BY finished_at DESC LIMIT 1
@@ -378,8 +378,8 @@ class WechatApplymentService:
                 old_subject_info = json.loads(existing["subject_info"])
 
                 # 经营类目不可修改校验
-                if 'business_category' in new_bank_info and old_subject_info.get('business_category') != new_bank_info[
-                    'business_category']:
+                if 'business_category' in new_bank_info and old_subject_info.get(
+                        'business_category') != new_bank_info.get('business_category'):
                     raise HTTPException(status_code=400, detail="经营类目不可修改")
 
                 # 标记核心信息已修改
@@ -389,16 +389,19 @@ class WechatApplymentService:
                     "updated_at": datetime.datetime.now()
                 }
                 update_sql = build_dynamic_update(cur, "wx_applyment", update_data, "id = %s")
-                # 关键修复：合并SET参数和WHERE参数
                 params = list(update_data.values()) + [existing["id"]]
                 cur.execute(update_sql, tuple(params))
 
                 # 创建新的进件记录
                 new_business_code = str(uuid.uuid4()).replace('-', '')
+
+                # 关键修复：从数据库字段获取subject_type
+                old_subject_type = existing["subject_type"]  # ← 必须添加这一行
+
                 insert_data = {
                     "user_id": user_id,
                     "business_code": new_business_code,
-                    "subject_type": old_subject_info.get("subject_type"),
+                    "subject_type": old_subject_type,  # ← 使用数据库字段值
                     "subject_info": existing["subject_info"],
                     "contact_info": json.dumps(data.get("contact_info", {}), ensure_ascii=False),
                     "bank_account_info": json.dumps(new_bank_info, ensure_ascii=False),
@@ -410,8 +413,41 @@ class WechatApplymentService:
                     "updated_at": datetime.datetime.now()
                 }
                 insert_sql = build_dynamic_insert(cur, "wx_applyment", insert_data)
-                # 关键修复：提供插入参数
-                cur.execute(insert_sql, tuple(insert_data.values()))
+                # 关键修复：提供插入参数（按顺序）
+                insert_values = [
+                    user_id,
+                    new_business_code,
+                    old_subject_type,
+                    existing["subject_info"],
+                    json.dumps(data.get("contact_info", {}), ensure_ascii=False),
+                    json.dumps(new_bank_info, ensure_ascii=False),
+                    "APPLYMENT_STATE_EDITTING",
+                    1,
+                    datetime.datetime.now() + datetime.timedelta(days=DRAFT_EXPIRE_DAYS),
+                    1,
+                    datetime.datetime.now(),
+                    datetime.datetime.now()
+                ]
+                cur.execute(insert_sql, tuple(insert_values))
+
+                # ========================================
+                # 新增：复制原申请单的材料到新申请单
+                # ========================================
+                cur.execute("""
+                    INSERT INTO wx_applyment_media (
+                        applyment_id, user_id, media_id, media_type,
+                        file_path, file_name, file_size, sha256, mime_type,
+                        upload_status, expires_at, created_at
+                    )
+                    SELECT 
+                        %s as applyment_id, 
+                        user_id, media_id, media_type,
+                        file_path, file_name, file_size, sha256, mime_type,
+                        upload_status, expires_at, NOW()
+                    FROM wx_applyment_media 
+                    WHERE applyment_id = %s
+                """, (cur.lastrowid, existing["id"]))
+                # ========================================
 
                 conn.commit()
                 logger.info(f"用户 {user_id} 修改核心信息，重新进件: {cur.lastrowid}")
