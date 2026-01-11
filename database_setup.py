@@ -588,7 +588,6 @@ class DatabaseManager:
                     INDEX idx_sub_mchid (sub_mchid),
                     INDEX idx_verify_result (verify_result),
                     INDEX idx_status (status)
-                    UNIQUE KEY uk_card_hash (card_hash)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
             'merchant_realname_verification': """
@@ -740,6 +739,19 @@ class DatabaseManager:
         self._add_merchant_settlement_accounts_foreign_keys(cursor)
         self._add_merchant_realname_verification_foreign_keys(cursor)
         self._add_user_bankcard_operations_foreign_keys(cursor)
+
+        try:
+            cursor.execute("""
+                CREATE UNIQUE INDEX uk_card_hash_active 
+                ON merchant_settlement_accounts (card_hash) 
+                WHERE status = 1
+            """)
+            logger.info("✅ 已创建条件唯一索引 uk_card_hash_active（防重复绑卡）")
+        except pymysql.MySQLError as e:
+            if e.args[0] == 1061:  # Duplicate key name 错误
+                logger.debug("ℹ️ 条件唯一索引 uk_card_hash_active 已存在，跳过创建")
+            else:
+                logger.warning(f"⚠️ 创建条件唯一索引失败: {e}")
 
         self._init_finance_accounts(cursor)
         logger.info("数据库表结构初始化完成")

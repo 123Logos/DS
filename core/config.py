@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     WX_WECHATPAY_SERIAL: str = ""
 
     PUSH_TEMPLATE_ID_APPLYMENT: str = ""
-
+    ENVIRONMENT: str = "development"
 
 # 实例化设置
 settings = Settings()
@@ -254,3 +254,4 @@ WX_WECHATPAY_SERIAL: Final[str] = settings.WX_WECHATPAY_SERIAL or ""
 
 # 推送配置
 PUSH_TEMPLATE_ID_APPLYMENT = settings.PUSH_TEMPLATE_ID_APPLYMENT        # 新增
+ENVIRONMENT: Final[str] = settings.ENVIRONMENT
