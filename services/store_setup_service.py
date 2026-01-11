@@ -4,7 +4,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any
 from fastapi import UploadFile, HTTPException
-from core.database import get_conn, execute_one, execute_update, execute_insert
+from core.database import get_conn
 from core.table_access import build_dynamic_select
 from core.exceptions import FinanceException
 from core.config import BASE_PIC_DIR
@@ -52,10 +52,12 @@ class StoreSetupService:
         # 检查是否已存在店铺信息
         with get_conn() as conn:
             with conn.cursor() as cur:
-                existing = execute_one(
+                cur.execute(
                     "SELECT id FROM merchant_stores WHERE user_id=%s",
-                    (req.user_id,), cur
+                    (req.user_id,)
                 )
+                existing = cur.fetchone()
+
                 if existing:
                     raise FinanceException("店铺信息已存在，请使用更新接口")
 
@@ -65,16 +67,18 @@ class StoreSetupService:
                         contact_name, contact_phone, contact_email, business_hours, store_address
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """
-                store_id = execute_insert(sql, (
+                # ✅ 修复：使用 cur.execute + cur.lastrowid
+                cur.execute(sql, (
                     req.user_id, req.store_name, req.store_logo_image_id,
                     req.store_description, req.contact_name, req.contact_phone,
                     req.contact_email, req.business_hours, req.store_address
-                ), cur)
+                ))
+                store_id = cur.lastrowid
 
                 # 设置用户为商家
-                execute_update(
+                cur.execute(
                     "UPDATE users SET is_merchant=1 WHERE id=%s",
-                    (req.user_id,), cur
+                    (req.user_id,)
                 )
 
                 conn.commit()
@@ -86,10 +90,12 @@ class StoreSetupService:
         """更新店铺信息"""
         with get_conn() as conn:
             with conn.cursor() as cur:
-                store = execute_one(
+                cur.execute(
                     "SELECT id FROM merchant_stores WHERE user_id=%s",
-                    (user_id,), cur
+                    (user_id,)
                 )
+                store = cur.fetchone()
+
                 if not store:
                     raise FinanceException("店铺信息不存在")
 
@@ -130,7 +136,7 @@ class StoreSetupService:
                     SET {', '.join(update_fields)}, updated_at=NOW() 
                     WHERE user_id=%s
                 """
-                execute_update(sql, params, cur)
+                cur.execute(sql, params)
                 conn.commit()
 
         logger.info(f"店铺信息更新成功: user_id={user_id}")
@@ -140,11 +146,27 @@ class StoreSetupService:
         """获取店铺信息"""
         with get_conn() as conn:
             with conn.cursor() as cur:
-                sql = build_dynamic_select(
-                    cur, "merchant_stores",
-                    where_clause="user_id=%s"
+                # ✅ 修复：使用 id AS store_id 别名，匹配 Pydantic 模型
+                cur.execute(
+                    """
+                    SELECT 
+                        id AS store_id,
+                        user_id,
+                        store_name,
+                        store_logo_image_id,
+                        store_description,
+                        contact_name,
+                        contact_phone,
+                        contact_email,
+                        business_hours,
+                        store_address,
+                        created_at,
+                        updated_at
+                    FROM merchant_stores 
+                    WHERE user_id=%s
+                    """,
+                    (user_id,)
                 )
-                cur.execute(sql, (user_id,))
                 store = cur.fetchone()
 
                 if not store:
@@ -152,8 +174,7 @@ class StoreSetupService:
 
                 # 生成LOGO URL
                 if store.get('store_logo_image_id'):
-                    store[
-                        'store_logo_url'] = f"https://your-domain.com/api/store/logo/preview/{store['store_logo_image_id']}"
+                    store['store_logo_url'] = f"/api/store/logo/preview/{store['store_logo_image_id']}"
 
                 return store
 
@@ -162,10 +183,12 @@ class StoreSetupService:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 # 检查支付进件状态（has_store_permission）
-                user = execute_one(
+                cur.execute(
                     "SELECT has_store_permission, is_merchant FROM users WHERE id=%s",
-                    (user_id,), cur
+                    (user_id,)
                 )
+                user = cur.fetchone()
+
                 if not user:
                     raise FinanceException(f"用户不存在: user_id={user_id}")
 
@@ -174,12 +197,13 @@ class StoreSetupService:
                 is_merchant = user['is_merchant'] == 1
 
                 # 检查是否已设置店铺信息
-                store = execute_one(
+                cur.execute(
                     "SELECT id FROM merchant_stores WHERE user_id=%s",
-                    (user_id,), cur
+                    (user_id,)
                 )
-                has_store_info = store is not None
+                store = cur.fetchone()
 
+                has_store_info = store is not None
                 can_setup_store = has_store_permission and not has_store_info
 
                 return {
@@ -293,27 +317,6 @@ class StoreSetupService:
 
                     conn.commit()
                     logger.info(f"店铺LOGO删除成功: user_id={user_id}")
-
-
-    def _save_logo(self, file_content: bytes, image_id: str) -> str:
-        """保存LOGO文件"""
-        base_dir = BASE_PIC_DIR / "store_logos"
-        base_dir.mkdir(parents=True, exist_ok=True)
-
-        file_path = base_dir / image_id
-        with open(file_path, "wb") as f:
-            f.write(file_content)
-
-        return str(file_path)
-
-    def get_logo_url(self, image_id: str) -> Optional[str]:
-        """获取LOGO预览URL"""
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                sql = "SELECT file_path FROM store_logos WHERE image_id=%s"
-                cur.execute(sql, (image_id,))
-                result = cur.fetchone()
-                return result['file_path'] if result else None
 
 
 class StoreAdminService:
