@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     UVICORN_PORT: int = 8000
     DRAFT_EXPIRE_DAYS: int = 7
     MAX_FILE_SIZE_MB: int = 10
+    qrcode_expire_seconds: int = 300
 
     # 数据库
     MYSQL_HOST: str = "127.0.0.1"
@@ -259,3 +260,5 @@ WX_WECHATPAY_SERIAL: Final[str] = settings.WX_WECHATPAY_SERIAL or ""
 # 推送配置
 PUSH_TEMPLATE_ID_APPLYMENT = settings.PUSH_TEMPLATE_ID_APPLYMENT        # 新增
 ENVIRONMENT: Final[str] = settings.ENVIRONMENT
+
+QRCODE_EXPIRE_SECONDS: Final[int] = settings.qrcode_expire_seconds

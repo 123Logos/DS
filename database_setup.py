@@ -177,13 +177,19 @@ class DatabaseManager:
                     qrcode_expire       DATETIME DEFAULT NULL COMMENT '码过期时间',
                     refresh_count       TINYINT NOT NULL DEFAULT 0 COMMENT '已刷新次数',
                     related_order_no    VARCHAR(50) DEFAULT NULL COMMENT '关联主订单号',
+                    pay_time            DATETIME NULL COMMENT '微信/支付宝支付成功时间',
+                    transaction_id      VARCHAR(64) DEFAULT NULL COMMENT '微信/支付宝交易号',
+                    refund_id           VARCHAR(64) DEFAULT NULL COMMENT '微信/支付宝退款单号',
+                    refund_time         DATETIME NULL COMMENT '退款完成时间',
+                    openid              VARCHAR(64) DEFAULT NULL COMMENT '付款人 openid（可选）',
                     created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_merchant  (merchant_id),
                     INDEX idx_status    (status),
-                    INDEX idx_expire    (qrcode_expire)
+                    INDEX idx_expire    (qrcode_expire),
+                    INDEX idx_trans     (transaction_id)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-            """,
+                """,
             'order_items': """
                 CREATE TABLE IF NOT EXISTS order_items (
                     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,

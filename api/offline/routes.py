@@ -1,5 +1,5 @@
 # api/offline/routes.py  —— 统一风格版
-from fastapi import APIRouter, HTTPException, Query, Depends
+from fastapi import APIRouter, HTTPException, Query, Depends, Request, Response
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime
@@ -9,6 +9,7 @@ from core.auth import get_current_user          # 如需登录鉴权
 from core.logging import get_logger
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from services.offline_service import OfflineService   # 业务逻辑层（稍后实现）
+import xmltodict
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -122,14 +123,11 @@ async def unified_order(
 
 
 # ------------------ 5. 支付回调 ------------------
-@router.post("/zhifu/notify", summary="支付回调（供微信/支付宝）")
-async def pay_notify():
-    try:
-        result = await OfflineService.handle_notify()
-        return result
-    except Exception as e:
-        logger.error(f"回调处理失败: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+@router.post("/zhifu/notify", summary="微信回调")
+async def pay_notify(request: Request):
+    raw_body = await request.body()          # ← 二进制
+    result = await OfflineService.handle_notify(raw_body)
+    return Response(content=result, media_type="application/xml")
 
 
 # ------------------ 6. 订单列表 ------------------
@@ -177,7 +175,10 @@ async def qrcode_status(
     current_user: dict = Depends(get_current_user)
 ):
     try:
-        result = await OfflineService.qrcode_status(order_no=order_no)
+        result = await OfflineService.qrcode_status(
+            order_no=order_no,
+            merchant_id=current_user["id"]   # ← 传当前登录用户
+        )
         return {"code": 0, "message": "查询成功", "data": result}
     except Exception as e:
         logger.error(f"收款码状态查询失败: {e}")
