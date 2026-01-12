@@ -9,7 +9,7 @@ from core.logging import get_logger
 
 logger = get_logger(__name__)
 
-# ----------- 仅在非 Mock 模式才读证书并初始化 wxpay ----------
+# ----------- 全局 wxpay 实例 ----------
 if not settings.WX_MOCK_MODE:
     _private_key = Path(settings.WECHAT_PAY_API_KEY_PATH).read_text(encoding="utf-8")
     wxpay = WeChatPay(
@@ -22,7 +22,7 @@ if not settings.WX_MOCK_MODE:
         user_agent="github.com/wechatpay-apiv3/wechatpay-python"
     )
 else:
-    wxpay = None  # Mock 模式下后面直接跳过真实转账
+    wxpay = None
 
 
 # 2. 给用户微信“零钱到账”通知

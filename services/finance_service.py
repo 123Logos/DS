@@ -2053,6 +2053,17 @@ class FinanceService:
                     "used_at": c['used_at'].strftime("%Y-%m-%d %H:%M:%S") if c['used_at'] else None,
                     "created_at": c['created_at'].strftime("%Y-%m-%d %H:%M:%S")
                 } for c in coupons]
+            # ----------------------------------
+                # 供线下模块调用的快捷接口
+            # ----------------------------------
+    def list_available(self, user_id: int, amount: int = 0) -> List[Dict[str, Any]]:
+        """
+        查询用户当前可用的优惠券列表（线下收银台用）
+        :param user_id: 用户ID
+        :param amount: 订单金额（分），用于过滤门槛
+        :return: 优惠券列表，元素格式同 get_user_coupons
+        """
+        return self.get_user_coupons(user_id, status='unused')
 
     # ==================== 关键修改7：财务报告使用member_points ====================
     def get_finance_report(self) -> Dict[str, Any]:
