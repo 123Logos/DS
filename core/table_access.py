@@ -102,6 +102,10 @@ def build_select_list(fields: List[str]) -> str:
     for f in fields:
         if not isinstance(f, str):
             raise ValueError("select fields must be strings")
+        # 纯数字或小数字面量直接保留（例如用于 EXISTS/存在性检查：SELECT 1）
+        if re.match(r"^\d+(\.\d+)?$", f):
+            parts.append(f)
+            continue
         low = f.lower()
         if " " in f or "(" in f or "`" in f or " as " in low:
             parts.append(f)
