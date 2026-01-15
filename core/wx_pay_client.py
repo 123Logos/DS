@@ -520,17 +520,33 @@ class WeChatPayClient:
             associated_data = resource.get("associated_data", "")
 
             key = self.apiv3_key
+            if not key:
+                raise Exception("API v3 key 未配置")
+            # 生产要求：key 必须为 16/24/32 字节，长度不符应视为配置错误
+            if len(key) not in (16, 24, 32):
+                raise Exception("API v3 key 长度无效，必须为 16/24/32 字节")
+
             aesgcm = AESGCM(key)
 
+            # nonce 可能是 base64 编码的原始字节，也可能是明文字符串，先尝试 base64 解码
+            try:
+                nonce_bytes = base64.b64decode(nonce)
+            except Exception:
+                nonce_bytes = nonce.encode('utf-8')
+
+            associated_bytes = associated_data.encode('utf-8') if associated_data else None
+
             decrypted = aesgcm.decrypt(
-                nonce.encode('utf-8'),
+                nonce_bytes,
                 base64.b64decode(cipher_text),
-                associated_data.encode('utf-8')
+                associated_bytes
             )
             return json.loads(decrypted.decode('utf-8'))
         except Exception as e:
             logger.error(f"解密失败: {str(e)}")
-            return json.loads(resource.get("ciphertext", "{}"))
+            # 解密失败时不尝试将 ciphertext 当作 JSON 解析返回（会导致二次解析错误）
+            # 返回空字典，调用方应对缺失字段做校验并返回合适的错误响应
+            return {}
 
     # ==================== 结算账户相关API ====================
 

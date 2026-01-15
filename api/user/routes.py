@@ -1275,8 +1275,19 @@ async def wechat_login(request: Request):
         raise HTTPException(status_code=400, detail="缺少参数")
 
     try:
-        # 调用微信接口，通过code换取openid和session_key
-        openid, session_key = WechatService.get_openid_by_code(code)
+        # 调用微信接口，通过 code 换取 openid、session_key（可选 unionid）
+        result = WechatService.get_openid_by_code(code)
+        # 支持返回 (openid, session_key) 或 (openid, session_key, unionid)
+        if isinstance(result, (list, tuple)):
+            if len(result) >= 2:
+                openid, session_key = result[0], result[1]
+            else:
+                openid, session_key = result, ""
+            unionid = result[2] if len(result) >= 3 else ""
+        else:
+            openid = result
+            session_key = ""
+            unionid = ""
 
         # 检查用户是否已注册
         user = WechatService.check_user_by_openid(openid)
@@ -1295,14 +1306,18 @@ async def wechat_login(request: Request):
         # ✅ 关键修改：使用微信专用Token类型，生成124位Token
         token = create_access_token(user_id, token_type="wechat")
 
-        logger.info(f"微信登录成功 - 用户ID: {user_id}, Token: {token[:20]}..., Token长度: {len(token)}")
+        logger.info(f"微信登录成功 - 用户ID: {user_id}, Token: {token[:20]}..., Token长度: {len(token)}, openid={openid}")
 
-        return AuthResp(
-            uid=user_id,
-            token=token,
-            level=level,
-            is_new=is_new_user
-        )
+        # 返回给前端额外的微信凭证，方便前端保存 openid/session_key/unionid
+        return {
+            "uid": user_id,
+            "token": token,
+            "level": level,
+            "is_new": is_new_user,
+            "openid": openid,
+            "session_key": session_key,
+            "unionid": unionid or ""
+        }
 
     except HTTPException:
         raise

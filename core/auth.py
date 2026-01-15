@@ -508,7 +508,7 @@ def ensure_sessions_table():
                     CREATE TABLE IF NOT EXISTS sessions (
                         id INT AUTO_INCREMENT PRIMARY KEY,
                         user_id INT NOT NULL,
-                        token VARCHAR(64) NOT NULL UNIQUE,
+                        token VARCHAR(256) NOT NULL UNIQUE,
                         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                         expired_at DATETIME NOT NULL,
                         INDEX idx_token (token),
