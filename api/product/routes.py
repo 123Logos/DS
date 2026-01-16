@@ -782,8 +782,10 @@ def update_product(id: int, payload: ProductUpdate):
 @router.post("/products/{id}/images", summary="📸 上传商品图片")
 def upload_images(
         id: int,
-        detail_images: List[UploadFile] = File([], description="详情图，最多10张，单张<3MB，仅JPG/PNG/WEBP"),
-        banner_images: List[UploadFile] = File([], description="轮播图，最多10张，单张<5MB，仅JPG/PNG/WEBP"),
+        # ✅ 修改：将详情图大小限制从<3MB改为<10MB
+        detail_images: List[UploadFile] = File([], description="详情图，最多10张，单张<10MB，仅JPG/PNG/WEBP"),
+        # ✅ 修改：将轮播图大小限制从<5MB改为<10MB
+        banner_images: List[UploadFile] = File([], description="轮播图，最多10张，单张<10MB，仅JPG/PNG/WEBP"),
 ):
     from PIL import Image
     import uuid
@@ -842,8 +844,9 @@ def upload_images(
                         ext = Path(f.filename).suffix.lower()
                         if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
                             raise HTTPException(status_code=400, detail="仅支持 JPG/PNG/WEBP")
-                        if f.size > 3 * 1024 * 1024:
-                            raise HTTPException(status_code=400, detail="详情图单张大小不能超过 3MB")
+                        # ✅ 修改：将详情图大小限制从3MB改为10MB
+                        if f.size > 10 * 1024 * 1024:
+                            raise HTTPException(status_code=400, detail="详情图单张大小不能超过 10MB")
                         file_name = f"detail_{uuid.uuid4().hex}{ext}"
                         file_path = goods_path / file_name
                         with Image.open(f.file) as im:
@@ -866,8 +869,9 @@ def upload_images(
                         ext = Path(f.filename).suffix.lower()
                         if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
                             raise HTTPException(status_code=400, detail="仅支持 JPG/PNG/WEBP")
-                        if f.size > 5 * 1024 * 1024:
-                            raise HTTPException(status_code=400, detail="轮播图单张大小不能超过 5MB")
+                        # ✅ 修改：将轮播图大小限制从5MB改为10MB
+                        if f.size > 10 * 1024 * 1024:
+                            raise HTTPException(status_code=400, detail="轮播图单张大小不能超过 10MB")
                         file_name = f"banner_{uuid.uuid4().hex}{ext}"
                         file_path = goods_path / file_name
                         with Image.open(f.file) as im:
@@ -1137,7 +1141,8 @@ def delete_images(
 def update_images(
         id: int,
         image_type: str = Query(..., pattern="^(banner|detail)$", description="图片类型: banner=轮播图, detail=详情图"),
-        files: List[UploadFile] = File(..., description="图片文件列表，最多10张"),
+        # ✅ 修改：更新接口的文件描述也统一改为<10MB
+        files: List[UploadFile] = File(..., description="图片文件列表，最多10张，单张<10MB"),
 ):
     """
     更新商品图片（追加式）
@@ -1194,8 +1199,9 @@ def update_images(
                         ext = Path(f.filename).suffix.lower()
                         if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
                             raise HTTPException(status_code=400, detail="仅支持 JPG/PNG/WEBP")
-                        if f.size > 3 * 1024 * 1024:
-                            raise HTTPException(status_code=400, detail="详情图单张大小不能超过 3MB")
+                        # ✅ 修改：将详情图大小限制从3MB改为10MB
+                        if f.size > 10 * 1024 * 1024:
+                            raise HTTPException(status_code=400, detail="详情图单张大小不能超过 10MB")
 
                         # 保存文件
                         file_name = f"detail_{uuid.uuid4().hex}{ext}"
@@ -1232,8 +1238,9 @@ def update_images(
                         ext = Path(f.filename).suffix.lower()
                         if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
                             raise HTTPException(status_code=400, detail="仅支持 JPG/PNG/WEBP")
-                        if f.size > 5 * 1024 * 1024:
-                            raise HTTPException(status_code=400, detail="轮播图单张大小不能超过 5MB")
+                        # ✅ 修改：将轮播图大小限制从5MB改为10MB
+                        if f.size > 10 * 1024 * 1024:
+                            raise HTTPException(status_code=400, detail="轮播图单张大小不能超过 10MB")
 
                         # 保存文件
                         file_name = f"banner_{uuid.uuid4().hex}{ext}"
