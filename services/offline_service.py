@@ -12,6 +12,7 @@ from core.config import settings
 from core.logging import get_logger
 from services.finance_service import FinanceService
 from services.notify_service import notify_merchant
+from pathlib import Path
 import pymysql
 import xmltodict
 
@@ -20,14 +21,27 @@ logger = get_logger(__name__)
 # -------------- 运行时 wxpay 初始化 --------------
 if not settings.WX_MOCK_MODE:
     from wechatpayv3 import WeChatPay, WeChatPayType
+    priv_path = Path(settings.WECHAT_PAY_API_KEY_PATH)
+    if not priv_path.exists():
+        raise RuntimeError(f"WeChat private key file not found: {priv_path}")
+    private_key = priv_path.read_text(encoding="utf-8")
+
+    public_key = None
+    if settings.WECHAT_PAY_PUBLIC_KEY_PATH:
+        pub_path = Path(settings.WECHAT_PAY_PUBLIC_KEY_PATH)
+        if pub_path.exists():
+            public_key = pub_path.read_text(encoding="utf-8")
+        else:
+            logger.warning(f"WeChat public key file not found: {pub_path}")
+
     wxpay: WeChatPay = WeChatPay(
         wechatpay_type=WeChatPayType.MINIPROG,
         mchid=settings.WECHAT_PAY_MCH_ID,
-        private_key=settings.WECHAT_PAY_API_KEY_PATH,  # 你的真实配置
+        private_key=private_key,
         cert_serial_no=settings.WECHAT_CERT_SERIAL_NO,
         apiv3_key=settings.WECHAT_PAY_API_V3_KEY,
         appid=settings.WECHAT_APP_ID,
-        public_key=settings.WECHAT_PAY_PUBLIC_KEY_PATH,
+        public_key=public_key,
         public_key_id=settings.WECHAT_PAY_PUB_KEY_ID,
     )
 else:
