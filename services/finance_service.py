@@ -2986,8 +2986,8 @@ class FinanceService:
                             "reward_id": r['id'],
                             "user_id": r['user_id'],
                             "user_name": r['user_name'],
-                            "points_issued": float(r['points_issued']),
-                            "current_points_balance": float(r['current_points'] or 0),
+                            "points_issued": str(r['points_issued']),
+                            "current_points_balance": str(r['current_points'] or 0),
                             "status": "已自动发放",
                             "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S"),
                             "points_field": "referral_points",
@@ -3067,8 +3067,8 @@ class FinanceService:
                 return {
                     "summary": {
                         "total_records": summary['total_records'] or 0,
-                        "total_referral_points": float(summary.get('total_referral_points', 0) or 0),
-                        "total_team_points": float(summary.get('total_team_points', 0) or 0)
+                        "total_referral_points": str(summary.get('total_referral_points', 0) or 0),
+                        "total_team_points": str(summary.get('total_team_points', 0) or 0)
                     },
                     "pagination": {
                         "page": page,
@@ -3082,8 +3082,8 @@ class FinanceService:
                             "user_id": r['user_id'],
                             "user_name": r['user_name'],
                             "reward_type": '推荐' if 'referral' in r['account_type'] else '团队',
-                            "points_issued": float(r['points_issued']),
-                            "current_points_balance": float(r['current_points'] or 0),
+                            "points_issued": str(r['points_issued']),
+                            "current_points_balance": str(r['current_points'] or 0),
                             "remark": r['remark'],
                             "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S"),
                             "points_field": r['account_type'],
@@ -4862,43 +4862,43 @@ class FinanceService:
                         "user_name": user['name'],
                         "points_summary": {
                             "subsidy_points": {
-                                "current_balance": float(subsidy_balance),
-                                "total_earned": float(subsidy_income),
-                                "total_used": float(subsidy_expense),
+                                "current_balance": str(subsidy_balance),
+                                "total_earned": str(subsidy_income),
+                                "total_used": str(subsidy_expense),
                                 "remark": "周补贴专用点数（从 member_points 转换而来）"
                             },
                             "referral_points": {
-                                "current_balance": float(referral_balance),
-                                "total_earned": float(referral_income),
-                                "total_used": float(referral_expense),
+                                "current_balance": str(referral_balance),
+                                "total_earned": str(referral_income),
+                                "total_used": str(referral_expense),
                                 "remark": "推荐奖励专用点数"
                             },
                             "team_reward_points": {
-                                "current_balance": float(team_balance),
-                                "total_earned": float(team_income),
-                                "total_used": float(team_expense),
+                                "current_balance": str(team_balance),
+                                "total_earned": str(team_income),
+                                "total_used": str(team_expense),
                                 "remark": "团队奖励专用点数"
                             },
                             "unilevel_points": {
-                                "current_balance": float(unilevel_balance),
-                                "total_earned": float(unilevel_income),
-                                "total_used": float(unilevel_expense),
+                                "current_balance": str(unilevel_balance),
+                                "total_earned": str(unilevel_income),
+                                "total_used": str(unilevel_expense),
                                 "remark": "联创星级分红专用点数"
                             },
                             "true_total_points": {
-                                "current_balance": float(true_total_balance),
-                                "total_deducted": float(true_total_deduction),  # 优惠券发放导致的扣减
+                                "current_balance": str(true_total_balance),
+                                "total_deducted": str(true_total_deduction),  # 优惠券发放导致的扣减
                                 "remark": "真实总点数（用于优惠券兑换）"
                             }
                         },
                         "grand_total": {
-                            "total_balance": float(
+                            "total_balance": str(
                                 true_total_balance
                             ),
-                            "total_earned": float(
+                            "total_earned": str(
                                 subsidy_income + referral_income + team_income + unilevel_income
                             ),
-                            "total_deducted": float(true_total_deduction)  # 优惠券扣减
+                            "total_deducted": str(true_total_deduction)  # 优惠券扣减
                         }
                     })
 

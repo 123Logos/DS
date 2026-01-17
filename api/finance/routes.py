@@ -247,7 +247,7 @@ async def get_public_welfare_balance(
             data={
                 "account_name": "公益基金",
                 "account_type": "public_welfare",
-                "balance": float(balance),
+                "balance": str(balance),
                 "reserved": 0.0,
                 "remark": "该账户自动汇入1%交易额"
             }
@@ -288,8 +288,8 @@ async def get_public_welfare_flow(
                 "id": flow['id'],
                 "related_user": flow['related_user'],
                 "user_name": get_user_name(flow['related_user']),
-                "change_amount": float(flow['change_amount']),
-                "balance_after": float(flow['balance_after']) if flow['balance_after'] else None,
+                "change_amount": str(flow['change_amount']),
+                "balance_after": str(flow['balance_after']) if flow['balance_after'] else None,
                 "flow_type": flow['flow_type'],
                 "remark": flow['remark'],
                 "created_at": flow['created_at'].strftime("%Y-%m-%d %H:%M:%S") if isinstance(flow['created_at'],
@@ -332,8 +332,8 @@ async def get_public_welfare_report(
         details = [{
             **item,
             "user_name": get_user_name(item['related_user']),
-            "change_amount": float(item['change_amount']),
-            "balance_after": float(item['balance_after']) if item['balance_after'] else None,
+            "change_amount": str(item['change_amount']),
+            "balance_after": str(item['balance_after']) if item['balance_after'] else None,
             "created_at": item['created_at'].strftime("%Y-%m-%d %H:%M:%S") if isinstance(item['created_at'],
                                                                                          datetime) else str(
                 item['created_at'])
@@ -988,7 +988,7 @@ async def get_company_points_balance(
             data={
                 "account_name": "公司积分账户",
                 "account_type": "company_points",
-                "balance": float(balance),
+                "balance": str(balance),
                 "reserved": 0.0,
                 "remark": "平台自有积分储备，用于积分抵扣等业务"
             }
@@ -1012,7 +1012,7 @@ async def get_platform_revenue_balance(
             data={
                 "account_name": "平台收入池",
                 "account_type": "platform_revenue_pool",
-                "balance": float(balance),
+                "balance": str(balance),
                 "reserved": 0.0,
                 "remark": "平台运营资金池，主要来源于商品销售收入的80%"
             }
