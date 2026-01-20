@@ -101,6 +101,7 @@ class UserInfoResp(BaseModel):
     name: Optional[str]
     avatar_path: Optional[str]
     member_level: int
+    is_merchant: int
     status: UserStatus
     referral_code: Optional[str]
     direct_count: int
