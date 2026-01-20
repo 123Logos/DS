@@ -85,7 +85,7 @@ class DatabaseManager:
                     referral_code VARCHAR(6) NULL COMMENT '推荐码',
                     withdrawable_balance DECIMAL(14,2) NOT NULL DEFAULT 0.00 COMMENT '可提现余额',
                     avatar_path VARCHAR(255) NULL DEFAULT NULL COMMENT '头像路径',
-                    is_merchant TINYINT(1) NOT NULL DEFAULT 0 COMMENT '判断是不是商家',
+                    is_merchant TINYINT NOT NULL DEFAULT 0 COMMENT '0=普通用户,1=商家,2=第三方/平台',
                     six_director INT NULL DEFAULT 0 COMMENT '直推六星人数，用于荣誉董事晋升判定',
                     six_team INT NULL DEFAULT 0 COMMENT '团队六星人数，用于荣誉董事晋升判定',
                     wechat_sub_mchid VARCHAR(32) NULL DEFAULT NULL COMMENT '微信特约商户号',

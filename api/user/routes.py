@@ -482,7 +482,7 @@ def user_info(mobile: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, mobile, name, avatar_path, member_level, status, referral_code "
+                "SELECT id, mobile, name, avatar_path, member_level, is_merchant, status, referral_code "
                 "FROM users WHERE mobile=%s AND status != %s",
                 (mobile, UserStatus.DELETED.value)
             )
@@ -530,12 +530,13 @@ def user_info(mobile: str):
             cur.execute(select_sql, (u["id"],))
             assets = cur.fetchone()
 
-    return UserInfoResp(
+        return UserInfoResp(
         uid=u["id"],
         mobile=u["mobile"],
         name=u["name"],
         avatar_path=u["avatar_path"],
         member_level=u["member_level"],
+            is_merchant=u.get("is_merchant", 0) or 0,
         status=u["status"],
         referral_code=u["referral_code"],
         direct_count=direct_count,

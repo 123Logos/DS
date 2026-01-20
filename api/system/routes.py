@@ -1,5 +1,5 @@
 # api/system/routes.py - 系统配置相关接口
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from typing import Optional
 from core.database import get_conn
 from core.logging import get_logger
@@ -163,4 +163,30 @@ def update_system_sentences(payload: SystemSentenceUpdate):
                 conn.rollback()
                 logger.error(f"更新系统标语失败: {str(e)}")
                 raise HTTPException(status_code=500, detail=f"更新系统标语失败: {str(e)}")
+
+
+@router.post("/system/grant-system", summary="🧠给予系统权限")
+def grant_system_permission(
+    user_id: int = Query(..., description="用户ID"),
+    key: str = Query(..., description="后台密钥"),
+    is_merchant: int = Query(..., description="商户类型：0=普通用户,1=商家,2=第三方/平台")
+):
+    """后台接口：通过密钥将指定用户的 `is_merchant` 设置为 0/1/2（仅允许这三种值）"""
+    # 密钥校验
+    if key != "fheq083@$!":
+        raise HTTPException(status_code=403, detail="密钥错误")
+
+    # 参数校验：只允许 0,1,2
+    if is_merchant not in (0, 1, 2):
+        raise HTTPException(status_code=400, detail="is_merchant 必须为 0、1 或 2")
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE id=%s", (user_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="用户不存在")
+
+            cur.execute("UPDATE users SET is_merchant=%s WHERE id=%s", (is_merchant, user_id))
+            conn.commit()
+            return {"msg": "is_merchant 已更新", "user_id": user_id, "is_merchant": is_merchant}
 
