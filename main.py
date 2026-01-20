@@ -14,6 +14,9 @@ from core.config import get_db_config, PIC_PATH, AVATAR_UPLOAD_DIR,UVICORN_PORT
 from core.logging import setup_logging
 from database_setup import initialize_database
 from api.wechat_pay.routes import register_wechat_pay_routes
+from core.logging import get_logger
+
+logger = get_logger(__name__)
 
 # 配置日志（如果需要同时输出到控制台，可以设置 log_to_console=True）
 setup_logging(log_to_file=True, log_to_console=True)
@@ -68,6 +71,16 @@ app = FastAPI(
 )
 # 注册全局异常处理器（放在 core/json_response.py 中实现）
 register_exception_handlers(app)
+
+
+# 在每次应用启动时初始化数据库表结构（幂等）
+@app.on_event("startup")
+def on_startup():
+    logger.info("应用启动：检查并初始化数据库表结构与后台任务")
+    try:
+        initialize_database()
+    except Exception as e:
+        logger.error(f"初始化数据库失败: {e}")
 
 # ... 原有代码保持不变 ...
 
