@@ -1,6 +1,6 @@
 # models/schemas/product.py - 商品系统 Pydantic 模型
 from pydantic import BaseModel, Field, ConfigDict
-from typing import Optional, List, Dict, Any  # ✅ 新增：导入 Dict, Any
+from typing import Optional, List, Dict, Any
 from decimal import Decimal
 from datetime import datetime
 
@@ -87,11 +87,11 @@ class ProductCreateRequest(BaseModel):
     main_image: Optional[str] = Field(None, max_length=500)
     detail_images: Optional[str] = None
     status: int = Field(default=ProductStatus.DRAFT, ge=0, le=3)
-    user_id: Optional[int] = None
+    # ✅ 修改：user_id 改为必填字段
+    user_id: int = Field(..., description="商家用户ID，必须提供")
     is_member_product: bool = Field(default=False)
     buy_rule: Optional[str] = None
     freight: Decimal = Field(default=Decimal("0.00"), ge=0)
-    # ✅ 新增字段：积分抵扣上限
     max_points_discount: Optional[Decimal] = Field(None, ge=0)
     skus: Optional[List[ProductSkuModel]] = None
     attributes: Optional[List[ProductAttributeModel]] = None
