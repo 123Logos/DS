@@ -76,6 +76,22 @@ def get_optional_files(files: Optional[List[UploadFile]] = File(None)) -> Option
     return valid_files if valid_files else None
 
 
+# ✅ 新增：用户验证辅助函数（必须添加）
+def _validate_user_exists(user_id: int) -> Dict[str, Any]:
+    """验证用户是否存在并返回用户信息"""
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="必须提供商家ID (user_id)")
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            select_sql = build_dynamic_select(cur, "users", where_clause="id = %s")
+            cur.execute(select_sql, (user_id,))
+            user = cur.fetchone()
+            if not user:
+                raise HTTPException(status_code=404, detail=f"用户ID {user_id} 不存在")
+            return user
+
+
 # ✅ 修改：在 PRODUCT_COLUMNS 中添加 max_points_discount
 PRODUCT_COLUMNS = ["id", "name", "pinyin", "description", "category",
                    "main_image", "detail_images", "status", "user_id",
@@ -130,6 +146,21 @@ def build_product_dict(product: Dict[str, Any], skus: List[Dict[str, Any]] = Non
     return base
 
 
+# ✅ 修改：新增用户验证辅助函数
+def _validate_user_exists(user_id: int) -> Dict[str, Any]:
+    """验证用户是否存在并返回用户信息"""
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="必须提供商家ID (user_id)")
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            select_sql = build_dynamic_select(cur, "users", where_clause="id = %s")
+            cur.execute(select_sql, (user_id,))
+            user = cur.fetchone()
+            if not user:
+                raise HTTPException(status_code=404, detail=f"用户ID {user_id} 不存在")
+            return user
+
 class SkuCreate(BaseModel):
     sku_code: str
     price: float = Field(..., ge=0)  # 商品现价
@@ -154,15 +185,15 @@ class SkuUpdate(BaseModel):
     specifications: Optional[Dict[str, Any]] = None
 
 
+# ✅ 修改：ProductCreate 中的 user_id 改为必填
 class ProductCreate(BaseModel):
     name: str
     description: Optional[str] = None
     category: str
-    user_id: Optional[int] = None
+    user_id: int  # ✅ 修改：移除 Optional，改为必填字段（关键修改）
     is_member_product: bool = False
     buy_rule: Optional[str] = None
     freight: Optional[float] = Field(0.0, ge=0, le=0, description="运费，系统强制0")
-    # ✅ 新增字段：积分抵扣上限
     max_points_discount: Optional[float] = Field(None, ge=0, description="积分抵扣上限")
     skus: List[SkuCreate]
     attributes: Optional[List[Dict[str, str]]] = None
@@ -420,55 +451,110 @@ def get_all_products(
             return {"status": "success", "total": total, "page": page, "size": size, "data": result_data}
 
 
-@router.get("/products/{id}", summary="📦 查询单个商品")
-def get_product(id: int):
+# ✅ 修改：删除原查询单个商品接口，替换为查询商家商品列表
+# 注意：路径改为 /products/merchant/{user_id} 避免路由冲突
+@router.get("/products/merchant/{user_id}", summary="🏪 查询商家商品列表")
+def get_products_by_user(
+        user_id: int,
+        status: Optional[int] = Query(None, description="状态筛选"),
+        page: int = Query(1, ge=1, description="页码"),
+        size: int = Query(10, ge=1, le=100, description="每页条数")
+):
+    """
+    ✅ 修改说明：
+    1. 原接口：GET /products/{id} 通过商品ID查询单个商品
+    2. 新接口：GET /products/merchant/{user_id} 通过用户ID查询该商家的商品列表
+    3. 新增分页功能，支持状态筛选
+    """
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # 查询商品
-            select_sql = build_dynamic_select(
-                cur,
-                "products",
-                where_clause="id = %s"
-            )
-            cur.execute(select_sql, (id,))
-            product = cur.fetchone()
-            if not product:
-                raise HTTPException(status_code=404, detail="商品不存在")
+            # ✅ 验证用户是否存在
+            _validate_user_exists(user_id)
 
-            # 获取 SKUs
-            select_sql = build_dynamic_select(
-                cur,
-                "product_skus",
-                where_clause="product_id = %s",
-                # ✅ 修改：查询新增字段 original_price 和 specifications
-                select_fields=["id", "sku_code", "price", "original_price", "stock", "specifications"]
-            )
-            cur.execute(select_sql, (id,))
-            skus = cur.fetchall()
-            # ✅ 修改：格式化新增字段
-            skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']),
-                     "original_price": float(s['original_price']) if s['original_price'] else None,
-                     "stock": s['stock'], "specifications": s['specifications']} for s in skus]
+            # 构建查询条件
+            where_clauses = ["user_id = %s"]
+            params = [user_id]
 
-            # 获取 attributes
-            select_sql = build_dynamic_select(
-                cur,
-                "product_attributes",
-                where_clause="product_id = %s",
-                select_fields=["name", "value"]
-            )
-            cur.execute(select_sql, (id,))
-            attributes = cur.fetchall()
-            attributes = [{"name": a['name'], "value": a['value']} for a in attributes]
+            if status is not None:
+                where_clauses.append("status = %s")
+                params.append(status)
 
-            return {"status": "success", "data": build_product_dict(product, skus, attributes)}
+            where_sql = " WHERE " + " AND ".join(where_clauses)
+
+            # 查询总数
+            count_sql = f"SELECT COUNT(*) as total FROM products{where_sql}"
+            cur.execute(count_sql, tuple(params))
+            total = cur.fetchone()['total']
+
+            # 查询商品列表
+            offset = (page - 1) * size
+            select_sql = f"""
+                SELECT * FROM products
+                {where_sql}
+                ORDER BY id DESC
+                LIMIT %s OFFSET %s
+            """
+            cur.execute(select_sql, tuple(params + [size, offset]))
+            products = cur.fetchall()
+
+            # 获取每个商品的 SKUs 和 attributes
+            result_data = []
+            for product in products:
+                product_id = product['id']
+
+                # 获取 SKUs
+                select_sql = build_dynamic_select(
+                    cur,
+                    "product_skus",
+                    where_clause="product_id = %s",
+                    select_fields=["id", "sku_code", "price", "original_price", "stock", "specifications"]
+                )
+                cur.execute(select_sql, (product_id,))
+                skus = cur.fetchall()
+                skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']),
+                         "original_price": float(s['original_price']) if s['original_price'] else None,
+                         "stock": s['stock'], "specifications": s['specifications']} for s in skus]
+
+                # 获取 attributes
+                select_sql = build_dynamic_select(
+                    cur,
+                    "product_attributes",
+                    where_clause="product_id = %s",
+                    select_fields=["name", "value"]
+                )
+                cur.execute(select_sql, (product_id,))
+                attributes = cur.fetchall()
+                attributes = [{"name": a['name'], "value": a['value']} for a in attributes]
+
+                result_data.append(build_product_dict(product, skus, attributes))
+
+            return {
+                "status": "success",
+                "total": total,
+                "page": page,
+                "size": size,
+                "data": result_data
+            }
 
 
 @router.post("/products", summary="➕ 新增商品")
 def add_product(payload: ProductCreate):
+    """
+    ✅ 修改说明：
+    1. 现在必须提供 user_id 字段
+    2. 新增用户存在性验证
+    3. 新增SKU非空验证
+    """
     with get_conn() as conn:
         with conn.cursor() as cur:
             try:
+                # ✅ 验证用户是否存在
+                _validate_user_exists(payload.user_id)
+
+                # ✅ 验证SKU列表不为空
+                if not payload.skus or len(payload.skus) == 0:
+                    raise HTTPException(status_code=400, detail="必须至少提供一个SKU")
+
                 # 处理会员商品价格: 强制所有SKU价格为1980
                 sku_prices = []
                 for sku in payload.skus:
@@ -477,7 +563,7 @@ def add_product(payload: ProductCreate):
                     else:
                         sku_prices.append(sku.price)
 
-                # 插入商品
+                # 插入商品（user_id 已验证存在）
                 pinyin = to_pinyin(payload.name)
                 cur.execute("""
                     INSERT INTO products (name, pinyin, description, category, status, user_id, 
@@ -485,7 +571,8 @@ def add_product(payload: ProductCreate):
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     payload.name, pinyin, payload.description, payload.category, payload.status,
-                    payload.user_id, payload.is_member_product, payload.buy_rule, 0.0,
+                    payload.user_id,  # ✅ 已验证的商家ID
+                    payload.is_member_product, payload.buy_rule, 0.0,
                     payload.max_points_discount
                 ))
                 product_id = cur.lastrowid
@@ -519,27 +606,24 @@ def add_product(payload: ProductCreate):
                         else:
                             a_name = None
                             a_value = None
-                        cur.execute("""
-                            INSERT INTO product_attributes (product_id, name, value)
-                            VALUES (%s, %s, %s)
-                        """, (product_id, a_name, a_value))
+
+                        # ✅ 验证属性不为空
+                        if a_name and a_value:
+                            cur.execute("""
+                                INSERT INTO product_attributes (product_id, name, value)
+                                VALUES (%s, %s, %s)
+                            """, (product_id, a_name, a_value))
 
                 conn.commit()
 
                 # 查询创建的商品
-                select_sql = build_dynamic_select(
-                    cur,
-                    "products",
-                    where_clause="id = %s"
-                )
+                select_sql = build_dynamic_select(cur, "products", where_clause="id = %s")
                 cur.execute(select_sql, (product_id,))
                 product = cur.fetchone()
 
                 # 获取 SKUs
                 select_sql = build_dynamic_select(
-                    cur,
-                    "product_skus",
-                    where_clause="product_id = %s",
+                    cur, "product_skus", where_clause="product_id = %s",
                     select_fields=["id", "sku_code", "price", "original_price", "stock", "specifications"]
                 )
                 cur.execute(select_sql, (product_id,))
@@ -550,17 +634,19 @@ def add_product(payload: ProductCreate):
 
                 # 获取 attributes
                 select_sql = build_dynamic_select(
-                    cur,
-                    "product_attributes",
-                    where_clause="product_id = %s",
-                    select_fields=["name", "value"]
+                    cur, "product_attributes", where_clause="product_id = %s", select_fields=["name", "value"]
                 )
                 cur.execute(select_sql, (product_id,))
                 attributes = cur.fetchall()
                 attributes = [{"name": a['name'], "value": a['value']} for a in attributes]
 
-                return {"status": "success", "message": "商品已创建",
-                        "data": build_product_dict(product, skus, attributes)}
+                return {
+                    "status": "success",
+                    "message": "商品已创建",
+                    "data": build_product_dict(product, skus, attributes)
+                }
+            except HTTPException:
+                raise
             except Exception as e:
                 conn.rollback()
                 raise HTTPException(status_code=400, detail=f"创建商品失败: {str(e)}")
