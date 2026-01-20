@@ -321,6 +321,44 @@ class StoreSetupService:
                     conn.commit()
                     logger.info(f"店铺LOGO删除成功: user_id={user_id}")
 
+    def get_logo_url(self, image_id: str) -> Optional[str]:
+        """根据 image_id 或者 numeric id 返回物理文件路径，找不到返回 None"""
+        # 支持三种查询方式：
+        # 1) 传入数据库自增 id（纯数字）
+        # 2) 传入完整 image_id（含后缀）
+        # 3) 传入不含后缀的 image_id（仅 stem）
+        from pathlib import Path
+        import os
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                try:
+                    if str(image_id).isdigit():
+                        cur.execute("SELECT file_path FROM store_logos WHERE id=%s", (int(image_id),))
+                    else:
+                        stem = Path(image_id).stem
+                        cur.execute(
+                            "SELECT file_path FROM store_logos WHERE image_id=%s OR image_id=%s LIMIT 1",
+                            (image_id, stem)
+                        )
+
+                    row = cur.fetchone()
+                    if not row:
+                        return None
+
+                    file_path = row.get('file_path') or row.get('filePath')
+                    if not file_path:
+                        return None
+
+                    if os.path.exists(file_path):
+                        return file_path
+                    else:
+                        logger.warning(f"LOGO文件不存在: {file_path}")
+                        return None
+                except Exception as e:
+                    logger.exception(f"查询LOGO路径失败: {str(e)}")
+                    return None
+
 
 class StoreAdminService:
     """店铺管理后台服务"""
