@@ -15,6 +15,12 @@ import json
 import threading
 import time
 from core.logging import get_logger
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+from io import BytesIO
+from typing import List, Dict, Any
+from fastapi.responses import StreamingResponse
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -415,7 +421,131 @@ class OrderManager:
 
         return True
 
+    @staticmethod
+    def export_to_excel(order_numbers: List[str]) -> bytes:
+        """
+        将多个订单详情导出为Excel文件
+        :param order_numbers: 订单号列表
+        :return: Excel文件的二进制数据
+        """
+        # 创建工作簿
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "订单详情"
 
+        # 定义表头（中文名称）
+        headers = [
+            "订单号", "订单状态", "订单金额", "支付方式", "配送方式",
+            "用户ID", "用户姓名", "用户手机号",
+            "收货人", "收货电话", "省份", "城市", "区县", "详细地址",
+            "商品信息", "商品规格", "下单时间", "支付时间", "发货时间"
+        ]
+
+        # 设置表头样式
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
+        header_alignment = Alignment(horizontal="center", vertical="center")
+        thin_border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin')
+        )
+
+        # 写入表头
+        for col_idx, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_idx, value=header)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_alignment
+            cell.border = thin_border
+
+        # 数据行
+        row_idx = 2
+        for order_number in order_numbers:
+            order_data = OrderManager.detail(order_number)
+            if not order_data:
+                continue
+
+            order_info = order_data["order_info"]
+            user_info = order_data["user"]
+            address = order_data["address"] or {}
+            items = order_data["items"]
+            specifications = order_data.get("specifications") or {}
+
+            # 处理商品信息（多个商品用换行符分隔）
+            product_names = "\n".join([item.get("product_name", "") for item in items])
+            quantities = "\n".join([f"数量: {item.get('quantity', 0)}" for item in items])
+            unit_prices = "\n".join([f"单价: ¥{item.get('unit_price', 0)}" for item in items])
+            product_info = f"{product_names}\n{quantities}\n{unit_prices}"
+
+            # 处理规格信息
+            spec_str = ""
+            if isinstance(specifications, dict):
+                spec_str = "\n".join([f"{k}: {v}" for k, v in specifications.items()])
+
+            # 整理行数据
+            row_data = [
+                order_info.get("order_number", ""),
+                order_info.get("status", ""),
+                float(order_info.get("total_amount", 0)),
+                order_info.get("pay_way", "wechat"),
+                order_info.get("delivery_way", "platform"),
+                user_info.get("id", ""),
+                user_info.get("name", ""),
+                user_info.get("mobile", ""),
+                address.get("consignee_name", ""),
+                address.get("consignee_phone", ""),
+                address.get("province", ""),
+                address.get("city", ""),
+                address.get("district", ""),
+                address.get("detail", ""),
+                product_info,
+                spec_str,
+                order_info.get("created_at", ""),
+                order_info.get("paid_at", ""),
+                order_info.get("shipped_at", "")
+            ]
+
+            # 写入数据行
+            for col_idx, value in enumerate(row_data, 1):
+                cell = ws.cell(row=row_idx, column=col_idx, value=value)
+                cell.alignment = Alignment(vertical="center", wrap_text=True)
+                cell.border = thin_border
+
+                # 金额列设置为货币格式
+                if col_idx == 3 and isinstance(value, (int, float)):
+                    cell.number_format = '¥#,##0.00'
+
+            row_idx += 1
+
+        # 调整列宽（自动适应内容）
+        for column in ws.columns:
+            max_length = 0
+            column_letter = get_column_letter(column[0].column)
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = min(max_length + 2, 50)  # 最大宽度限制为50
+            ws.column_dimensions[column_letter].width = adjusted_width
+
+        # 调整行高（适应多行内容）
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            max_lines = 1
+            for cell in row:
+                if cell.value and isinstance(cell.value, str):
+                    lines = cell.value.count('\n') + 1
+                    max_lines = max(max_lines, lines)
+            ws.row_dimensions[row[0].row].height = min(15 * max_lines, 100)  # 最大高度限制为100
+
+        # 保存到内存
+        excel_data = BytesIO()
+        wb.save(excel_data)
+        excel_data.seek(0)
+        return excel_data.getvalue()
 # ---------------- 请求模型 ----------------
 class DeliveryWay(str, Enum):
     platform = "platform"  # 平台配送
@@ -641,6 +771,37 @@ def auto_receive_task(db_cfg: dict = None):
     t = threading.Thread(target=run, daemon=True)
     t.start()
     logger.info("自动收货守护进程已启动（不再发放积分）")
+
+
+
+
+class OrderExportRequest(BaseModel):
+    order_numbers: List[str]
+
+
+@router.post("/export", summary="导出订单详情到Excel")
+def export_orders(body: OrderExportRequest):
+    """
+    批量导出订单详情为Excel文件
+    请求示例: {"order_numbers": ["20250101120000", "20250101120001"]}
+    """
+    if not body.order_numbers:
+        raise HTTPException(status_code=422, detail="订单号列表不能为空")
+
+    # 限制一次最多导出100个订单
+    if len(body.order_numbers) > 100:
+        raise HTTPException(status_code=422, detail="单次导出订单数不能超过100个")
+
+    try:
+        excel_data = OrderManager.export_to_excel(body.order_numbers)
+        return StreamingResponse(
+            BytesIO(excel_data),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": "attachment; filename=orders_export.xlsx"}
+        )
+    except Exception as e:
+        logger.error(f"导出订单失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"导出失败: {str(e)}")
 
 # 模块被导入时自动启动守护线程
 start_order_expire_task()
