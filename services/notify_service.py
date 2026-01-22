@@ -226,3 +226,32 @@ async def handle_pay_notify(raw_body: Union[bytes, str]) -> str:
     except Exception as e:
         logger.error(f"[pay-notify] 处理失败: {e}")
         return "<xml><return_code><![CDATA[FAIL]]></return_code></xml>"
+
+
+# 兼容调用：异步统一下单包装（服务内其他模块可能调用 ns.wxpay.async_unified_order）
+async def async_unified_order(req: dict) -> dict:
+    """
+    异步包装：在后台线程调用 core.wx_pay_client.wxpay_client.create_jsapi_order
+    目的：兼容原来期望 ns.wxpay.async_unified_order 的调用方式
+    """
+    if settings.WX_MOCK_MODE:
+        import uuid, time
+        return {"prepay_id": f"MOCK_PREPAY_{int(time.time())}_{uuid.uuid4().hex[:8]}"}
+
+    from core.wx_pay_client import wxpay_client
+    out_trade_no = req.get('out_trade_no')
+    total = req.get('amount', {}).get('total')
+    payer = req.get('payer', {})
+    openid = payer.get('openid', '') if isinstance(payer, dict) else ''
+
+    import anyio
+
+    def _sync_call():
+        return wxpay_client.create_jsapi_order(
+            out_trade_no=str(out_trade_no),
+            total_fee=int(total),
+            openid=str(openid),
+            description=req.get('description', '')
+        )
+
+    return await anyio.to_thread.run_sync(_sync_call)

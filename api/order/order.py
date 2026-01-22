@@ -697,12 +697,23 @@ def order_pay(body: OrderPay):
                     "mchid": settings.WECHAT_PAY_MCH_ID,
                     "description": f"订单{body.order_number}",
                     "out_trade_no": body.order_number,
-                    "notify_url": settings.WECHAT_NOTIFY_URL,
+                    "notify_url": settings.WECHAT_PAY_NOTIFY_URL,
                     "amount": {"total": cash_fee, "currency": "CNY"}
                 }
+                # 获取用户 openid（优先从 users 表读取），若无则提示前端传入或绑定
+                cur.execute("SELECT openid FROM users WHERE id=%s", (user_id,))
+                user_row = cur.fetchone()
+                openid = (user_row.get('openid') if user_row else None) or ''
+                if not openid:
+                    logger.error(f"下单失败：用户 {user_id} 未绑定 openid，无法创建 JSAPI 支付单")
+                    raise HTTPException(status_code=422, detail="缺少 openid：请在小程序端传入或在用户资料中绑定 openid")
+
+                # 将 payer.openid 填入请求，供 async_unified_order 使用
+                req["payer"] = {"openid": openid}
                 try:
-                    loop = __import__("asyncio").get_event_loop()
-                    loop.run_until_complete(ns.wxpay.async_unified_order(req))
+                    import asyncio
+                    # 在 AnyIO 的线程池中可能没有当前事件循环，使用 asyncio.run 在独立循环中执行协程
+                    asyncio.run(ns.async_unified_order(req))
                 except Exception as e:
                     logger.error(f"微信下单失败: {e}")
                     raise HTTPException(status_code=502, detail="生成支付单失败")
