@@ -4,7 +4,7 @@ import pymysql
 import jwt
 import datetime
 import requests
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any,Tuple
 from fastapi import HTTPException
 
 from core.logging import get_logger
@@ -225,3 +225,41 @@ class WechatService:
         except Exception as e:
             logger.exception(f"生成小程序码异常: {e}")
             return None
+
+    @staticmethod
+    def get_openid_by_code(code: str) -> Tuple[str, str]:
+        """code 换 openid 和 session_key"""
+        url = f"https://api.weixin.qq.com/sns/jscode2session?appid={WECHAT_APP_ID}&secret={WECHAT_APP_SECRET}&js_code={code}&grant_type=authorization_code"
+        resp = requests.get(url, timeout=10).json()
+
+        if "errcode" in resp and resp["errcode"] != 0:
+            raise ValueError(f"微信接口错误: {resp.get('errmsg')}")
+
+        return resp["openid"], resp["session_key"]
+
+    @staticmethod
+    def decrypt_phone_number(session_key: str, encrypted_data: str, iv: str) -> str:
+        """AES解密微信手机号"""
+        try:
+            # base64解码
+            session_key_bytes = base64.b64decode(session_key)
+            encrypted_bytes = base64.b64decode(encrypted_data)
+            iv_bytes = base64.b64decode(iv)
+
+            # AES解密
+            cipher = AES.new(session_key_bytes, AES.MODE_CBC, iv_bytes)
+            decrypted = cipher.decrypt(encrypted_bytes)
+
+            # 去除PKCS#7填充
+            pad_len = decrypted[-1]
+            result = json.loads(decrypted[:-pad_len].decode('utf-8'))
+
+            # 校验AppID
+            if result.get('watermark', {}).get('appid') != WECHAT_APP_ID:
+                raise ValueError("AppID不匹配")
+
+            return result['phoneNumber']
+
+        except Exception as e:
+            logger.error(f"解密失败: {e}")
+            raise ValueError("手机号解密失败，请检查参数是否正确")

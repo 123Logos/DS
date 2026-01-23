@@ -8,7 +8,7 @@ from models.schemas.user import (
     UpdateAddressReq,
     PointsReq, UserInfoResp, BindReferrerReq,MobileResp,Query,AvatarUploadResp,
     UnilevelStatusResponse, UnilevelPromoteResponse,UserAllPointsResponse,UserPointsSummaryResponse,SetUnilevelReq,
-    ReferralQRResponse
+    ReferralQRResponse,DecryptPhoneReq, DecryptPhoneResp
 )
 
 from core.database import get_conn
@@ -1673,3 +1673,33 @@ def refresh_referral_qr(user_id: int):
     except Exception as e:
         logger.exception(f"刷新推荐码二维码失败: {e}")
         raise HTTPException(status_code=500, detail="服务器内部错误")
+
+
+@router.post("/user/decrypt-phone", tags=["用户中心"], response_model=DecryptPhoneResp, summary="解密微信手机号")
+def decrypt_phone(req: DecryptPhoneReq):
+    """
+    解密微信手机号（核心接口）
+
+    前端发送：
+    - code: 微信登录 code（必须用同一个）
+    - encrypted_data: getPhoneNumber 返回的 encryptedData
+    - iv: getPhoneNumber 返回的 iv
+    """
+    try:
+        # 1. code 换 session_key
+        openid, session_key = WechatService.get_openid_by_code(req.code)
+
+        # 2. 解密手机号
+        phone = WechatService.decrypt_phone_number(
+            session_key=session_key,
+            encrypted_data=req.encrypted_data,
+            iv=req.iv
+        )
+
+        logger.info(f"✅ 手机号解密成功: {phone[:3]}****{phone[-4:]}")
+
+        return DecryptPhoneResp(phone=phone)
+
+    except Exception as e:
+        logger.exception(f"手机号解密失败: {e}")
+        raise HTTPException(status_code=400, detail=str(e))

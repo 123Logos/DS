@@ -279,3 +279,18 @@ class ReferralQRResponse(BaseModel):
 
     class Config:
         from_attributes = True  # 兼容 ORM 模式
+
+
+# =============== 手机号解密模型 ===============
+
+class DecryptPhoneReq(BaseModel):
+    """手机号解密请求"""
+    code: str              # 微信登录凭证
+    encrypted_data: str    # getPhoneNumber 返回的加密数据
+    iv: str               # 解密向量
+
+
+class DecryptPhoneResp(BaseModel):
+    """手机号解密响应"""
+    phone: str            # 解密后的手机号
+    message: str = "success"
