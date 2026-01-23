@@ -135,7 +135,7 @@ TAX_RATE: Final[Decimal] = Decimal('0.06')
 POINTS_DISCOUNT_RATE: Final[Decimal] = Decimal('1.0')
 COUPON_VALID_DAYS: Final[int] = 30
 MAX_PURCHASE_PER_DAY: Final[int] = 2
-MAX_TEAM_LAYER: Final[int] = 325
+MAX_TEAM_LAYER: Final[int] = 10
 
 # ==================== 用户状态 ====================
 class UserStatus(IntEnum):

@@ -700,13 +700,13 @@ class FinanceService:
             else:
                 logger.debug("购买者无推荐人，跳过推荐奖励")
 
-        # 2. 团队奖励（只为新达到的层级发放）
-        if new_level <= max(old_level, 1):
-            logger.debug("等级未提升或保持1星，不产生团队奖励")
+        # 2. 团队奖励（只为新达到的层级发放；0→1 也发放）
+        if new_level <= old_level:
+            logger.debug("等级未提升，不产生团队奖励")
             return
 
         # ==================== 计算新达到的层级范围 ====================
-        start_layer = max(old_level + 1, 2)
+        start_layer = max(old_level + 1, 1)  # 允许 0→1 发放 L1 团队奖励
         logger.debug(f"发放团队奖励层级范围: L{start_layer}-L{new_level}")
         # ========================================================================
 
