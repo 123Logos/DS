@@ -6104,6 +6104,8 @@ def _execute_split(cur, order_number: str, total: Decimal):
         }
 
     for account_type, ratio in pools_to_assign.items():
+        if account_type == 'public_welfare':
+            continue          # ← 新增：不再重复写公益基金
         try:
             amt = total * ratio
             # 单元级日志：准备分配到指定资金池的金额与比例
