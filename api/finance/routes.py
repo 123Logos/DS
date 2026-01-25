@@ -1117,6 +1117,49 @@ async def donate_true_total_points(
     except Exception as e:
         logger.error(f"捐赠接口异常: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"捐赠失败: {str(e)}")
+@router.get("/api/reports/platform/flow-summary", response_model=ResponseModel, summary="平台综合流水报表（一键整合）")
+async def get_platform_flow_summary(
+        start_date: str = Query(..., description="开始日期 yyyy-MM-dd"),
+        end_date: str = Query(..., description="结束日期 yyyy-MM-dd"),
+        user_id: Optional[int] = Query(None, gt=0, description="按用户ID筛选（可选）"),
+        include_detail: bool = Query(True, description="是否包含明细记录"),
+        page: int = Query(1, ge=1, description="页码"),
+        page_size: int = Query(50, ge=1, le=200, description="每页条数"),
+        service: FinanceService = Depends(get_finance_service)
+):
+    """
+    平台综合流水报表（整合所有资金池、订单、积分、点数流水）
+
+    功能特点：
+    - 自动汇总所有资金池的收支情况
+    - 关联订单、用户、操作类型
+    - 智能识别资金流向（用户支付→平台→子池分配）
+    - 支持按用户、日期范围筛选
+    - 提供完整的余额快照和趋势分析
+    """
+    try:
+        data = service.get_platform_flow_summary(
+            start_date=start_date,
+            end_date=end_date,
+            user_id=user_id,
+            include_detail=include_detail,
+            page=page,
+            page_size=page_size
+        )
+
+        total_pools = len(data['pools_summary'])
+        total_records = data['pagination']['total']
+
+        return ResponseModel(
+            success=True,
+            message=f"平台综合流水报表生成成功: {total_pools}个资金池, {total_records}笔交易",
+            data=data
+        )
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"平台综合流水报表生成失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 def register_finance_routes(app: FastAPI):
     """注册财务管理系统路由到主应用"""
     app.include_router(router, tags=["财务系统"])

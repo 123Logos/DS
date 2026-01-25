@@ -279,17 +279,22 @@ class FinanceService:
                     )
                     logger.debug(f"用户{user_id}获得积分: +{normal_points_earned:.4f}")
 
-            # 9. 更新平台资金池（使用动态配置的 merchant_balance）
-            try:
-                allocs = self.get_pool_allocations()
-                platform_revenue = final_amount * allocs.get('merchant_balance', Decimal('0.80'))
-            except Exception:
-                platform_revenue = final_amount * Decimal('0.80')
+            # 9. 记录完整用户支付链路（100% 收入 → 80% 商家 + 20% 各池）
+            allocs = self.get_pool_allocations()
+            platform_revenue = final_amount  # ① 先按 100% 记收入
+            self._add_pool_balance(cur, 'platform_revenue_pool', platform_revenue,
+                                   f"订单#{order_id} 用户支付¥{final_amount:.2f}", user_id)
 
-            cur.execute(
-                "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'platform_revenue_pool'",
-                (platform_revenue,)
-            )
+            # ② 再记 20% 支出（分配到各子池）
+            for atype, ratio in allocs.items():
+                if atype == 'merchant_balance':
+                    continue
+                alloc_amount = final_amount * ratio
+                self._add_pool_balance(cur, 'platform_revenue_pool', -alloc_amount,
+                                       f"订单#{order_id} 分配到{atype}池¥{alloc_amount:.2f}", user_id)
+                # 各子池收入
+                self._add_pool_balance(cur, atype, alloc_amount,
+                                       f"订单#{order_id} 子池收入¥{alloc_amount:.2f}", user_id)
 
             # 记录流水
             cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'platform_revenue_pool'")
@@ -5550,6 +5555,405 @@ class FinanceService:
         except Exception as e:
             logger.error(f"❌ 用户 {user_id} 捐赠失败: {e}")
             raise FinanceException(f"捐赠失败: {e}")
+
+    def get_platform_flow_summary(
+            self,
+            start_date: str,
+            end_date: str,
+            user_id: Optional[int] = None,
+            include_detail: bool = True,
+            page: int = 1,
+            page_size: int = 50
+    ) -> Dict[str, Any]:
+        """
+        平台综合流水报表（整合所有资金池、订单、积分流水）
+
+        整合逻辑：
+        1. 查询所有资金池的汇总和明细
+        2. 查询订单相关的积分和资金流动
+        3. 查询提现申请处理情况
+        4. 合并所有流水，按时间倒序排列
+        5. 计算总体统计和趋势分析
+        """
+        logger.info(
+            f"生成平台综合流水报表: 日期范围={start_date}至{end_date}, "
+            f"用户={user_id or '所有用户'}, 包含明细={include_detail}"
+        )
+
+        from datetime import datetime, date
+        import itertools
+
+        # ==================== 1. 定义所有资金池类型 ====================
+        all_pool_types = [
+            'platform_revenue_pool',  # 平台收入池（源头）
+            'public_welfare',  # 公益基金
+            'subsidy_pool',  # 周补贴池
+            'honor_director',  # 荣誉董事分红池
+            'company_points',  # 公司积分池
+            'maintain_pool',  # 平台维护池
+            'director_pool',  # 荣誉董事池
+            'shop_pool',  # 社区店池
+            'city_pool',  # 城市运营中心池
+            'branch_pool',  # 大区分公司池
+            'fund_pool'  # 事业发展基金池
+        ]
+
+        # ==================== 2. 并行查询所有资金池数据 ====================
+        pools_summary = {}
+        all_raw_flows = []
+
+        for pool_type in all_pool_types:
+            try:
+                # 查询资金池汇总（不获取明细，只获取汇总）
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        # 构建WHERE条件
+                        where_conditions = [
+                            "account_type = %s",
+                            "DATE(created_at) BETWEEN %s AND %s"
+                        ]
+                        params = [pool_type, start_date, end_date]
+
+                        # 只有联创分红池过滤 related_user=NULL
+                        if pool_type == 'honor_director':
+                            where_conditions.append("related_user IS NULL")
+
+                        # 用户筛选（如果指定了user_id）
+                        if user_id:
+                            where_conditions.append("related_user = %s")
+                            params.append(user_id)
+
+                        where_sql = " AND ".join(where_conditions)
+
+                        # 查询汇总
+                        summary_sql = f"""
+                            SELECT 
+                                COUNT(*) as total_transactions,
+                                SUM(CASE WHEN flow_type = 'income' THEN change_amount ELSE 0 END) as total_income,
+                                SUM(CASE WHEN flow_type = 'expense' THEN change_amount ELSE 0 END) as total_expense,
+                                SUM(change_amount) as net_change
+                            FROM account_flow
+                            WHERE {where_sql}
+                        """
+                        cur.execute(summary_sql, tuple(params))
+                        summary = cur.fetchone()
+
+                        # 查询期末余额
+                        cur.execute(
+                            "SELECT balance FROM finance_accounts WHERE account_type = %s",
+                            (pool_type,)
+                        )
+                        balance_row = cur.fetchone()
+                        ending_balance = Decimal(str(balance_row['balance'] if balance_row else 0))
+
+                        # 添加到汇总
+                        account_name_map = {
+                            "platform_revenue_pool": "平台收入池",
+                            "public_welfare": "公益基金",
+                            "subsidy_pool": "周补贴池",
+                            "honor_director": "荣誉董事分红池",
+                            "company_points": "公司积分池",
+                            "maintain_pool": "平台维护池",
+                            "director_pool": "荣誉董事池",
+                            "shop_pool": "社区店池",
+                            "city_pool": "城市运营中心池",
+                            "branch_pool": "大区分公司池",
+                            "fund_pool": "事业发展基金池"
+                        }
+
+                        pools_summary[pool_type] = {
+                            "account_name": account_name_map.get(pool_type, pool_type),
+                            "total_transactions": summary['total_transactions'] or 0,
+                            "total_income": float(summary['total_income'] or 0),
+                            "total_expense": float(summary['total_expense'] or 0),
+                            "net_change": float(summary['net_change'] or 0),
+                            "ending_balance": float(ending_balance)
+                        }
+
+                        # 如果需要明细，查询原始流水
+                        if include_detail:
+                            # 查询所有流水（不分页，后续统一分页）
+                            detail_sql = f"""
+                                SELECT 
+                                    id as flow_id,
+                                    related_user,
+                                    change_amount,
+                                    balance_after,
+                                    flow_type,
+                                    remark,
+                                    created_at,
+                                    %s as account_type
+                                FROM account_flow
+                                WHERE {where_sql}
+                                ORDER BY created_at DESC
+                            """
+                            cur.execute(detail_sql, tuple([pool_type] + params))
+                            flows = cur.fetchall()
+                            all_raw_flows.extend(flows)
+
+            except Exception as e:
+                logger.warning(f"查询资金池 {pool_type} 数据失败: {e}")
+                continue
+
+        # ==================== 3. 查询订单相关流水（积分抵扣、用户支付） ====================
+        order_flows = []
+        if include_detail:
+            try:
+                # 使用已有的 get_order_points_flow_report 逻辑
+                order_data = self.get_order_points_flow_report(
+                    start_date=start_date,
+                    end_date=end_date,
+                    user_id=user_id,
+                    order_no=None,
+                    page=1,
+                    page_size=10000  # 获取所有记录用于合并
+                )
+
+                # 转换订单流水格式，与资金池流水统一
+                for record in order_data['records']:
+                    # 用户积分获得（收入）
+                    if record['user_points_earned'] > 0:
+                        order_flows.append({
+                            'flow_id': f"order_{record['order_id']}_user_points",
+                            'related_user': record['user_id'],
+                            'change_amount': Decimal(str(record['user_points_earned'])),
+                            'balance_after': None,  # 订单流水不记录余额
+                            'flow_type': 'income',
+                            'remark': f"订单#{record['order_no']} 用户获得积分{record['user_points_earned']:.4f}",
+                            'created_at': datetime.strptime(record['created_at'], "%Y-%m-%d %H:%M:%S"),
+                            'account_type': 'order_related'
+                        })
+
+                    # 积分抵扣（支出）
+                    if record['points_deduction'] > 0:
+                        order_flows.append({
+                            'flow_id': f"order_{record['order_id']}_points_deduction",
+                            'related_user': record['user_id'],
+                            'change_amount': -Decimal(str(record['points_deduction'])),
+                            'balance_after': None,
+                            'flow_type': 'expense',
+                            'remark': f"订单#{record['order_no']} 积分抵扣¥{record['points_deduction']:.2f}",
+                            'created_at': datetime.strptime(record['created_at'], "%Y-%m-%d %H:%M:%S"),
+                            'account_type': 'order_related'
+                        })
+
+                    # 平台收入（源头）
+                    order_flows.append({
+                        'flow_id': f"order_{record['order_id']}_platform_income",
+                        'related_user': record['user_id'],
+                        'change_amount': Decimal(str(record['net_sales'])),
+                        'balance_after': None,
+                        'flow_type': 'income',
+                        'remark': f"订单#{record['order_no']} 平台收入¥{record['net_sales']:.2f}（总销售额）",
+                        'created_at': datetime.strptime(record['created_at'], "%Y-%m-%d %H:%M:%S"),
+                        'account_type': 'order_related'
+                    })
+
+            except Exception as e:
+                logger.warning(f"查询订单相关流水失败: {e}")
+
+        # ==================== 4. 合并所有流水并统一格式 ====================
+        all_flows = []
+
+        # 处理资金池流水
+        for flow in all_raw_flows:
+            try:
+                # 确保 created_at 是 datetime 对象
+                created_at = flow['created_at']
+                if isinstance(created_at, str):
+                    created_at = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
+                elif isinstance(created_at, date) and not hasattr(created_at, 'hour'):
+                    created_at = datetime.combine(created_at, datetime.min.time())
+
+                # 智能识别资金流向类型
+                remark = flow['remark']
+                flow_category = self._classify_flow_type(
+                    account_type=flow['account_type'],
+                    flow_type=flow['flow_type'],
+                    remark=remark
+                )
+
+                all_flows.append({
+                    'flow_id': str(flow['flow_id']),
+                    'user_id': flow['related_user'],
+                    'user_name': self._get_user_name(flow['related_user']),
+                    'flow_type': flow_category['type'],
+                    'flow_category': flow_category['category'],
+                    'change_amount': float(flow['change_amount']),
+                    'balance_after': float(flow['balance_after']) if flow['balance_after'] is not None else None,
+                    'remark': remark,
+                    'created_at': created_at,
+                    'source': 'account_flow',
+                    'account_type': flow['account_type']
+                })
+            except Exception as e:
+                logger.debug(f"处理流水记录失败: {e}")
+                continue
+
+        # 添加订单流水
+        all_flows.extend(order_flows)
+
+        # 按时间倒序排序
+        all_flows.sort(key=lambda x: x['created_at'], reverse=True)
+
+        # ==================== 5. 分页处理 ====================
+        total_records = len(all_flows)
+        total_pages = (total_records + page_size - 1) // page_size if total_records > 0 else 1
+        offset = (page - 1) * page_size
+
+        paged_flows = all_flows[offset:offset + page_size]
+
+        # ==================== 6. 计算总体统计 ====================
+        grand_total_income = sum(
+            pool['total_income'] for pool in pools_summary.values()
+        )
+        grand_total_expense = sum(
+            pool['total_expense'] for pool in pools_summary.values()
+        )
+        grand_net_change = grand_total_income - grand_total_expense
+
+        # 活跃资金池数量（有余额或有交易的）
+        active_pools = sum(
+            1 for pool in pools_summary.values()
+            if pool['ending_balance'] > 0 or pool['total_transactions'] > 0
+        )
+
+        # ==================== 7. 组装最终报表 ====================
+        result = {
+            "summary": {
+                "report_type": "platform_flow_summary",
+                "query_period": f"{start_date} 至 {end_date}",
+                "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "total_active_pools": active_pools,
+                "grand_total": {
+                    "total_income": grand_total_income,
+                    "total_expense": grand_total_expense,
+                    "net_flow": grand_net_change
+                },
+                "pools_overview": {
+                    "total_balance": sum(pool['ending_balance'] for pool in pools_summary.values()),
+                    "total_transactions": sum(pool['total_transactions'] for pool in pools_summary.values())
+                }
+            },
+            "pools_summary": pools_summary,
+            "pagination": {
+                "page": page,
+                "page_size": page_size,
+                "total": total_records,
+                "total_pages": total_pages,
+                "has_next": page < total_pages,
+                "has_prev": page > 1
+            },
+            "flows": paged_flows if include_detail else [],
+            "data_sources": [
+                "account_flow（资金池流水）",
+                "orders + points_log（订单相关流水）"
+            ]
+        }
+
+        logger.info(
+            f"平台综合流水报表生成完成: {total_records}笔交易, "
+            f"净流量¥{grand_net_change:.2f}, {active_pools}个活跃资金池"
+        )
+
+        return result
+
+    def _classify_flow_type(self, account_type: str, flow_type: str, remark: str) -> Dict[str, str]:
+        """
+        智能识别流水类型和分类
+
+        返回:
+            {
+                'type': '用户支付'|'补贴发放'|'分红发放'|'积分抵扣'|'退款回冲'|'提现处理'|'捐赠',
+                'category': '收入'|'支出'
+            }
+        """
+        # 默认分类
+        category = '收入' if flow_type == 'income' else '支出'
+
+        # 基于account_type识别
+        if account_type == 'platform_revenue_pool':
+            if '用户支付' in remark:
+                flow_type_name = '用户支付'
+            elif '退款回冲' in remark:
+                flow_type_name = '退款回冲'
+            else:
+                flow_type_name = '平台收入'
+        elif account_type == 'public_welfare':
+            flow_type_name = '公益基金'
+        elif account_type == 'subsidy_pool':
+            flow_type_name = '补贴资金'
+        elif account_type == 'honor_director':
+            flow_type_name = '联创分红'
+        elif account_type == 'company_points':
+            flow_type_name = '公司积分'
+        elif account_type == 'maintain_pool':
+            flow_type_name = '平台维护'
+        elif account_type == 'director_pool':
+            flow_type_name = '董事分红'
+        elif account_type == 'shop_pool':
+            flow_type_name = '社区店分润'
+        elif account_type == 'city_pool':
+            flow_type_name = '城市中心分润'
+        elif account_type == 'branch_pool':
+            flow_type_name = '大区公司分润'
+        elif account_type == 'fund_pool':
+            flow_type_name = '发展基金'
+        elif account_type == 'true_total_points':
+            if '捐赠' in remark:
+                flow_type_name = '用户捐赠'
+                category = '支出'
+            elif '优惠券' in remark:
+                flow_type_name = '优惠券发放'
+                category = '支出'
+            else:
+                flow_type_name = '点数调整'
+        else:
+            flow_type_name = '其他资金变动'
+
+        # 基于remark关键词优化识别
+        remark_lower = remark.lower()
+        if any(word in remark_lower for word in ['订单', '支付']):
+            flow_type_name = '订单交易'
+        elif any(word in remark_lower for word in ['补贴', '周补贴']):
+            flow_type_name = '周补贴发放'
+        elif any(word in remark_lower for word in ['分红', '联创']):
+            flow_type_name = '联创分红'
+        elif any(word in remark_lower for word in ['提现']):
+            flow_type_name = '提现处理'
+        elif any(word in remark_lower for word in ['退款']):
+            flow_type_name = '订单退款'
+        elif any(word in remark_lower for word in ['捐赠']):
+            flow_type_name = '公益捐赠'
+            category = '支出'
+
+        return {
+            'type': flow_type_name,
+            'category': category
+        }
+
+    def _get_user_name(self, user_id: Optional[int]) -> str:
+        """获取用户名称（缓存优化）"""
+        if not user_id:
+            return "系统"
+
+        # 使用简单的内存缓存（在同一次请求内）
+        if not hasattr(self, '_user_name_cache'):
+            self._user_name_cache = {}
+
+        if user_id in self._user_name_cache:
+            return self._user_name_cache[user_id]
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT name FROM users WHERE id = %s", (user_id,))
+                    row = cur.fetchone()
+                    name = row['name'] if row else f"未知用户:{user_id}"
+                    self._user_name_cache[user_id] = name
+                    return name
+        except Exception:
+            return f"查询失败:{user_id}"
 # ==================== 订单系统财务功能（来自 order/finance.py） ====================
 
 def _build_team_rewards_select(cursor, asset_fields: List[str] = None) -> tuple:
@@ -5653,7 +6057,18 @@ def _execute_split(cur, order_number: str, total: Decimal):
         "UPDATE users SET merchant_balance=merchant_balance+%s WHERE id=1",
         (merchant,)
     )
+    # 记录完整支付链路（100% 收入 → 80% 商家 + 20% 各池）
+    svc = FinanceService()
 
+    # ① 平台收入池 +100%
+    svc._add_pool_balance(cur, 'platform_revenue_pool', total,
+                          f"订单分账: {order_number} 用户支付¥{total:.2f}", None)
+
+    # ② 平台收入池 -80%（商家部分）
+    svc._add_pool_balance(cur, 'platform_revenue_pool', -merchant,
+                          f"订单分账: {order_number} 商家结算¥{merchant:.2f}", None)
+
+    # ③ 各子池 20% 支出（已在下方 for 循环里记收入，保持不动）
     # 获取商家余额
     select_sql = build_dynamic_select(
         cur,
