@@ -463,23 +463,48 @@ async def handle_transaction_success(data: dict):
                             logger.error(f"读取/校验优惠券失败: {e}")
                             return
 
+                    # 额外检测：若系统未记录优惠券，但微信回调包含 promotion_detail，则按微信优惠金额入账
+                    promo_detail = data.get("promotion_detail") or []
+                    promo_cents = 0
+                    try:
+                        for item in promo_detail:
+                            if not item:
+                                continue
+                            promo_cents += int(item.get("amount", 0) or 0)
+                    except Exception:
+                        promo_cents = 0
+
                     # 3) 金额校验（微信实付 vs 系统应付）
-                    payable_cents = int(total_amount_db * Decimal('100'))
+                    payable_cents_calc = int(total_amount_db * Decimal('100'))
                     try:
-                        payable_cents -= int(pending_points * Decimal('100'))
+                        payable_cents_calc -= int(pending_points * Decimal('100'))
                     except Exception:
-                        payable_cents -= int(pending_points)  # 兜底
+                        payable_cents_calc -= int(pending_points)  # 兜底
                     try:
-                        payable_cents -= int(coupon_amount * Decimal('100'))
+                        payable_cents_calc -= int(coupon_amount * Decimal('100'))
                     except Exception:
-                        payable_cents -= int(coupon_amount)
+                        payable_cents_calc -= int(coupon_amount)
+
+                    # 若微信存在 promotion_detail 且系统未记录优惠券，则使用微信的优惠金额修正 coupon_amount
+                    if promo_cents > 0 and not pending_coupon_id:
+                        promo_coupon = Decimal(str(promo_cents)) / Decimal('100')
+                        coupon_amount += promo_coupon
+                        payable_cents_calc -= promo_cents
+                        logger.info(
+                            "检测到微信优惠券未在系统记录，按回调优惠金额入账: %s（分）", promo_cents
+                        )
+
+                    payable_cents = payable_cents_calc
 
                     if amount is not None and int(amount) != payable_cents:
                         logger.error(
                             "金额不一致，微信=%s分，系统应收=%s分，继续按微信实收入账处理",
                             amount, payable_cents
                         )
-                        # 以微信实收为准，避免阻断后续结算/积分/分账
+                        # 以微信实收为准，避免阻断后续结算/积分/分账；并将差额视为额外优惠
+                        diff_cents = payable_cents - int(amount)
+                        if diff_cents > 0:
+                            coupon_amount += Decimal(str(diff_cents)) / Decimal('100')
                         payable_cents = int(amount)
 
                     # amount 单位为分，转换为 Decimal 元（FinanceService 内部可能期望元）

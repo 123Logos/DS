@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, field_validator, constr
-from typing import Optional, List, Dict, Any
+from pydantic import BaseModel, field_validator, StringConstraints
+from typing import Optional, List, Dict, Any, Annotated
 from core.database import get_conn
 from services.finance_service import get_balance, withdraw   # 不再用 bind_bank
 from decimal import Decimal
@@ -80,7 +80,7 @@ class MWithdraw(BaseModel):
 class MBindBank(BaseModel):
     user_id: int
     bank_name: str
-    bank_account: constr(strip_whitespace=True, min_length=10, max_length=30)
+    bank_account: Annotated[str, StringConstraints(strip_whitespace=True, min_length=10, max_length=30)]
 
     @field_validator("bank_account")
     @classmethod
