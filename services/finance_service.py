@@ -2260,8 +2260,11 @@ class FinanceService:
         """
         logger.info("计算联创星级分红预览（含单个用户上限1万）")
 
-        # 1. 查询分红池余额
-        pool_balance = self.get_account_balance('honor_director')
+        # 1. 查询分红池余额（优先使用资金分配池 director_pool，与分配配置保持一致）
+        pool_balance = self.get_account_balance('director_pool')
+        if pool_balance is None or pool_balance == 0:
+            # 兼容旧数据，回退到 honor_director 账户
+            pool_balance = self.get_account_balance('honor_director')
 
         total_member_points = Decimal('0')
         total_merchant_points = Decimal('0')
