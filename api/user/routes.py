@@ -1703,3 +1703,30 @@ def decrypt_phone(req: DecryptPhoneReq):
     except Exception as e:
         logger.exception(f"手机号解密失败: {e}")
         raise HTTPException(status_code=400, detail=str(e))
+
+@router.delete("/user/avatar", tags=["用户中心"], summary="清空头像")
+def clear_avatar(user_id: int):
+    """
+    一键清空头像
+    前端调用：wx.request({ url: '/user/avatar', method: 'DELETE', ... })
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 清空头像路径
+                cur.execute(
+                    """
+                    UPDATE users 
+                    SET avatar_path = NULL, updated_at = NOW() 
+                    WHERE id = %s
+                    """,
+                    (user_id,)
+                )
+                conn.commit()
+
+        logger.info(f"✅ 用户 {user_id} 清空头像成功")
+        return {"message": "头像已清空", "success": True}
+
+    except Exception as e:
+        logger.exception(f"清空头像失败: {e}")
+        raise HTTPException(status_code=500, detail="操作失败")
