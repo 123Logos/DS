@@ -7,6 +7,7 @@ from core.database import get_conn
 from services.finance_service import FinanceService
 from decimal import Decimal
 from services.wechat_applyment_service import WechatApplymentService
+from datetime import datetime
 import json
 import logging
 import base64
@@ -33,6 +34,7 @@ async def create_jsapi_order(request: Request):
     total_fee_client = payload.get('total_fee')  # 分
     openid = payload.get('openid')
     description = payload.get('description', '商品支付')
+    coupon_id = payload.get('coupon_id')
 
     if not out_trade_no or not total_fee_client or not openid:
         raise HTTPException(status_code=400, detail="missing out_trade_no/total_fee/openid")
@@ -58,6 +60,35 @@ async def create_jsapi_order(request: Request):
                 coupon_amt = Decimal('0')
 
                 pending_coupon_id = order_row.get('pending_coupon_id')
+                # 允许在下单时绑定优惠券（未绑定时才绑定）
+                if coupon_id:
+                    if pending_coupon_id and pending_coupon_id != coupon_id:
+                        raise HTTPException(status_code=409, detail="order already bound to another coupon")
+                    target_coupon_id = pending_coupon_id or coupon_id
+
+                    cur.execute(
+                        "SELECT id, user_id, amount, status, valid_from, valid_to FROM coupons WHERE id=%s",
+                        (target_coupon_id,)
+                    )
+                    coupon_row = cur.fetchone()
+                    if not coupon_row or coupon_row.get('user_id') != order_row.get('user_id'):
+                        raise HTTPException(status_code=400, detail="coupon not available for user")
+                    if coupon_row.get('status') != 'unused':
+                        raise HTTPException(status_code=409, detail="coupon already used")
+
+                    today = datetime.now().date()
+                    valid_from = coupon_row.get('valid_from')
+                    valid_to = coupon_row.get('valid_to')
+                    if valid_from and valid_to and not (valid_from <= today <= valid_to):
+                        raise HTTPException(status_code=400, detail="coupon expired")
+
+                    if not pending_coupon_id:
+                        cur.execute(
+                            "UPDATE orders SET pending_coupon_id=%s WHERE id=%s",
+                            (target_coupon_id, order_row['id'])
+                        )
+                    pending_coupon_id = target_coupon_id
+
                 if pending_coupon_id:
                     cur.execute("SELECT amount, status FROM coupons WHERE id=%s", (pending_coupon_id,))
                     coupon_row = cur.fetchone()
