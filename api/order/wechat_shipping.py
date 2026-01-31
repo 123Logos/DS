@@ -72,13 +72,17 @@ class WechatShippingManager:
         """发送带access_token的请求"""
         token = cls._get_access_token()
         full_url = f"{url}?access_token={token}"
-        headers = {'Content-Type': 'application/json'}
+        headers = {'Content-Type': 'application/json; charset=utf-8'}
+
+        def _post_payload(body: Dict[str, Any]):
+            payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            return requests.post(full_url, data=payload, headers=headers, timeout=10)
 
         try:
             if method == "GET":
                 resp = requests.get(full_url, headers=headers, timeout=10)
             else:
-                resp = requests.post(full_url, json=data, headers=headers, timeout=10)
+                resp = _post_payload(data)
 
             resp.raise_for_status()
             result = resp.json()
@@ -90,7 +94,7 @@ class WechatShippingManager:
                 if method == "GET":
                     resp = requests.get(full_url, headers=headers, timeout=10)
                 else:
-                    resp = requests.post(full_url, json=data, headers=headers, timeout=10)
+                    resp = _post_payload(data)
                 result = resp.json()
 
             return result

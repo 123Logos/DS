@@ -192,15 +192,21 @@ class MerchantManager:
                             _hex(order_info.get("user_name"))
                         )
 
-                        # 同步到微信
+                        # 清洗为 UTF-8，剔除控制字符，避免微信接口非 UTF-8 报错
+                        def _clean(val: Any) -> str:
+                            s = "" if val is None else str(val)
+                            # 去除非打印控制字符
+                            s = "".join(ch for ch in s if ch >= " " or ch == "\n")
+                            return s.encode("utf-8", "ignore").decode("utf-8")
+
                         wx_result = WechatShippingService.sync_order_to_wechat(
-                            transaction_id=transaction_id,
-                            openid=openid,
+                            transaction_id=_clean(transaction_id),
+                            openid=_clean(openid),
                             delivery_way=delivery_way,
-                            tracking_number=tracking_number,
-                            express_company=express_company,
-                            item_desc=item_desc,
-                            receiver_phone=receiver_phone,
+                            tracking_number=_clean(tracking_number),
+                            express_company=_clean(express_company),
+                            item_desc=_clean(item_desc),
+                            receiver_phone=_clean(receiver_phone),
                             is_sfeng=is_sfeng
                         )
 
