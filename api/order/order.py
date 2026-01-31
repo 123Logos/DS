@@ -507,13 +507,7 @@ class OrderManager:
         """
         用户确认收货（前端调用微信确认收货组件成功后回调）
 
-        重要：必须通过微信组件完成确认，否则资金无法结算！
-
-        流程：
-        1. 验证订单状态（必须为 pending_recv）
-        2. 【强制】验证微信侧状态必须为已确认收货(order_state=3)或交易完成(4)
-        3. 更新订单状态为 completed
-        4. 触发资金结算（如果适用）
+        修复：增加重试机制处理微信状态同步延迟（最多3次，间隔1.5秒）
         """
         result = {
             "ok": False,
@@ -544,50 +538,80 @@ class OrderManager:
                     result["message"] = f"订单状态不正确，当前状态：{order['status']}"
                     return result
 
-                # 2. 【强制验证】必须存在微信支付单号
                 transaction_id = order.get('transaction_id')
                 if not transaction_id:
                     result["message"] = "缺少微信支付单号，无法确认收货"
                     return result
 
-                # 3. 【核心修改】强制查询微信侧状态，必须为已确认收货
-                try:
-                    wx_result = WechatShippingManager.get_order(transaction_id)
-
-                    if wx_result.get('errcode') != 0:
-                        error_msg = wx_result.get('errmsg', '未知错误')
-                        result["message"] = f"查询微信订单状态失败：{error_msg}"
-                        return result
-
-                    order_state = wx_result.get('order_state')
-
-                    # 严格校验：微信状态必须是 3(确认收货) 或 4(交易完成)
-                    if order_state == 3:
-                        result["wx_verified"] = True
-                        verify_msg = "微信已确认收货"
-                    elif order_state == 4:
-                        result["wx_verified"] = True
-                        verify_msg = "微信交易已完成"
-                    else:
-                        # 状态不对，直接拒绝！
-                        state_map = {1: "待发货", 2: "已发货未收货", 5: "已退款", 6: "资金待结算"}
-                        current_state_name = state_map.get(order_state, f"未知状态({order_state})")
-                        result[
-                            "message"] = f"微信端未确认收货，当前状态：{current_state_name}。请用户在微信小程序内点击确认收货按钮。"
-                        return result
-
-                except Exception as e:
-                    logger.error(f"[confirm_receive] 查询微信状态异常: {e}")
-                    result["message"] = "校验微信收货状态失败，请稍后重试"
-                    return result
-
-                # 4. （可选）验证前端传来的微信组件结果与后台查询是否一致
+                # 可选：验证前端传入的微信组件结果
                 if wx_confirm_result and wx_confirm_result.get('order_id') != transaction_id:
                     logger.warning(f"[confirm_receive] 前端传入的transaction_id与订单不符")
                     result["message"] = "验证失败：订单信息不匹配"
                     return result
 
-                # 5. 更新订单状态
+                # ===== 核心修复：带重试的微信状态查询 =====
+                max_retries = 3
+                retry_delay = 1.5  # 秒
+                wx_result = None
+                order_state = None
+
+                for attempt in range(max_retries):
+                    try:
+                        wx_result = WechatShippingManager.get_order(transaction_id)
+
+                        if wx_result.get('errcode') != 0:
+                            error_msg = wx_result.get('errmsg', '未知错误')
+                            result["message"] = f"查询微信订单状态失败：{error_msg}"
+                            return result
+
+                        order_state = wx_result.get('order_state')
+
+                        # 已确认收货(3)或交易完成(4)，立即通过
+                        if order_state in (3, 4):
+                            break
+
+                        # 如果是待发货(1)或已发货(2)，且不是最后一次重试，等待后重试
+                        if order_state in (1, 2) and attempt < max_retries - 1:
+                            logger.info(
+                                f"[confirm_receive] 订单 {order_number} 微信状态 {order_state}，"
+                                f"第 {attempt + 1}/{max_retries} 次重试，等待 {retry_delay}s..."
+                            )
+                            time.sleep(retry_delay)
+                            continue
+
+                        # 其他状态或最后一次尝试，跳出循环处理
+                        break
+
+                    except Exception as e:
+                        logger.error(f"[confirm_receive] 查询微信状态异常: {e}")
+                        if attempt == max_retries - 1:
+                            result["message"] = "校验微信收货状态失败，请稍后重试"
+                            return result
+                        time.sleep(retry_delay)
+
+                # 状态校验
+                if order_state == 3:
+                    result["wx_verified"] = True
+                    verify_msg = "微信已确认收货"
+                elif order_state == 4:
+                    result["wx_verified"] = True
+                    verify_msg = "微信交易已完成"
+                else:
+                    # 状态映射表
+                    state_map = {1: "待发货", 2: "已发货未收货", 5: "已退款", 6: "资金待结算"}
+
+                    if order_state is None:
+                        result["message"] = "微信状态尚未同步，请稍等2-3分钟后重试"
+                        logger.warning(f"[confirm_receive] 订单 {order_number} 微信返回状态为None")
+                    else:
+                        current_state_name = state_map.get(order_state, f"异常状态({order_state})")
+                        result["message"] = (
+                            f"微信端未确认收货，当前状态：{current_state_name}。"
+                            f"请确保在微信小程序内点击确认收货按钮。"
+                        )
+                    return result
+
+                # 更新订单状态
                 updated = OrderManager.update_status(
                     order_number,
                     "completed",
@@ -599,27 +623,31 @@ class OrderManager:
                     result["message"] = "更新订单状态失败"
                     return result
 
-                # 6. 记录确认收货日志
-                cur.execute("""
-                    INSERT INTO wechat_shipping_logs 
-                    (order_id, order_number, transaction_id, action_type, is_success, remark, response_data, created_at)
-                    VALUES (%s, %s, %s, 'confirm', 1, %s, %s, NOW())
-                """, (
-                    order['id'],
-                    order_number,
-                    transaction_id,
-                    f"用户确认收货, 微信验证: {result['wx_verified']}",
-                    json.dumps(wx_result)
-                ))
-
-                conn.commit()
+                # 记录确认收货日志（这里是你缺失的代码）
+                try:
+                    cur.execute("""
+                        INSERT INTO wechat_shipping_logs 
+                        (order_id, order_number, transaction_id, action_type, is_success, remark, response_data, created_at)
+                        VALUES (%s, %s, %s, 'confirm', 1, %s, %s, NOW())
+                    """, (
+                        order['id'],
+                        order_number,
+                        transaction_id,
+                        f"用户确认收货, 微信验证: {result['wx_verified']}",
+                        json.dumps(wx_result)
+                    ))
+                    conn.commit()
+                except Exception as e:
+                    logger.error(f"[confirm_receive] 记录日志失败: {e}")
+                    # 日志记录失败不影响主流程，但最好回滚或记录
+                    conn.rollback()
 
                 result["ok"] = True
                 result["message"] = f"确认收货成功（{verify_msg}），资金将在微信侧结算"
 
-                # 7. 触发后续业务逻辑（如积分发放等）
+                # 可选：触发后续业务（如积分发放）
                 try:
-                    # 如果积分是在确认收货时发放（而非支付时），在这里触发
+                    # 如果需要在确认收货时触发某些业务逻辑，可以在这里调用
                     pass
                 except Exception as e:
                     logger.error(f"[confirm_receive] 订单 {order_number} 后续处理异常: {e}")
