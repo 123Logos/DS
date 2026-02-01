@@ -17,6 +17,7 @@ logs/
 .env
 certs
 pic_data/
+json_data/
 user_pic/
 uploads/
 临时文件夹

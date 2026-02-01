@@ -17,6 +17,9 @@ class TaskScheduler:
 
     def start(self):
         """启动所有定时任务"""
+        # 延迟导入，避免启动时循环依赖
+        from api.order.wechat_shipping import WechatShippingManager
+
         # 每天凌晨2点清理过期草稿
         self.scheduler.add_job(
             self.clean_expired_drafts,
@@ -55,6 +58,15 @@ class TaskScheduler:
             self.auto_distribute_unilevel_dividend,
             CronTrigger(day=1, hour=0, minute=0),  # 每月1号 00:00:00
             id="monthly_unilevel_auto",
+            replace_existing=True,
+            misfire_grace_time=3600
+        )
+
+        # 每天12:00 刷新微信快递公司列表缓存
+        self.scheduler.add_job(
+            WechatShippingManager.refresh_delivery_list_cache,
+            CronTrigger(hour=12, minute=0),
+            id="refresh_delivery_list_daily",
             replace_existing=True,
             misfire_grace_time=3600
         )

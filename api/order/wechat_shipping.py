@@ -8,11 +8,15 @@ import json
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
+from pathlib import Path
 from fastapi import HTTPException
 from core.config import settings
 from core.logging import get_logger
 
 logger = get_logger(__name__)
+
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+DELIVERY_LIST_PATH = BASE_DIR / "json_data" / "delivery-list.json"
 
 
 class WechatShippingManager:
@@ -197,9 +201,60 @@ class WechatShippingManager:
         return cls._make_request(cls.SET_MSG_JUMP_PATH_URL, {"path": path})
 
     @classmethod
-    def get_delivery_list(cls) -> Dict[str, Any]:
-        """获取快递公司列表"""
-        return cls._make_request(cls.GET_DELIVERY_LIST_URL, {}, method="GET")
+    def _get_delivery_list_remote(cls) -> Dict[str, Any]:
+        """直接调用微信接口获取快递公司列表（POST）。"""
+        return cls._make_request(cls.GET_DELIVERY_LIST_URL, {}, method="POST")
+
+    @staticmethod
+    def _fix_mojibake(val: Any) -> Any:
+        if not isinstance(val, str):
+            return val
+        try:
+            return val.encode("latin1").decode("utf-8")
+        except Exception:
+            return val
+
+    @classmethod
+    def refresh_delivery_list_cache(cls) -> Dict[str, Any]:
+        """拉取微信快递公司列表并写入本地缓存文件。"""
+        result = cls._get_delivery_list_remote()
+        delivery_list = result.get("delivery_list") or []
+
+        # 修复可能的乱码
+        for item in delivery_list:
+            if isinstance(item, dict) and "delivery_name" in item:
+                item["delivery_name"] = cls._fix_mojibake(item["delivery_name"])
+
+        payload = {
+            "errcode": result.get("errcode", 0),
+            "errmsg": result.get("errmsg", "ok"),
+            "delivery_list": delivery_list,
+            "count": len(delivery_list),
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }
+
+        DELIVERY_LIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        DELIVERY_LIST_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return payload
+
+    @classmethod
+    def load_delivery_list_cache(cls) -> Dict[str, Any]:
+        """读取本地缓存，如不存在或损坏则刷新。"""
+        try:
+            if DELIVERY_LIST_PATH.exists():
+                data = json.loads(DELIVERY_LIST_PATH.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and "delivery_list" in data:
+                    return data
+        except Exception:
+            logger.warning("读取 delivery-list.json 失败，尝试重新拉取", exc_info=True)
+        return cls.refresh_delivery_list_cache()
+
+    @classmethod
+    def get_delivery_list(cls, force_refresh: bool = False) -> Dict[str, Any]:
+        """优先使用本地缓存，必要时刷新。"""
+        if force_refresh or not DELIVERY_LIST_PATH.exists():
+            return cls.refresh_delivery_list_cache()
+        return cls.load_delivery_list_cache()
 
     @classmethod
     def is_trade_managed(cls) -> Dict[str, Any]:

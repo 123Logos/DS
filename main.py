@@ -82,6 +82,14 @@ def on_startup():
     except Exception as e:
         logger.error(f"初始化数据库失败: {e}")
 
+    # 启动时刷新快递公司列表缓存
+    try:
+        from api.order.wechat_shipping import WechatShippingManager
+        WechatShippingManager.refresh_delivery_list_cache()
+        logger.info("启动时已刷新快递公司列表缓存")
+    except Exception as e:
+        logger.warning(f"刷新快递公司列表缓存失败: {e}")
+
 # ... 原有代码保持不变 ...
 
 tags_metadata = [

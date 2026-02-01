@@ -656,7 +656,7 @@ class OrderManager:
                     cur.execute("""
                         INSERT INTO wechat_shipping_logs 
                         (order_id, order_number, transaction_id, action_type, is_success, remark, response_data, created_at)
-                        VALUES (%s, %s, %s, 'confirm', 1, %s, %s, NOW())
+                        VALUES (%s, %s, %s, 'sync', 1, %s, %s, NOW())
                     """, (
                         order['id'],
                         order_number,

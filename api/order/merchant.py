@@ -474,12 +474,46 @@ def m_notify_confirm_receive(body: NotifyConfirmReceiveRequest):
 
 # ---------------- 微信发货管理相关接口 ----------------
 @router.get("/wechat/delivery-list", summary="获取快递公司列表")
-def get_delivery_list():
-    """获取微信小程序支持的快递公司列表"""
-    result = WechatShippingManager.get_delivery_list()
-    if result.get("errcode") != 0:
-        raise HTTPException(status_code=500, detail=result.get("errmsg", "获取失败"))
-    return result
+def get_delivery_list(start: int = 0, end: Optional[int] = None):
+    """获取微信小程序支持的快递公司列表（使用本地缓存，支持分页切片）。"""
+    logger.info("[delivery_list] start start=%s end=%s", start, end)
+    try:
+        cached = WechatShippingManager.get_delivery_list()
+    except Exception as e:
+        logger.error("[delivery_list] exception: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="服务内部错误")
+
+    delivery_list = cached.get("delivery_list") or []
+    count = len(delivery_list)
+
+    start = max(0, int(start))
+    end = count if end is None else max(start, min(int(end), count))
+    sliced = delivery_list[start:end]
+
+    if cached.get("errcode") not in (None, 0):
+        errmsg = cached.get("errmsg")
+        logger.error(
+            "[delivery_list] failed errcode=%s errmsg=%s payload=%s",
+            cached.get("errcode"),
+            errmsg,
+            json.dumps(cached, ensure_ascii=False) if cached is not None else "<nil>"
+        )
+        raise HTTPException(status_code=500, detail=errmsg or "获取失败")
+
+    response = {
+        "errcode": 0,
+        "errmsg": "ok",
+        "count": count,
+        "start": start,
+        "end": end,
+        "delivery_list": sliced,
+    }
+
+    if "updated_at" in cached:
+        response["updated_at"] = cached["updated_at"]
+
+    logger.info("[delivery_list] success items=%s start=%s end=%s", len(sliced), start, end)
+    return response
 
 
 @router.get("/wechat/order-status/{order_number}", summary="查询订单在微信的发货状态")
