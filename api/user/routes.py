@@ -1735,49 +1735,35 @@ def clear_avatar(user_id: int):
 @router.post("/user/get-phone", tags=["用户中心"], response_model=GetPhoneResp)
 def get_phone(req: GetPhoneReq):
     """
-    微信手机号快速验证（mp-phone-number 组件）
-    这是新版本的手机号
-    前端发送：mp-phone-number 组件返回的 code
-    后端：用 code 换取真实手机号（无需解密）
+    微信手机号快速验证（mp-phone-number 组件专用）
     """
     try:
-        # 1. 调用微信接口换手机号
-        url = (
-            f"https://api.weixin.qq.com/wxa/business/getuserphonenumber?"
-            f"access_token={get_wx_access_token()}"
-        )
+        # 1. 调用微信服务获取手机号
+        phone = WechatService.get_phone_number(req.code)
 
-        resp = requests.post(url, json={"code": req.code}, timeout=10).json()
-
-        if resp.get("errcode") != 0:
-            logger.error(f"获取手机号失败: {resp}")
-            raise ValueError(f"微信接口错误: {resp.get('errmsg')}")
-
-        # 2. 提取手机号
-        phone_info = resp.get("phone_info", {})
-        phone = phone_info.get("phoneNumber")
-
-        if not phone:
-            raise ValueError("无法获取手机号")
-
-        # 3. 更新数据库（根据当前登录用户）
-        # 注意：需要从前端请求头中获取 token 或 user_id
-        user_id = get_current_user_id()  # 需要实现这个辅助函数
+        # 2. 更新数据库（需要知道当前用户）
+        # 方案：从请求头获取 user_id（前端需要传）
+        user_id = req.user_id  # 需要在 GetPhoneReq 模型中添加这个字段
 
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # 确保字段存在
+                cur.execute("SHOW COLUMNS FROM users LIKE 'phone'")
+                if not cur.fetchone():
+                    raise ValueError("数据库缺少 phone 字段")
+
+                # 更新手机号
                 cur.execute(
-                    "UPDATE users SET phone = %s WHERE id = %s AND wx_openid IS NOT NULL",
+                    "UPDATE users SET phone = %s, updated_at = NOW() WHERE id = %s",
                     (phone, user_id)
                 )
                 conn.commit()
 
-        logger.info(f"✅ 用户 {user_id} 手机号验证成功: {phone[:3]}****{phone[-4:]}")
-
+        logger.info(f"✅ 用户 {user_id} 手机号验证成功")
         return GetPhoneResp(phone=phone)
 
     except Exception as e:
-        logger.exception(f"手机号验证失败: {e}")
+        logger.error(f"手机号验证失败: {e}")
         raise HTTPException(status_code=400, detail=str(e))
 
 

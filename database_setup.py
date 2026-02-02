@@ -763,6 +763,8 @@ class DatabaseManager:
                 'referral_points': 'referral_points DECIMAL(12,4) NOT NULL DEFAULT 0.0000 COMMENT \'推荐奖励专用点数\'',
                 'wechat_sub_mchid': 'wechat_sub_mchid VARCHAR(32) NULL DEFAULT NULL COMMENT \'微信特约商户号\'',
                 'has_store_permission': 'has_store_permission TINYINT(1) NOT NULL DEFAULT 0 COMMENT \'是否开通开店权限（支付进件成功后置为1）\'',
+                'wx_openid': "wx_openid VARCHAR(100) UNIQUE DEFAULT NULL COMMENT '微信openid'",
+                'phone': "phone VARCHAR(20) DEFAULT NULL COMMENT '手机号'",
             },
             'orders': {
                 'tracking_number': 'tracking_number VARCHAR(64) NULL COMMENT \'快递单号\'',

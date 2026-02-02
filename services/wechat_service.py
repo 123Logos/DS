@@ -266,3 +266,34 @@ class WechatService:
         except Exception as e:
             logger.error(f"解密失败: {e}")
             raise ValueError("手机号解密失败，请检查参数是否正确")
+
+    @staticmethod
+    def get_phone_number(phone_code: str) -> str:
+        """微信手机号快速验证 - 核心方法"""
+        try:
+            # 获取 access_token
+            access_token = WechatService.get_access_token()
+
+            # 调用微信接口
+            url = f"https://api.weixin.qq.com/wxa/business/getuserphonenumber?access_token={access_token}"
+            resp = requests.post(url, json={"code": phone_code}, timeout=10).json()
+
+            if resp.get("errcode") != 0:
+                raise ValueError(f"微信接口错误: {resp.get('errmsg')}")
+
+            return resp["phone_info"]["phoneNumber"]
+
+        except Exception as e:
+            logger.error(f"获取手机号失败: {e}")
+            raise
+
+    @staticmethod
+    def get_access_token() -> str:
+        """获取微信 access_token（生产环境需缓存）"""
+        url = f"https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid={WECHAT_APP_ID}&secret={WECHAT_APP_SECRET}"
+        resp = requests.get(url, timeout=10).json()
+
+        if "access_token" not in resp:
+            raise ValueError(f"获取access_token失败: {resp}")
+
+        return resp["access_token"]

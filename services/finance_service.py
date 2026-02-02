@@ -294,12 +294,18 @@ class FinanceService:
                     logger.debug(f"用户{user_id}获得积分: +{normal_points_earned:.4f}")
             # 9. 记录完整用户支付链路（100% 收入 → 80% 商家 + 20% 各池）
             allocs = self.get_pool_allocations()
-            platform_revenue = final_amount  # ① 先按 100% 记收入
+
+            # 【修改】资金分配计算基数：实付金额 + 优惠券抵扣金额
+            distribution_base = final_amount + coupon_discount
+            if distribution_base < Decimal('0'):
+                distribution_base = Decimal('0')
+
+            platform_revenue = distribution_base  # ① 先按新的基数记收入
             self._add_pool_balance(
                 cur,
                 'platform_revenue_pool',
                 platform_revenue,
-                f"订单分账: {order_no} 用户支付¥{final_amount:.2f}",
+                f"订单分账: {order_no} 分配基数¥{distribution_base:.2f}(实付¥{final_amount:.2f}+优惠券¥{coupon_discount:.2f})",
                 user_id
             )
 
@@ -307,7 +313,8 @@ class FinanceService:
             for atype, ratio in allocs.items():
                 if atype == 'merchant_balance':
                     continue
-                alloc_amount = final_amount * ratio
+                # 【修改】使用新的分配基数计算各子池金额
+                alloc_amount = distribution_base * ratio
                 self._add_pool_balance(
                     cur,
                     'platform_revenue_pool',

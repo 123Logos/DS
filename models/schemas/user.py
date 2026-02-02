@@ -300,7 +300,7 @@ class DecryptPhoneResp(BaseModel):
 class GetPhoneReq(BaseModel):
     """手机号快速验证请求"""
     code: str  # 微信返回的手机号凭证
-
+    user_id: int  # ✅ 添加用户ID字段
 
 class GetPhoneResp(BaseModel):
     """手机号快速验证响应"""
