@@ -22,11 +22,44 @@ from io import BytesIO
 from typing import List, Dict, Any
 from fastapi.responses import StreamingResponse
 
+# ==================== 新增：导入 Redis 用于分布式锁 ====================
+import redis
+import redis.exceptions
+
 # ==================== 新增：导入微信发货管理模块 ====================
 from .wechat_shipping import WechatShippingManager
 
 logger = get_logger(__name__)
 router = APIRouter()
+
+
+# ==================== 新增：Redis 客户端初始化（带容错） ====================
+def _get_redis_client():
+    """获取 Redis 客户端，如果未配置则返回 None"""
+    try:
+        # 尝试从 settings 获取 Redis 配置，如果没有则使用默认本地配置
+        redis_host = getattr(settings, 'REDIS_HOST', 'localhost')
+        redis_port = getattr(settings, 'REDIS_PORT', 6379)
+        redis_db = getattr(settings, 'REDIS_DB', 0)
+
+        client = redis.Redis(
+            host=redis_host,
+            port=redis_port,
+            db=redis_db,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2
+        )
+        # 测试连接
+        client.ping()
+        return client
+    except Exception as e:
+        logger.warning(f"Redis 连接失败（将使用数据库兜底）: {e}")
+        return None
+
+
+# 全局 Redis 客户端
+redis_client = _get_redis_client()
 
 
 # 在 order.py 的 _cancel_expire_orders 函数中
@@ -257,174 +290,262 @@ class OrderManager:
             buy_now_items: Optional[List[Dict[str, Any]]] = None,
             delivery_way: str = "platform",
             points_to_use: Optional[Decimal] = None,
-            coupon_id: Optional[int] = None
+            coupon_id: Optional[int] = None,
+            # ==================== 新增：幂等性 Key（前端生成，用于防重放） ====================
+            idempotency_key: Optional[str] = None
     ) -> Optional[str]:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                # ---------- 1. 组装订单明细 ----------
-                if buy_now:
-                    if not buy_now_items:
-                        raise HTTPException(status_code=422, detail="立即购买时 buy_now_items 不能为空")
-                    items = []
-                    for it in buy_now_items:
-                        cur.execute("SELECT is_member_product FROM products WHERE id = %s", (it["product_id"],))
-                        prod = cur.fetchone()
-                        if not prod:
-                            raise HTTPException(status_code=404, detail=f"products 表中不存在 id={it['product_id']}")
+        """
+        创建订单（已增加幂等性校验，防止重复创建）
 
-                        sku_id = it.get("sku_id")
-                        if not sku_id:
-                            cur.execute("SELECT id FROM product_skus WHERE product_id = %s LIMIT 1",
-                                        (it['product_id'],))
-                            sku_row = cur.fetchone()
-                            if sku_row:
-                                sku_id = sku_row.get('id')
-                            else:
+        幂等性策略：
+        1. Redis 分布式锁：防止并发重复提交（5秒锁）
+        2. 业务层幂等检查：检查最近1分钟内是否有未取消的订单
+        3. 数据库唯一索引：最后一道防线（order_number 唯一）
+        """
+
+        # ==================== 新增：Redis 分布式锁 ====================
+        lock_key = f"order:create:{user_id}"
+        lock_acquired = False
+
+        if redis_client:
+            try:
+                # NX=True: 只有 key 不存在时才设置成功（获取锁成功）
+                # EX=5: 锁 5 秒后自动释放（防止死锁）
+                lock_acquired = redis_client.set(lock_key, idempotency_key or "1", nx=True, ex=5)
+                if not lock_acquired:
+                    logger.warning(f"用户 {user_id} 重复提交订单，Redis 锁拦截")
+                    raise HTTPException(
+                        status_code=429,
+                        detail="订单创建中，请勿重复提交，或等待 5 秒后重试"
+                    )
+            except redis.exceptions.RedisError as e:
+                logger.error(f"Redis 锁操作失败: {e}，将降级为数据库锁")
+                # Redis 故障时降级，继续执行（依赖数据库唯一索引兜底）
+                lock_acquired = False
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+
+                    # ==================== 新增：业务层幂等检查 ====================
+                    # 检查该用户最近 1 分钟内是否已有非取消状态的订单（立即购买场景除外）
+                    if not buy_now:
+                        cur.execute("""
+                            SELECT order_number, status, created_at 
+                            FROM orders 
+                            WHERE user_id = %s 
+                              AND created_at > DATE_SUB(NOW(), INTERVAL 1 MINUTE)
+                              AND status != 'cancelled'
+                            ORDER BY created_at DESC 
+                            LIMIT 1
+                        """, (user_id,))
+                        recent_order = cur.fetchone()
+
+                        if recent_order:
+                            logger.warning(
+                                f"用户 {user_id} 1 分钟内已有订单 {recent_order['order_number']}，拦截重复创建")
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"您刚刚已创建订单 {recent_order['order_number']}，请勿重复提交"
+                            )
+
+                    # ==================== 新增：幂等 Key 检查（如果提供了的话） ====================
+                    if idempotency_key and redis_client:
+                        # 检查这个 idempotency_key 是否已经用过（24小时有效期）
+                        used_key = f"order:idempotency:{idempotency_key}"
+                        if redis_client.exists(used_key):
+                            # 返回之前创建的订单号
+                            existing_order = redis_client.get(used_key)
+                            logger.info(f"幂等 Key 重复，返回已存在订单: {existing_order}")
+                            return existing_order
+
+                    # ---------- 1. 组装订单明细 ----------
+                    if buy_now:
+                        if not buy_now_items:
+                            raise HTTPException(status_code=422, detail="立即购买时 buy_now_items 不能为空")
+                        items = []
+                        for it in buy_now_items:
+                            cur.execute("SELECT is_member_product FROM products WHERE id = %s", (it["product_id"],))
+                            prod = cur.fetchone()
+                            if not prod:
+                                raise HTTPException(status_code=404,
+                                                    detail=f"products 表中不存在 id={it['product_id']}")
+
+                            sku_id = it.get("sku_id")
+                            if not sku_id:
+                                cur.execute("SELECT id FROM product_skus WHERE product_id = %s LIMIT 1",
+                                            (it['product_id'],))
+                                sku_row = cur.fetchone()
+                                if sku_row:
+                                    sku_id = sku_row.get('id')
+                                else:
+                                    raise HTTPException(status_code=422,
+                                                        detail=f"商品 {it['product_id']} 无可用 SKU，请提供 sku_id")
+
+                            if "price" not in it:
                                 raise HTTPException(status_code=422,
-                                                    detail=f"商品 {it['product_id']} 无可用 SKU，请提供 sku_id")
+                                                    detail=f"buy_now_items 必须包含 price 字段：product_id={it['product_id']}")
 
-                        if "price" not in it:
-                            raise HTTPException(status_code=422,
-                                                detail=f"buy_now_items 必须包含 price 字段：product_id={it['product_id']}")
+                            items.append({
+                                "sku_id": sku_id,
+                                "product_id": it["product_id"],
+                                "quantity": it["quantity"],
+                                "price": Decimal(str(it["price"])),
+                                "is_vip": prod["is_member_product"]
+                            })
+                    else:
+                        cur.execute("""
+                            SELECT c.product_id,
+                                c.sku_id,
+                                c.quantity,
+                                s.price,
+                                p.is_member_product AS is_vip,
+                                c.specifications
+                            FROM cart c
+                            JOIN product_skus s ON s.id = c.sku_id
+                            JOIN products p ON p.id = c.product_id
+                            WHERE c.user_id = %s AND c.selected = 1
+                        """, (user_id,))
+                        items = cur.fetchall()
+                        if not items:
+                            return None
 
-                        items.append({
-                            "sku_id": sku_id,
-                            "product_id": it["product_id"],
-                            "quantity": it["quantity"],
-                            "price": Decimal(str(it["price"])),
-                            "is_vip": prod["is_member_product"]
-                        })
-                else:
+                    # ---------- 2. 优惠券商品类型验证（新增） ----------
+                    has_vip = any(i["is_vip"] for i in items)
+
+                    if coupon_id:
+                        # 查询优惠券详情并锁定
+                        cur.execute("""
+                            SELECT id, amount, applicable_product_type, status, valid_from, valid_to, user_id
+                            FROM coupons 
+                            WHERE id = %s AND user_id = %s AND status = 'unused'
+                            FOR UPDATE
+                        """, (coupon_id, user_id))
+                        coupon = cur.fetchone()
+
+                        if not coupon:
+                            raise HTTPException(status_code=400, detail="优惠券不存在、已被使用或不属于当前用户")
+
+                        # 检查有效期
+                        today = datetime.now().date()
+                        if not (coupon['valid_from'] <= today <= coupon['valid_to']):
+                            raise HTTPException(status_code=400, detail="优惠券不在有效期内")
+
+                        # 检查商品类型匹配
+                        applicable_type = coupon['applicable_product_type']
+                        if applicable_type == 'member_only' and not has_vip:
+                            raise HTTPException(status_code=400, detail="该优惠券仅限会员商品使用")
+                        if applicable_type == 'normal_only' and has_vip:
+                            raise HTTPException(status_code=400, detail="该优惠券仅限普通商品使用")
+
+                        # 检查优惠券金额是否超过订单金额
+                        coupon_amount = Decimal(str(coupon['amount']))
+                        total_amount = sum(Decimal(str(i["quantity"])) * Decimal(str(i["price"])) for i in items)
+                        if coupon_amount > total_amount:
+                            raise HTTPException(status_code=400, detail="优惠券金额不能大于订单金额")
+
+                    # ---------- 3. 地址信息 ----------
+                    if delivery_way == "pickup":
+                        consignee_name = consignee_phone = province = city = district = shipping_address = ""
+                    elif custom_addr:
+                        consignee_name = custom_addr.get("consignee_name")
+                        consignee_phone = custom_addr.get("consignee_phone")
+                        province = custom_addr.get("province", "")
+                        city = custom_addr.get("city", "")
+                        district = custom_addr.get("district", "")
+                        shipping_address = custom_addr.get("detail", "")
+                    else:
+                        raise HTTPException(status_code=422, detail="必须上传收货地址或选择自提")
+
+                    # ---------- 4. 订单主表 ----------
+                    total = sum(Decimal(str(i["quantity"])) * Decimal(str(i["price"])) for i in items)
+
+                    # ==================== 优化：更安全的订单号生成 ====================
+                    # 使用 16 位十六进制 UUID 代替原来的 6 位数字，极大降低碰撞概率
+                    order_number = (
+                            datetime.now().strftime("%Y%m%d%H%M%S") +
+                            str(user_id) +
+                            uuid.uuid4().hex[:16]  # 16位十六进制，比原来6位数字更安全
+                    )
+
+                    init_status = "pending_pay"
+
+                    # 修改后的 INSERT 语句，包含 original_amount, pending_points, pending_coupon_id
                     cur.execute("""
-                        SELECT c.product_id,
-                            c.sku_id,
-                            c.quantity,
-                            s.price,
-                            p.is_member_product AS is_vip,
-                            c.specifications
-                        FROM cart c
-                        JOIN product_skus s ON s.id = c.sku_id
-                        JOIN products p ON p.id = c.product_id
-                        WHERE c.user_id = %s AND c.selected = 1
-                    """, (user_id,))
-                    items = cur.fetchall()
-                    if not items:
-                        return None
-
-                # ---------- 2. 优惠券商品类型验证（新增） ----------
-                has_vip = any(i["is_vip"] for i in items)
-
-                if coupon_id:
-                    # 查询优惠券详情并锁定
-                    cur.execute("""
-                        SELECT id, amount, applicable_product_type, status, valid_from, valid_to, user_id
-                        FROM coupons 
-                        WHERE id = %s AND user_id = %s AND status = 'unused'
-                        FOR UPDATE
-                    """, (coupon_id, user_id))
-                    coupon = cur.fetchone()
-
-                    if not coupon:
-                        raise HTTPException(status_code=400, detail="优惠券不存在、已被使用或不属于当前用户")
-
-                    # 检查有效期
-                    today = datetime.now().date()
-                    if not (coupon['valid_from'] <= today <= coupon['valid_to']):
-                        raise HTTPException(status_code=400, detail="优惠券不在有效期内")
-
-                    # 检查商品类型匹配
-                    applicable_type = coupon['applicable_product_type']
-                    if applicable_type == 'member_only' and not has_vip:
-                        raise HTTPException(status_code=400, detail="该优惠券仅限会员商品使用")
-                    if applicable_type == 'normal_only' and has_vip:
-                        raise HTTPException(status_code=400, detail="该优惠券仅限普通商品使用")
-
-                    # 检查优惠券金额是否超过订单金额
-                    coupon_amount = Decimal(str(coupon['amount']))
-                    total_amount = sum(Decimal(str(i["quantity"])) * Decimal(str(i["price"])) for i in items)
-                    if coupon_amount > total_amount:
-                        raise HTTPException(status_code=400, detail="优惠券金额不能大于订单金额")
-
-                # ---------- 3. 地址信息 ----------
-                if delivery_way == "pickup":
-                    consignee_name = consignee_phone = province = city = district = shipping_address = ""
-                elif custom_addr:
-                    consignee_name = custom_addr.get("consignee_name")
-                    consignee_phone = custom_addr.get("consignee_phone")
-                    province = custom_addr.get("province", "")
-                    city = custom_addr.get("city", "")
-                    district = custom_addr.get("district", "")
-                    shipping_address = custom_addr.get("detail", "")
-                else:
-                    raise HTTPException(status_code=422, detail="必须上传收货地址或选择自提")
-
-                # ---------- 4. 订单主表 ----------
-                total = sum(Decimal(str(i["quantity"])) * Decimal(str(i["price"])) for i in items)
-                order_number = datetime.now().strftime("%Y%m%d%H%M%S") + str(user_id) + str(uuid.uuid4().int)[:6]
-                init_status = "pending_pay"
-
-                # 修改后的 INSERT 语句，包含 original_amount, pending_points, pending_coupon_id
-                cur.execute("""
-                    INSERT INTO orders(
-                        user_id, order_number, total_amount, original_amount, status, is_vip_item,
+                        INSERT INTO orders(
+                            user_id, order_number, total_amount, original_amount, status, is_vip_item,
+                            consignee_name, consignee_phone,
+                            province, city, district, shipping_address, delivery_way,
+                            pay_way, auto_recv_time, refund_reason, expire_at,
+                            pending_points, pending_coupon_id)
+                        VALUES (%s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s, %s,
+                                'wechat', %s, %s, %s, %s, %s)
+                    """, (
+                        user_id, order_number, total, total, init_status, has_vip,
                         consignee_name, consignee_phone,
                         province, city, district, shipping_address, delivery_way,
-                        pay_way, auto_recv_time, refund_reason, expire_at,
-                        pending_points, pending_coupon_id)
-                    VALUES (%s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s, %s,
-                            'wechat', %s, %s, %s, %s, %s)
-                """, (
-                    user_id, order_number, total, total, init_status, has_vip,
-                    consignee_name, consignee_phone,
-                    province, city, district, shipping_address, delivery_way,
-                    datetime.now() + timedelta(days=7),
-                    specifications,
-                    datetime.now() + timedelta(hours=12) if init_status == "pending_pay" else None,
-                    points_to_use or Decimal('0'),
-                    coupon_id
-                ))
-                oid = cur.lastrowid
-
-                # ---------- 5. 库存校验 & 扣减 ----------
-                structure = get_table_structure(cur, "product_skus")
-                has_stock_field = 'stock' in structure['fields']
-                stock_select = (
-                    f"COALESCE({_quote_identifier('stock')}, 0) AS {_quote_identifier('stock')}"
-                    if has_stock_field and 'stock' in structure['asset_fields']
-                    else _quote_identifier('stock')
-                ) if has_stock_field else "0 AS stock"
-
-                for i in items:
-                    cur.execute(f"SELECT {stock_select} FROM {_quote_identifier('product_skus')} WHERE id=%s",
-                                (i['sku_id'],))
-                    result = cur.fetchone()
-                    current_stock = result.get('stock', 0) if result else 0
-                    if current_stock < i["quantity"]:
-                        raise HTTPException(status_code=400, detail=f"SKU {i['sku_id']} 库存不足")
-
-                # ---------- 6. 写订单明细 ----------
-                for i in items:
-                    cur.execute("""
-                        INSERT INTO order_items(order_id, product_id, sku_id, quantity, unit_price, total_price)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                    """, (
-                        oid, i["product_id"], i["sku_id"], i["quantity"],
-                        i["price"], Decimal(str(i["quantity"])) * Decimal(str(i["price"]))
+                        datetime.now() + timedelta(days=7),
+                        specifications,
+                        datetime.now() + timedelta(hours=12) if init_status == "pending_pay" else None,
+                        points_to_use or Decimal('0'),
+                        coupon_id
                     ))
+                    oid = cur.lastrowid
 
-                # ---------- 7. 扣库存 ----------
-                if has_stock_field:
+                    # ---------- 5. 库存校验 & 扣减 ----------
+                    structure = get_table_structure(cur, "product_skus")
+                    has_stock_field = 'stock' in structure['fields']
+                    stock_select = (
+                        f"COALESCE({_quote_identifier('stock')}, 0) AS {_quote_identifier('stock')}"
+                        if has_stock_field and 'stock' in structure['asset_fields']
+                        else _quote_identifier('stock')
+                    ) if has_stock_field else "0 AS stock"
+
                     for i in items:
-                        cur.execute("UPDATE product_skus SET stock = stock - %s WHERE id = %s",
-                                    (i["quantity"], i['sku_id']))
+                        cur.execute(f"SELECT {stock_select} FROM {_quote_identifier('product_skus')} WHERE id=%s",
+                                    (i['sku_id'],))
+                        result = cur.fetchone()
+                        current_stock = result.get('stock', 0) if result else 0
+                        if current_stock < i["quantity"]:
+                            raise HTTPException(status_code=400, detail=f"SKU {i['sku_id']} 库存不足")
 
-                # ---------- 8. 清空购物车（仅购物车结算场景） ----------
-                if not buy_now:
-                    cur.execute("DELETE FROM cart WHERE user_id = %s AND selected = 1", (user_id,))
+                    # ---------- 6. 写订单明细 ----------
+                    for i in items:
+                        cur.execute("""
+                            INSERT INTO order_items(order_id, product_id, sku_id, quantity, unit_price, total_price)
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                        """, (
+                            oid, i["product_id"], i["sku_id"], i["quantity"],
+                            i["price"], Decimal(str(i["quantity"])) * Decimal(str(i["price"]))
+                        ))
 
-                conn.commit()
-                return order_number
+                    # ---------- 7. 扣库存 ----------
+                    if has_stock_field:
+                        for i in items:
+                            cur.execute("UPDATE product_skus SET stock = stock - %s WHERE id = %s",
+                                        (i["quantity"], i['sku_id']))
+
+                    # ---------- 8. 清空购物车（仅购物车结算场景） ----------
+                    if not buy_now:
+                        cur.execute("DELETE FROM cart WHERE user_id = %s AND selected = 1", (user_id,))
+
+                    # ==================== 新增：记录幂等 Key 使用（如果提供了的话） ====================
+                    if idempotency_key and redis_client:
+                        used_key = f"order:idempotency:{idempotency_key}"
+                        redis_client.setex(used_key, 86400, order_number)  # 24小时过期
+
+                    conn.commit()
+                    logger.info(f"订单创建成功: {order_number}, 用户: {user_id}")
+                    return order_number
+
+        finally:
+            # ==================== 新增：无论成功与否都释放 Redis 锁 ====================
+            if lock_acquired and redis_client:
+                try:
+                    redis_client.delete(lock_key)
+                except Exception as e:
+                    logger.error(f"释放 Redis 锁失败: {e}")
 
     @staticmethod
     def list_by_user(user_id: int, status: Optional[str] = None):
@@ -959,7 +1080,9 @@ class OrderCreate(BaseModel):
     buy_now: bool = False
     buy_now_items: Optional[List[Dict[str, Any]]] = None
     points_to_use: Optional[Decimal] = Decimal('0')  # 新增：积分抵扣数量
-    coupon_id: Optional[int] = None                   # 新增：优惠券ID
+    coupon_id: Optional[int] = None  # 新增：优惠券ID
+    # ==================== 新增：幂等性 Key（前端生成 UUID） ====================
+    idempotency_key: Optional[str] = None  # 用于防止重复提交
 
 
 class OrderPay(BaseModel):
@@ -994,6 +1117,13 @@ class ConfirmReceiveRequest(BaseModel):
 # ---------------- 路由 ----------------
 @router.post("/create", summary="创建订单")
 def create_order(body: OrderCreate):
+    """
+    创建订单接口（已增加幂等性校验）
+
+    - 请前端在提交时生成 idempotency_key（UUID），用于防止重复创建
+    - 如果同一用户 1 分钟内已有未取消订单，会返回错误
+    - 如果 Redis 锁未释放（5 秒内），会返回 429 错误
+    """
     no = OrderManager.create(
         body.user_id,
         body.address_id,
@@ -1003,7 +1133,8 @@ def create_order(body: OrderCreate):
         buy_now_items=body.buy_now_items,
         delivery_way=body.delivery_way,
         points_to_use=body.points_to_use,  # 传递积分参数
-        coupon_id=body.coupon_id           # 传递优惠券参数
+        coupon_id=body.coupon_id,  # 传递优惠券参数
+        idempotency_key=body.idempotency_key  # 传递幂等 Key
     )
     if not no:
         raise HTTPException(status_code=422, detail="购物车为空或地址缺失")
