@@ -269,8 +269,17 @@ class FinanceService:
                 )
 
                 if user.member_level >= 1 and final_amount > Decimal('0'):
+                    # 【修改】新的积分计算逻辑：(优惠券抵扣金额 + 实付金额) × 普通商品金额 / 订单总金额
                     points_ratio = normal_total_amount / total_amount if total_amount > 0 else Decimal('0')
-                    normal_points_earned = final_amount * points_ratio
+
+                    # 计算基数：优惠券抵扣 + 实付金额（即订单总额减去积分抵扣部分）
+                    calculation_base = coupon_discount + final_amount
+
+                    # 确保基数不为负数
+                    if calculation_base < Decimal('0'):
+                        calculation_base = Decimal('0')
+
+                    normal_points_earned = calculation_base * points_ratio
 
                     cur.execute(
                         "UPDATE users SET member_points = COALESCE(member_points, 0) + %s WHERE id = %s",
@@ -283,7 +292,6 @@ class FinanceService:
                         (user_id, normal_points_earned, user_id, '购买普通商品获得积分', order_id)
                     )
                     logger.debug(f"用户{user_id}获得积分: +{normal_points_earned:.4f}")
-
             # 9. 记录完整用户支付链路（100% 收入 → 80% 商家 + 20% 各池）
             allocs = self.get_pool_allocations()
             platform_revenue = final_amount  # ① 先按 100% 记收入

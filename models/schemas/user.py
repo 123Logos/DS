@@ -281,7 +281,7 @@ class ReferralQRResponse(BaseModel):
         from_attributes = True  # 兼容 ORM 模式
 
 
-# =============== 手机号解密模型 ===============
+# =============== 手机号解密模型（芝士老版本） ===============
 
 class DecryptPhoneReq(BaseModel):
     """手机号解密请求"""
@@ -293,4 +293,16 @@ class DecryptPhoneReq(BaseModel):
 class DecryptPhoneResp(BaseModel):
     """手机号解密响应"""
     phone: str            # 解密后的手机号
+    message: str = "success"
+
+# =============== 手机号快速验证模型(这是super ultra extra new type) ===============
+
+class GetPhoneReq(BaseModel):
+    """手机号快速验证请求"""
+    code: str  # 微信返回的手机号凭证
+
+
+class GetPhoneResp(BaseModel):
+    """手机号快速验证响应"""
+    phone: str  # 明文手机号
     message: str = "success"

@@ -1,16 +1,16 @@
 from fastapi import HTTPException, APIRouter, Request,File, UploadFile,Path, Depends
 import uuid
 import datetime
-
+import requests
 from models.schemas.user import (
     SetStatusReq, AuthReq, AuthResp, UpdateProfileReq, SelfDeleteReq,
     FreezeReq, ResetPwdReq, AdminResetPwdReq, SetLevelReq, AddressReq,
     UpdateAddressReq,
     PointsReq, UserInfoResp, BindReferrerReq,MobileResp,Query,AvatarUploadResp,
     UnilevelStatusResponse, UnilevelPromoteResponse,UserAllPointsResponse,UserPointsSummaryResponse,SetUnilevelReq,
-    ReferralQRResponse,DecryptPhoneReq, DecryptPhoneResp
+    ReferralQRResponse,DecryptPhoneReq, DecryptPhoneResp,GetPhoneReq, GetPhoneResp
 )
-
+from core.config import WECHAT_APP_ID, WECHAT_APP_SECRET
 from core.database import get_conn
 from core.logging import get_logger
 from core.table_access import build_dynamic_select, get_table_structure, _quote_identifier
@@ -1679,7 +1679,7 @@ def refresh_referral_qr(user_id: int):
 def decrypt_phone(req: DecryptPhoneReq):
     """
     解密微信手机号（核心接口）
-
+    这个是旧版本的新版的在👇的👇
     前端发送：
     - code: 微信登录 code（必须用同一个）
     - encrypted_data: getPhoneNumber 返回的 encryptedData
@@ -1730,3 +1730,68 @@ def clear_avatar(user_id: int):
     except Exception as e:
         logger.exception(f"清空头像失败: {e}")
         raise HTTPException(status_code=500, detail="操作失败")
+
+
+@router.post("/user/get-phone", tags=["用户中心"], response_model=GetPhoneResp)
+def get_phone(req: GetPhoneReq):
+    """
+    微信手机号快速验证（mp-phone-number 组件）
+    这是新版本的手机号
+    前端发送：mp-phone-number 组件返回的 code
+    后端：用 code 换取真实手机号（无需解密）
+    """
+    try:
+        # 1. 调用微信接口换手机号
+        url = (
+            f"https://api.weixin.qq.com/wxa/business/getuserphonenumber?"
+            f"access_token={get_wx_access_token()}"
+        )
+
+        resp = requests.post(url, json={"code": req.code}, timeout=10).json()
+
+        if resp.get("errcode") != 0:
+            logger.error(f"获取手机号失败: {resp}")
+            raise ValueError(f"微信接口错误: {resp.get('errmsg')}")
+
+        # 2. 提取手机号
+        phone_info = resp.get("phone_info", {})
+        phone = phone_info.get("phoneNumber")
+
+        if not phone:
+            raise ValueError("无法获取手机号")
+
+        # 3. 更新数据库（根据当前登录用户）
+        # 注意：需要从前端请求头中获取 token 或 user_id
+        user_id = get_current_user_id()  # 需要实现这个辅助函数
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET phone = %s WHERE id = %s AND wx_openid IS NOT NULL",
+                    (phone, user_id)
+                )
+                conn.commit()
+
+        logger.info(f"✅ 用户 {user_id} 手机号验证成功: {phone[:3]}****{phone[-4:]}")
+
+        return GetPhoneResp(phone=phone)
+
+    except Exception as e:
+        logger.exception(f"手机号验证失败: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+def get_wx_access_token() -> str:
+    """获取微信 access_token（缓存）"""
+    # 实现 access_token 缓存逻辑
+    url = f"https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid={WECHAT_APP_ID}&secret={WECHAT_APP_SECRET}"
+    resp = requests.get(url, timeout=10).json()
+    return resp.get("access_token")
+
+
+def get_current_user_id() -> int:
+    """从请求头获取当前用户ID（需根据您的认证逻辑实现）"""
+    # 示例：从 JWT token 解析
+    # token = request.headers.get("authorization")
+    # return decode_token(token)
+    pass
