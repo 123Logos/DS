@@ -772,6 +772,7 @@ class DatabaseManager:
                 'expire_at': 'expire_at DATETIME NULL COMMENT \'订单过期时间（未支付订单7天后自动过期）\'',
                 'offline_order_flag': 'offline_order_flag TINYINT(1) NOT NULL DEFAULT 0 COMMENT \'是否线下收银订单：0线上/1线下\'',
                 'applyment_id': 'applyment_id BIGINT UNSIGNED DEFAULT NULL COMMENT \'关联微信进件单ID（线下订单必填）\'',
+                'transaction_id': 'transaction_id VARCHAR(64) DEFAULT NULL COMMENT \'微信/支付宝交易号\'',
                 'wechat_shipping_status': 'wechat_shipping_status TINYINT NOT NULL DEFAULT 0 COMMENT \'微信发货状态：0未上传 1已上传 2上传失败 3已重新上传\'',
                 'wechat_shipping_time': 'wechat_shipping_time DATETIME NULL COMMENT \'微信发货信息上传时间\'',
                 'wechat_shipping_msg': 'wechat_shipping_msg VARCHAR(500) NULL COMMENT \'微信发货接口返回错误信息\'',

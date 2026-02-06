@@ -1,5 +1,5 @@
 from services.finance_service import FinanceService
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any, cast
 from core.config import Settings, settings
@@ -292,15 +292,23 @@ class OrderManager:
             points_to_use: Optional[Decimal] = None,
             coupon_id: Optional[int] = None,
             # ==================== 新增：幂等性 Key（前端生成，用于防重放） ====================
-            idempotency_key: Optional[str] = None
+            idempotency_key: Optional[str] = None,
+            # ==================== 新增：商家ID（可选，默认0=平台自营） ====================
+            merchant_id: Optional[int] = None
     ) -> Optional[str]:
         """
-        创建订单（已增加幂等性校验，防止重复创建）
+        创建订单（已增加幂等性校验，防止重复创建，支持多商家订单）
 
         幂等性策略：
         1. Redis 分布式锁：防止并发重复提交（5秒锁）
         2. 业务层幂等检查：检查最近1分钟内是否有未取消的订单
         3. 数据库唯一索引：最后一道防线（order_number 唯一）
+
+        商家处理逻辑：
+        - 如果提供了 merchant_id，直接使用该值
+        - 如果未提供，从 buy_now_items 或购物车商品中推断商家ID
+        - 如果商品属于不同商家，返回错误（一笔订单只能属于一个商家）
+        - 如果无法确定商家，默认使用 0（平台自营）
         """
 
         # ==================== 新增：Redis 分布式锁 ====================
@@ -364,12 +372,17 @@ class OrderManager:
                         if not buy_now_items:
                             raise HTTPException(status_code=422, detail="立即购买时 buy_now_items 不能为空")
                         items = []
+                        product_merchant_ids = set()  # 收集所有商品的商家ID
+                        
                         for it in buy_now_items:
-                            cur.execute("SELECT is_member_product FROM products WHERE id = %s", (it["product_id"],))
+                            cur.execute("SELECT is_member_product, user_id FROM products WHERE id = %s", (it["product_id"],))
                             prod = cur.fetchone()
                             if not prod:
                                 raise HTTPException(status_code=404,
                                                     detail=f"products 表中不存在 id={it['product_id']}")
+
+                            # 收集商家ID (user_id 即商家ID)
+                            product_merchant_ids.add(prod.get("user_id") or 0)
 
                             sku_id = it.get("sku_id")
                             if not sku_id:
@@ -393,13 +406,26 @@ class OrderManager:
                                 "price": Decimal(str(it["price"])),
                                 "is_vip": prod["is_member_product"]
                             })
+                        
+                        # 检查商家一致性（一笔订单只能属于一个商家）
+                        if len(product_merchant_ids) > 1:
+                            raise HTTPException(
+                                status_code=400, 
+                                detail="一笔订单只能包含同一商家的商品，请分开下单"
+                            )
+                        
+                        # 如果未提供 merchant_id，从商品中推断
+                        if merchant_id is None:
+                            merchant_id = product_merchant_ids.pop() if product_merchant_ids else 0
                     else:
+                        # 购物车结算
                         cur.execute("""
                             SELECT c.product_id,
                                 c.sku_id,
                                 c.quantity,
                                 s.price,
                                 p.is_member_product AS is_vip,
+                                p.user_id as merchant_id,
                                 c.specifications
                             FROM cart c
                             JOIN product_skus s ON s.id = c.sku_id
@@ -409,6 +435,21 @@ class OrderManager:
                         items = cur.fetchall()
                         if not items:
                             return None
+
+                        # 检查购物车中的商品是否属于同一商家
+                        merchant_ids = set(item.get("merchant_id") or 0 for item in items)
+                        if len(merchant_ids) > 1:
+                            raise HTTPException(
+                                status_code=400,
+                                detail="购物车中包含不同商家的商品，请分开结算"
+                            )
+                        
+                        # 如果未提供 merchant_id，从商品中推断
+                        if merchant_id is None:
+                            merchant_id = merchant_ids.pop() if merchant_ids else 0
+
+                    # 确保 merchant_id 是整数
+                    merchant_id = int(merchant_id or 0)
 
                     # ---------- 2. 优惠券商品类型验证（新增） ----------
                     has_vip = any(i["is_vip"] for i in items)
@@ -470,19 +511,19 @@ class OrderManager:
 
                     init_status = "pending_pay"
 
-                    # 修改后的 INSERT 语句，包含 original_amount, pending_points, pending_coupon_id
+                    # 修改后的 INSERT 语句，包含 merchant_id 字段
                     cur.execute("""
                         INSERT INTO orders(
-                            user_id, order_number, total_amount, original_amount, status, is_vip_item,
+                            user_id, merchant_id, order_number, total_amount, original_amount, status, is_vip_item,
                             consignee_name, consignee_phone,
                             province, city, district, shipping_address, delivery_way,
                             pay_way, auto_recv_time, refund_reason, expire_at,
                             pending_points, pending_coupon_id)
-                        VALUES (%s, %s, %s, %s, %s, %s,
+                        VALUES (%s, %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s, %s, %s,
                                 'wechat', %s, %s, %s, %s, %s)
                     """, (
-                        user_id, order_number, total, total, init_status, has_vip,
+                        user_id, merchant_id, order_number, total, total, init_status, has_vip,
                         consignee_name, consignee_phone,
                         province, city, district, shipping_address, delivery_way,
                         datetime.now() + timedelta(days=7),
@@ -536,7 +577,7 @@ class OrderManager:
                         redis_client.setex(used_key, 86400, order_number)  # 24小时过期
 
                     conn.commit()
-                    logger.info(f"订单创建成功: {order_number}, 用户: {user_id}")
+                    logger.info(f"订单创建成功: {order_number}, 用户: {user_id}, 商家: {merchant_id}")
                     return order_number
 
         finally:
@@ -580,8 +621,118 @@ class OrderManager:
                 return orders
 
     @staticmethod
+    def list_by_merchant(
+        merchant_id: int,
+        status: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        page: int = 1,
+        page_size: int = 20
+    ) -> Dict[str, Any]:
+        """
+        按商家查询订单列表（支持分页、状态筛选、时间范围筛选）
+        
+        Args:
+            merchant_id: 商家ID（对应 users.id）
+            status: 订单状态筛选
+            start_date: 开始日期（格式：YYYY-MM-DD）
+            end_date: 结束日期（格式：YYYY-MM-DD）
+            page: 页码，从1开始
+            page_size: 每页数量
+            
+        Returns:
+            包含订单列表、分页信息、统计信息的字典
+        """
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 构建查询条件
+                where_conditions = ["merchant_id = %s"]
+                params = [merchant_id]
+                
+                if status:
+                    where_conditions.append("status = %s")
+                    params.append(status)
+                
+                if start_date:
+                    where_conditions.append("DATE(created_at) >= %s")
+                    params.append(start_date)
+                
+                if end_date:
+                    where_conditions.append("DATE(created_at) <= %s")
+                    params.append(end_date)
+                
+                where_clause = " AND ".join(where_conditions)
+                
+                # 查询总数量
+                count_sql = f"SELECT COUNT(*) as total FROM orders WHERE {where_clause}"
+                cur.execute(count_sql, tuple(params))
+                total = cur.fetchone()["total"]
+                
+                # 查询总金额
+                amount_sql = f"""
+                    SELECT 
+                        COALESCE(SUM(total_amount), 0) as total_amount,
+                        COALESCE(SUM(CASE WHEN status = 'completed' THEN total_amount ELSE 0 END), 0) as completed_amount
+                    FROM orders 
+                    WHERE {where_clause}
+                """
+                cur.execute(amount_sql, tuple(params))
+                amount_stats = cur.fetchone()
+                
+                # 查询订单列表（分页）
+                select_fields = OrderManager._build_orders_select(cur)
+                offset = (page - 1) * page_size
+                sql = f"""
+                    SELECT {select_fields} 
+                    FROM orders 
+                    WHERE {where_clause}
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                """
+                query_params = params + [page_size, offset]
+                cur.execute(sql, tuple(query_params))
+                orders = cur.fetchall()
+                
+                # 为每个订单查询商品明细和用户信息
+                for o in orders:
+                    # 查询商品明细
+                    cur.execute(
+                        """
+                        SELECT oi.*, p.name as product_name, p.cover as product_cover
+                        FROM order_items oi
+                        JOIN products p ON oi.product_id = p.id
+                        WHERE oi.order_id = %s
+                        """,
+                        (o["id"],)
+                    )
+                    o["items"] = cur.fetchall()
+                    
+                    # 查询用户信息
+                    cur.execute(
+                        "SELECT id, name, mobile, avatar FROM users WHERE id = %s",
+                        (o["user_id"],)
+                    )
+                    user_info = cur.fetchone()
+                    o["user_info"] = user_info
+                
+                return {
+                    "list": orders,
+                    "pagination": {
+                        "page": page,
+                        "page_size": page_size,
+                        "total": total,
+                        "total_pages": (total + page_size - 1) // page_size
+                    },
+                    "statistics": {
+                        "total_amount": float(amount_stats["total_amount"]),
+                        "completed_amount": float(amount_stats["completed_amount"]),
+                        "order_count": total
+                    }
+                }
+
+    @staticmethod
     def detail(order_number: str) -> Optional[dict]:
-        """查询单个订单详情（含用户、地址、商品明细）。"""
+        """查询单个订单详情（含用户、地址、商品明细、商家信息）。"""
         with get_conn() as conn:
             with conn.cursor() as cur:
                 select_fields = OrderManager._build_orders_select(cur)
@@ -595,6 +746,7 @@ class OrderManager:
 
                 order_id = order.get("id")
                 user_id = order.get("user_id")
+                merchant_id = order.get("merchant_id") or 0
 
                 # 商品明细
                 cur.execute(
@@ -617,6 +769,21 @@ class OrderManager:
                     )
                     user_info = cur.fetchone()
 
+                # 商家信息
+                merchant_info = None
+                if merchant_id and merchant_id > 0:
+                    cur.execute(
+                        """
+                        SELECT u.id, u.name, u.mobile, u.avatar, u.wechat_sub_mchid,
+                               ms.store_name, ms.store_logo_image_id, ms.store_address
+                        FROM users u
+                        LEFT JOIN merchant_stores ms ON ms.user_id = u.id
+                        WHERE u.id = %s AND u.is_merchant = 1
+                        """,
+                        (merchant_id,)
+                    )
+                    merchant_info = cur.fetchone()
+
                 # 地址信息直接取订单中的收货字段
                 address = {
                     "consignee_name": order.get("consignee_name"),
@@ -630,6 +797,7 @@ class OrderManager:
                 return {
                     "order_info": order,
                     "user": user_info,
+                    "merchant": merchant_info,
                     "address": address,
                     "items": items,
                     "specifications": order.get("refund_reason"),
@@ -871,7 +1039,7 @@ class OrderManager:
         ws1.title = "订单详情"
 
         headers1 = [
-            "订单号", "订单状态", "总金额", "原始金额", "积分抵扣", "实付金额",
+            "订单号", "商家ID", "商家名称", "订单状态", "总金额", "原始金额", "积分抵扣", "实付金额",
             "支付方式", "配送方式", "是否会员订单",
             "用户ID", "用户姓名", "用户手机号",
             "收货人", "收货电话", "省份", "城市", "区县", "详细地址",
@@ -897,7 +1065,7 @@ class OrderManager:
         # ========== 第二个工作表：资金拆分明细 ==========
         ws2 = wb.create_sheet(title="资金拆分")
         headers2 = [
-            "订单号", "账户类型", "变动金额", "变动后余额",
+            "订单号", "商家ID", "账户类型", "变动金额", "变动后余额",
             "流水类型", "备注", "创建时间"
         ]
 
@@ -922,6 +1090,7 @@ class OrderManager:
 
                     order_info = order_data["order_info"]
                     user_info = order_data["user"]
+                    merchant_info = order_data.get("merchant")
                     address = order_data["address"] or {}
                     items = order_data["items"]
                     specifications = order_data.get("specifications") or {}
@@ -950,6 +1119,8 @@ class OrderManager:
                     # 填充订单详情行
                     row_data1 = [
                         order_info.get("order_number", ""),
+                        order_info.get("merchant_id", 0),
+                        merchant_info.get("store_name") or merchant_info.get("name", "平台自营") if merchant_info else "平台自营",
                         order_info.get("status", ""),
                         float(total),
                         float(order_info.get("original_amount", 0)),
@@ -978,7 +1149,7 @@ class OrderManager:
                         cell = ws1.cell(row=row_idx1, column=col_idx, value=value)
                         cell.alignment = Alignment(vertical="center", wrap_text=True)
                         cell.border = thin_border
-                        if col_idx in [3, 4, 5, 6]:  # 金额列
+                        if col_idx in [5, 6, 7, 8]:  # 金额列
                             cell.number_format = '¥#,##0.00'
 
                     row_idx1 += 1
@@ -1015,6 +1186,7 @@ class OrderManager:
 
                         row_data2 = [
                             order_number,
+                            order_info.get("merchant_id", 0),
                             account_type_cn,
                             display_amount,
                             balance_after_display,
@@ -1029,7 +1201,7 @@ class OrderManager:
                             cell.border = thin_border
 
                             # 只有非商家余额行才设置货币格式
-                            if col_idx in [3, 4] and not is_platform_fee_row:
+                            if col_idx in [4, 5] and not is_platform_fee_row:
                                 cell.number_format = '¥#,##0.00'
 
                         row_idx2 += 1
@@ -1083,6 +1255,8 @@ class OrderCreate(BaseModel):
     coupon_id: Optional[int] = None  # 新增：优惠券ID
     # ==================== 新增：幂等性 Key（前端生成 UUID） ====================
     idempotency_key: Optional[str] = None  # 用于防止重复提交
+    # ==================== 新增：商家ID ====================
+    merchant_id: Optional[int] = None  # 商家ID，不传则自动从商品推断
 
 
 class OrderPay(BaseModel):
@@ -1114,15 +1288,26 @@ class ConfirmReceiveRequest(BaseModel):
     wx_confirm_result: Optional[Dict[str, Any]] = None
 
 
+# ==================== 新增：商家订单查询请求模型 ====================
+class MerchantOrdersQuery(BaseModel):
+    status: Optional[str] = None
+    start_date: Optional[str] = None  # 格式：YYYY-MM-DD
+    end_date: Optional[str] = None    # 格式：YYYY-MM-DD
+    page: int = 1
+    page_size: int = 20
+
+
 # ---------------- 路由 ----------------
 @router.post("/create", summary="创建订单")
 def create_order(body: OrderCreate):
     """
-    创建订单接口（已增加幂等性校验）
-
+    创建订单接口（已增加幂等性校验，支持多商家订单）
+    
     - 请前端在提交时生成 idempotency_key（UUID），用于防止重复创建
     - 如果同一用户 1 分钟内已有未取消订单，会返回错误
     - 如果 Redis 锁未释放（5 秒内），会返回 429 错误
+    - 如果 buy_now_items 中的商品属于不同商家，会返回错误（一笔订单只能属于一个商家）
+    - 如果不传 merchant_id，系统会自动从商品中推断商家
     """
     no = OrderManager.create(
         body.user_id,
@@ -1134,7 +1319,8 @@ def create_order(body: OrderCreate):
         delivery_way=body.delivery_way,
         points_to_use=body.points_to_use,  # 传递积分参数
         coupon_id=body.coupon_id,  # 传递优惠券参数
-        idempotency_key=body.idempotency_key  # 传递幂等 Key
+        idempotency_key=body.idempotency_key,  # 传递幂等 Key
+        merchant_id=body.merchant_id  # 传递商家ID
     )
     if not no:
         raise HTTPException(status_code=422, detail="购物车为空或地址缺失")
@@ -1157,6 +1343,37 @@ def order_detail(order_number: str):
 @router.post("/status", summary="更新订单状态")
 def update_status(body: StatusUpdate):
     return {"ok": OrderManager.update_status(body.order_number, body.new_status, body.reason)}
+
+
+# ==================== 新增：按商家查询订单接口 ====================
+@router.get("/merchant/{merchant_id}", summary="查询商家订单列表")
+def list_merchant_orders(
+    merchant_id: int,
+    status: Optional[str] = Query(None, description="订单状态筛选"),
+    start_date: Optional[str] = Query(None, description="开始日期(YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="结束日期(YYYY-MM-DD)"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页数量")
+):
+    """
+    根据商家ID查询订单列表（支持分页、状态筛选、时间范围筛选）
+    
+    返回内容包括：
+    - list: 订单列表（包含商品明细和用户信息）
+    - pagination: 分页信息
+    - statistics: 统计信息（订单总金额、已完成金额、订单数量）
+    
+    权限说明：此接口仅返回该商家的订单，需要配合权限校验使用
+    """
+    result = OrderManager.list_by_merchant(
+        merchant_id=merchant_id,
+        status=status,
+        start_date=start_date,
+        end_date=end_date,
+        page=page,
+        page_size=page_size
+    )
+    return result
 
 
 # ==================== 新增：确认收货接口（前端调用微信组件后回调） ====================
