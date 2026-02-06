@@ -47,8 +47,15 @@ class WeChatPayClient:
     }
 
     def __init__(self):
-        # Mock模式开关（生产环境强制禁止）
-        self.mock_mode = os.getenv('WX_MOCK_MODE', 'false').lower() == 'true'
+        # ✅ 使用 settings.wx_mock_mode_bool，确保正确解析
+        try:
+            from core.config import settings
+            self.mock_mode = settings.wx_mock_mode_bool
+            logger.info(f"【WeChatPayClient】WX_MOCK_MODE={settings.WX_MOCK_MODE} -> {self.mock_mode}")
+        except Exception as e:
+            # 回退到 os.getenv
+            self.mock_mode = os.getenv('WX_MOCK_MODE', 'false').lower() == 'true'
+            logger.warning(f"【WeChatPayClient】使用os.getenv回退: {self.mock_mode}, error: {e}")
 
         # 安全：生产环境禁止Mock
         if self.mock_mode and ENVIRONMENT == 'production':
@@ -57,10 +64,12 @@ class WeChatPayClient:
         if self.mock_mode:
             logger.warning("⚠️ 【MOCK模式】已启用，所有微信接口调用均为模拟！")
             logger.warning("⚠️ 当前环境: {}".format(ENVIRONMENT))
+        else:
+            logger.warning("⚠️ 【MOCK模式】未启用，将调用真实微信接口！")
 
-        # 商户配置
+        # 商户配置（所有模式都需要基础配置）
         self.mchid = WECHAT_PAY_MCH_ID
-        self.apiv3_key = WECHAT_PAY_API_V3_KEY.encode('utf-8')
+        self.apiv3_key = WECHAT_PAY_API_V3_KEY.encode('utf-8') if WECHAT_PAY_API_V3_KEY else b''
         self.cert_path = WECHAT_PAY_API_CERT_PATH
         self.key_path = WECHAT_PAY_API_KEY_PATH
         self.pub_key_id = WECHAT_PAY_PUB_KEY_ID
@@ -76,13 +85,17 @@ class WeChatPayClient:
             max_retries=3
         ))
 
-        # 加载密钥和公钥
-        self.private_key = self._load_private_key()
-        self.wechat_public_key = self._load_wechat_public_key_from_file()
-
-        # 初始化Mock测试数据
+        # ✅ 修复：Mock模式下跳过密钥加载，避免证书不存在报错
         if self.mock_mode:
+            self.private_key = None
+            self.wechat_public_key = None
+            logger.info("🟡 Mock模式：跳过证书和密钥加载")
+            # ✅ 修复：只在这里调用一次 Mock 数据初始化
             self._ensure_mock_applyment_exists()
+        else:
+            # 非Mock模式：加载真实密钥和公钥
+            self.private_key = self._load_private_key()
+            self.wechat_public_key = self._load_wechat_public_key_from_file()
 
     # ==================== 微信支付公钥加载（本地文件） ====================
 
@@ -454,29 +467,71 @@ class WeChatPayClient:
 
     @settlement_rate_limiter
     def upload_image(self, image_content: bytes, content_type: str) -> str:
-        """上传图片获取media_id"""
+        """上传图片获取media_id - 修复版"""
+        # ✅ 添加调试日志
+        logger.info(f"【upload_image】mock_mode={self.mock_mode}, 图片大小={len(image_content)} bytes")
+
         if self.mock_mode:
             logger.info("【MOCK】模拟上传图片")
-            return f"MOCK_MEDIA_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+            mock_media_id = f"MOCK_MEDIA_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+            logger.info(f"【MOCK】返回模拟 media_id: {mock_media_id}")
+            return mock_media_id
+
+        # ⚠️ 非Mock模式：检查密钥是否已加载
+        if not self.private_key:
+            raise RuntimeError("非Mock模式下私钥未加载，请检查证书配置")
 
         url = f"{self.BASE_URL}/v3/merchant/media/upload"
-        files = {
-            'file': (
-                'image.jpg',
-                image_content,
-                content_type,
-                {'Content-Disposition': 'form-data; name="file"; filename="image.jpg"'}
-            )
+
+        # 微信V3图片上传需要特殊处理（meta + file）
+        meta = {
+            "filename": "image.jpg",
+            "sha256": hashlib.sha256(image_content).hexdigest()
         }
+
+        # 构建 multipart/form-data
+        boundary = f"----WebKitFormBoundary{uuid.uuid4().hex[:16]}"
+        meta_json = json.dumps(meta, ensure_ascii=False)
+
+        # ✅ 修复：使用字节串拼接，避免 f-string 与 bytes 混用
+        body_parts = []
+
+        # meta 部分
+        body_parts.append(f'--{boundary}\r\n'.encode('utf-8'))
+        body_parts.append(f'Content-Disposition: form-data; name="meta"\r\n'.encode('utf-8'))
+        body_parts.append(f'Content-Type: application/json\r\n\r\n'.encode('utf-8'))
+        body_parts.append(meta_json.encode('utf-8'))
+        body_parts.append(b'\r\n')
+
+        # file 部分
+        body_parts.append(f'--{boundary}\r\n'.encode('utf-8'))
+        body_parts.append(f'Content-Disposition: form-data; name="file"; filename="image.jpg"\r\n'.encode('utf-8'))
+        body_parts.append(f'Content-Type: {content_type}\r\n\r\n'.encode('utf-8'))
+        body_parts.append(image_content)
+        body_parts.append(f'\r\n--{boundary}--\r\n'.encode('utf-8'))
+
+        body = b''.join(body_parts)
 
         headers = {
-            'Authorization': self._build_auth_header('POST', url),
-            'Wechatpay-Serial': self._get_merchant_serial_no()
+            'Authorization': self._build_auth_header('POST', url, meta_json),
+            'Content-Type': f'multipart/form-data; boundary={boundary}',
+            'Accept': 'application/json',
+            'Wechatpay-Serial': self.pub_key_id
         }
 
-        response = self.session.post(url, files=files, headers=headers, timeout=30)
+        logger.info(f"【upload_image】调用真实微信接口: {url}")
+        logger.info(f"【upload_image】使用公钥ID: {self.pub_key_id}")
+
+        response = self.session.post(url, data=body, headers=headers, timeout=30)
+
+        logger.info(f"【upload_image】微信响应状态: {response.status_code}")
+        if response.status_code != 200:
+            logger.error(f"【upload_image】微信响应错误: {response.text}")
+
         response.raise_for_status()
-        return response.json().get('media_id')
+        result = response.json()
+        logger.info(f"【upload_image】上传成功, media_id={result.get('media_id', 'N/A')}")
+        return result.get('media_id')
 
     # ==================== 下单与前端支付参数生成 ====================
     def create_jsapi_order(self, out_trade_no: str, total_fee: int, openid: str, description: str = "商品支付", notify_url: Optional[str] = None) -> Dict[str, Any]:

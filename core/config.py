@@ -61,8 +61,19 @@ class Settings(BaseSettings):
     WX_WECHATPAY_SERIAL: str = ""
     WECHAT_CERT_SERIAL_NO: str = ""          
     WECHAT_TMPL_MERCHANT_INCOME: str = ""    
-    WECHAT_SECRET: str = "" 
-    WX_MOCK_MODE: bool = False                 
+    WECHAT_SECRET: str = ""
+    # ✅ 修改为 str 类型，避免 pydantic 的 bool 解析问题
+    WX_MOCK_MODE: str = "false"
+    WX_USE_PUB_KEY_ID_MODE: str = "true"  # 同样改为 str
+
+    @property
+    def wx_mock_mode_bool(self) -> bool:
+        """安全解析布尔值"""
+        return str(self.WX_MOCK_MODE).lower() in ("true", "1", "yes", "on")
+
+    @property
+    def wx_use_pub_key_id_mode_bool(self) -> bool:
+        return str(self.WX_USE_PUB_KEY_ID_MODE).lower() in ("true", "1", "yes", "on")
 
     PUSH_TEMPLATE_ID_APPLYMENT: str = ""
     ENVIRONMENT: str = "development"
