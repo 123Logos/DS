@@ -224,7 +224,7 @@ class DatabaseManager:
                     product_name        VARCHAR(255) DEFAULT '' COMMENT '商品名称',
                     remark              TEXT COMMENT '备注',
                     status              TINYINT NOT NULL DEFAULT 1 COMMENT '1待支付 2已支付 4已退款',
-                    qrcode_url          VARCHAR(500) DEFAULT NULL COMMENT '收款码',
+                    qrcode_url          TEXT DEFAULT NULL COMMENT '收款码',
                     qrcode_expire       DATETIME DEFAULT NULL COMMENT '码过期时间',
                     refresh_count       TINYINT NOT NULL DEFAULT 0 COMMENT '已刷新次数',
                     related_order_no    VARCHAR(50) DEFAULT NULL COMMENT '关联主订单号',

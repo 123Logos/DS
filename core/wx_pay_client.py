@@ -428,7 +428,10 @@ class WeChatPayClient:
                 "sub_mchid": sub_mchid
             }
 
-        url = f"{self.BASE_URL}/v3/applyment4sub/applyment/"
+        # ✅ 使用路径构建签名（符合微信规范）
+        url_path = "/v3/applyment4sub/applyment/"
+        full_url = f"{self.BASE_URL}{url_path}"
+
         payload = {
             "business_code": applyment_data["business_code"],
             "contact_info": json.loads(applyment_data["contact_info"]),
@@ -438,13 +441,13 @@ class WeChatPayClient:
 
         body_str = json.dumps(payload, ensure_ascii=False)
         headers = {
-            'Authorization': self._build_auth_header('POST', url, body_str),
+            'Authorization': self._build_auth_header('POST', url_path, body_str),  # ✅ 使用路径
             'Content-Type': 'application/json',
             'Accept': 'application/json',
             'Wechatpay-Serial': self._get_merchant_serial_no()
         }
 
-        response = self.session.post(url, data=body_str.encode('utf-8'), headers=headers, timeout=30)
+        response = self.session.post(full_url, data=body_str.encode('utf-8'), headers=headers, timeout=30)
         response.raise_for_status()
         return response.json()
 
@@ -455,92 +458,91 @@ class WeChatPayClient:
             logger.info(f"【MOCK】查询进件状态: {applyment_id}")
             return self._get_mock_application_status(f"MOCK_{applyment_id}")
 
-        url = f"{self.BASE_URL}/v3/applyment4sub/applyment/applyment_id/{applyment_id}"
+        # ✅ 使用路径构建签名
+        url_path = f"/v3/applyment4sub/applyment/applyment_id/{applyment_id}"
+        full_url = f"{self.BASE_URL}{url_path}"
+
         headers = {
-            'Authorization': self._build_auth_header('GET', url),
+            'Authorization': self._build_auth_header('GET', url_path),  # ✅ 使用路径
             'Accept': 'application/json'
         }
 
-        response = self.session.get(url, headers=headers, timeout=30)
+        response = self.session.get(full_url, headers=headers, timeout=30)
         response.raise_for_status()
         return response.json()
 
     @settlement_rate_limiter
     def upload_image(self, image_content: bytes, content_type: str) -> str:
         """上传图片获取media_id - 修复版"""
-        # ✅ 添加调试日志
         logger.info(f"【upload_image】mock_mode={self.mock_mode}, 图片大小={len(image_content)} bytes")
 
         if self.mock_mode:
             logger.info("【MOCK】模拟上传图片")
             mock_media_id = f"MOCK_MEDIA_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-            logger.info(f"【MOCK】返回模拟 media_id: {mock_media_id}")
             return mock_media_id
 
-        # ⚠️ 非Mock模式：检查密钥是否已加载
         if not self.private_key:
             raise RuntimeError("非Mock模式下私钥未加载，请检查证书配置")
 
-        url = f"{self.BASE_URL}/v3/merchant/media/upload"
+        # ✅ 使用路径构建签名（微信图片上传接口规范）
+        url_path = "/v3/merchant/media/upload"
+        full_url = f"{self.BASE_URL}{url_path}"
 
-        # 微信V3图片上传需要特殊处理（meta + file）
         meta = {
             "filename": "image.jpg",
             "sha256": hashlib.sha256(image_content).hexdigest()
         }
 
-        # 构建 multipart/form-data
         boundary = f"----WebKitFormBoundary{uuid.uuid4().hex[:16]}"
         meta_json = json.dumps(meta, ensure_ascii=False)
 
-        # ✅ 修复：使用字节串拼接，避免 f-string 与 bytes 混用
         body_parts = []
-
-        # meta 部分
         body_parts.append(f'--{boundary}\r\n'.encode('utf-8'))
         body_parts.append(f'Content-Disposition: form-data; name="meta"\r\n'.encode('utf-8'))
         body_parts.append(f'Content-Type: application/json\r\n\r\n'.encode('utf-8'))
         body_parts.append(meta_json.encode('utf-8'))
         body_parts.append(b'\r\n')
-
-        # file 部分
         body_parts.append(f'--{boundary}\r\n'.encode('utf-8'))
         body_parts.append(f'Content-Disposition: form-data; name="file"; filename="image.jpg"\r\n'.encode('utf-8'))
         body_parts.append(f'Content-Type: {content_type}\r\n\r\n'.encode('utf-8'))
         body_parts.append(image_content)
         body_parts.append(f'\r\n--{boundary}--\r\n'.encode('utf-8'))
-
         body = b''.join(body_parts)
 
+        # ✅ 关键修复：使用商户证书序列号
+        merchant_serial = self._get_merchant_serial_no()
         headers = {
-            'Authorization': self._build_auth_header('POST', url, meta_json),
+            'Authorization': self._build_auth_header('POST', url_path, meta_json),  # ✅ 使用路径
             'Content-Type': f'multipart/form-data; boundary={boundary}',
             'Accept': 'application/json',
-            'Wechatpay-Serial': self.pub_key_id
+            'Wechatpay-Serial': merchant_serial
         }
 
-        logger.info(f"【upload_image】调用真实微信接口: {url}")
-        logger.info(f"【upload_image】使用公钥ID: {self.pub_key_id}")
+        logger.info(f"【upload_image】调用微信接口: {full_url}")
+        logger.info(f"【upload_image】商户证书序列号: {merchant_serial}")
 
-        response = self.session.post(url, data=body, headers=headers, timeout=30)
+        response = self.session.post(full_url, data=body, headers=headers, timeout=30)
 
-        logger.info(f"【upload_image】微信响应状态: {response.status_code}")
+        logger.info(f"【upload_image】微信响应: {response.status_code}")
         if response.status_code != 200:
-            logger.error(f"【upload_image】微信响应错误: {response.text}")
+            logger.error(f"【upload_image】错误响应: {response.text}")
 
         response.raise_for_status()
         result = response.json()
-        logger.info(f"【upload_image】上传成功, media_id={result.get('media_id', 'N/A')}")
         return result.get('media_id')
 
     # ==================== 下单与前端支付参数生成 ====================
-    def create_jsapi_order(self, out_trade_no: str, total_fee: int, openid: str, description: str = "商品支付", notify_url: Optional[str] = None) -> Dict[str, Any]:
+    def create_jsapi_order(self, out_trade_no: str, total_fee: int, openid: str, description: str = "商品支付",
+                           notify_url: Optional[str] = None) -> Dict[str, Any]:
         """创建 JSAPI 订单（/v3/pay/transactions/jsapi），返回微信下单响应（包含 prepay_id）"""
         if self.mock_mode:
             logger.info(f"【MOCK】创建JSAPI订单: out_trade_no={out_trade_no}, total_fee={total_fee}, openid={openid}")
             return {"prepay_id": f"MOCK_PREPAY_{int(time.time())}_{uuid.uuid4().hex[:8]}"}
 
-        url = '/v3/pay/transactions/jsapi'
+        # ✅ 使用路径构建签名
+        url_path = '/v3/pay/transactions/jsapi'
+        full_url = f"{self.BASE_URL}{url_path}"
+
         body = {
             "appid": WECHAT_APP_ID,
             "mchid": self.mchid,
@@ -553,18 +555,18 @@ class WeChatPayClient:
 
         body_str = json.dumps(body, ensure_ascii=False)
         headers = {
-            'Authorization': self._build_auth_header('POST', url, body_str),
+            'Authorization': self._build_auth_header('POST', url_path, body_str),  # ✅ 使用路径
             'Content-Type': 'application/json',
             'Accept': 'application/json',
             'Wechatpay-Serial': self._get_merchant_serial_no()
         }
 
-        response = self.session.post(self.BASE_URL + url, data=body_str.encode('utf-8'), headers=headers, timeout=15)
+        response = self.session.post(full_url, data=body_str.encode('utf-8'), headers=headers, timeout=15)
         try:
             response.raise_for_status()
         except Exception as e:
             try:
-                logger.error("WeChat JSAPI 请求 URL: %s", self.BASE_URL + url)
+                logger.error("WeChat JSAPI 请求 URL: %s", full_url)
                 logger.error("WeChat JSAPI 请求体: %s", body_str)
                 logger.error("WeChat JSAPI 响应状态: %s", response.status_code)
                 logger.error("WeChat JSAPI 响应体: %s", response.text)
@@ -754,14 +756,17 @@ class WeChatPayClient:
             logger.info(f"【MOCK】查询结算账户: sub_mchid={sub_mchid}")
             return self._get_mock_settlement_data(sub_mchid)
 
-        url = f'/v3/apply4sub/sub_merchants/{sub_mchid}/settlement'
+        # ✅ 使用路径构建签名
+        url_path = f'/v3/apply4sub/sub_merchants/{sub_mchid}/settlement'
+        full_url = f"{self.BASE_URL}{url_path}"
+
         headers = {
-            'Authorization': self._build_auth_header('GET', url),
+            'Authorization': self._build_auth_header('GET', url_path),  # ✅ 使用路径
             'Accept': 'application/json'
         }
 
         params = {'account_number_rule': 'ACCOUNT_NUMBER_RULE_MASK_V2'}
-        response = self.session.get(self.BASE_URL + url, headers=headers, params=params, timeout=10)
+        response = self.session.get(full_url, headers=headers, params=params, timeout=10)
         response.raise_for_status()
         data = response.json()
 
@@ -801,7 +806,9 @@ class WeChatPayClient:
                 'status': 'APPLYMENT_STATE_AUDITING'
             }
 
-        url = f'/v3/apply4sub/sub_merchants/{sub_mchid}/modify-settlement'
+        # ✅ 使用路径构建签名
+        url_path = f'/v3/apply4sub/sub_merchants/{sub_mchid}/modify-settlement'
+        full_url = f"{self.BASE_URL}{url_path}"
 
         body = {
             "account_type": account_info['account_type'],
@@ -816,13 +823,13 @@ class WeChatPayClient:
         body = {k: v for k, v in body.items() if v != ''}
         body_str = json.dumps(body, ensure_ascii=False)
         headers = {
-            'Authorization': self._build_auth_header('POST', url, body_str),
+            'Authorization': self._build_auth_header('POST', url_path, body_str),  # ✅ 使用路径
             'Content-Type': 'application/json',
             'Accept': 'application/json',
             'Wechatpay-Serial': self._get_merchant_serial_no()
         }
 
-        response = self.session.post(self.BASE_URL + url, data=body_str.encode('utf-8'), headers=headers, timeout=30)
+        response = self.session.post(full_url, data=body_str.encode('utf-8'), headers=headers, timeout=30)
         response.raise_for_status()
 
         result = response.json()
@@ -837,14 +844,17 @@ class WeChatPayClient:
             logger.info(f"【MOCK】查询改绑状态: application_no={application_no}")
             return self._get_mock_application_status(application_no)
 
-        url = f'/v3/apply4sub/sub_merchants/{sub_mchid}/application/{application_no}'
+        # ✅ 使用路径构建签名
+        url_path = f'/v3/apply4sub/sub_merchants/{sub_mchid}/application/{application_no}'
+        full_url = f"{self.BASE_URL}{url_path}"
+
         headers = {
-            'Authorization': self._build_auth_header('GET', url),
+            'Authorization': self._build_auth_header('GET', url_path),  # ✅ 使用路径
             'Accept': 'application/json'
         }
 
         params = {'account_number_rule': 'ACCOUNT_NUMBER_RULE_MASK_V2'}
-        response = self.session.get(self.BASE_URL + url, headers=headers, params=params, timeout=30)
+        response = self.session.get(full_url, headers=headers, params=params, timeout=30)
         response.raise_for_status()
 
         data = response.json()
