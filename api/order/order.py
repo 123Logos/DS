@@ -336,7 +336,6 @@ class OrderManager:
                 with conn.cursor() as cur:
 
                     # ==================== 新增：业务层幂等检查 ====================
-                    # 检查该用户最近 1 分钟内是否已有非取消状态的订单（立即购买场景除外）
                     if not buy_now:
                         cur.execute("""
                             SELECT order_number, status, created_at 
@@ -359,10 +358,8 @@ class OrderManager:
 
                     # ==================== 新增：幂等 Key 检查（如果提供了的话） ====================
                     if idempotency_key and redis_client:
-                        # 检查这个 idempotency_key 是否已经用过（24小时有效期）
                         used_key = f"order:idempotency:{idempotency_key}"
                         if redis_client.exists(used_key):
-                            # 返回之前创建的订单号
                             existing_order = redis_client.get(used_key)
                             logger.info(f"幂等 Key 重复，返回已存在订单: {existing_order}")
                             return existing_order
@@ -372,16 +369,16 @@ class OrderManager:
                         if not buy_now_items:
                             raise HTTPException(status_code=422, detail="立即购买时 buy_now_items 不能为空")
                         items = []
-                        product_merchant_ids = set()  # 收集所有商品的商家ID
-                        
+                        product_merchant_ids = set()
+
                         for it in buy_now_items:
-                            cur.execute("SELECT is_member_product, user_id FROM products WHERE id = %s", (it["product_id"],))
+                            cur.execute("SELECT is_member_product, user_id FROM products WHERE id = %s",
+                                        (it["product_id"],))
                             prod = cur.fetchone()
                             if not prod:
                                 raise HTTPException(status_code=404,
                                                     detail=f"products 表中不存在 id={it['product_id']}")
 
-                            # 收集商家ID (user_id 即商家ID)
                             product_merchant_ids.add(prod.get("user_id") or 0)
 
                             sku_id = it.get("sku_id")
@@ -406,19 +403,16 @@ class OrderManager:
                                 "price": Decimal(str(it["price"])),
                                 "is_vip": prod["is_member_product"]
                             })
-                        
-                        # 检查商家一致性（一笔订单只能属于一个商家）
+
                         if len(product_merchant_ids) > 1:
                             raise HTTPException(
-                                status_code=400, 
+                                status_code=400,
                                 detail="一笔订单只能包含同一商家的商品，请分开下单"
                             )
-                        
-                        # 如果未提供 merchant_id，从商品中推断
+
                         if merchant_id is None:
                             merchant_id = product_merchant_ids.pop() if product_merchant_ids else 0
                     else:
-                        # 购物车结算
                         cur.execute("""
                             SELECT c.product_id,
                                 c.sku_id,
@@ -436,26 +430,23 @@ class OrderManager:
                         if not items:
                             return None
 
-                        # 检查购物车中的商品是否属于同一商家
                         merchant_ids = set(item.get("merchant_id") or 0 for item in items)
                         if len(merchant_ids) > 1:
                             raise HTTPException(
                                 status_code=400,
                                 detail="购物车中包含不同商家的商品，请分开结算"
                             )
-                        
-                        # 如果未提供 merchant_id，从商品中推断
+
                         if merchant_id is None:
                             merchant_id = merchant_ids.pop() if merchant_ids else 0
 
-                    # 确保 merchant_id 是整数
                     merchant_id = int(merchant_id or 0)
 
-                    # ---------- 2. 优惠券商品类型验证（新增） ----------
+                    # ---------- 2. 优惠券商品类型验证 ----------
                     has_vip = any(i["is_vip"] for i in items)
+                    coupon_amount = Decimal('0')
 
                     if coupon_id:
-                        # 查询优惠券详情并锁定
                         cur.execute("""
                             SELECT id, amount, applicable_product_type, status, valid_from, valid_to, user_id
                             FROM coupons 
@@ -467,19 +458,16 @@ class OrderManager:
                         if not coupon:
                             raise HTTPException(status_code=400, detail="优惠券不存在、已被使用或不属于当前用户")
 
-                        # 检查有效期
                         today = datetime.now().date()
                         if not (coupon['valid_from'] <= today <= coupon['valid_to']):
                             raise HTTPException(status_code=400, detail="优惠券不在有效期内")
 
-                        # 检查商品类型匹配
                         applicable_type = coupon['applicable_product_type']
                         if applicable_type == 'member_only' and not has_vip:
                             raise HTTPException(status_code=400, detail="该优惠券仅限会员商品使用")
                         if applicable_type == 'normal_only' and has_vip:
                             raise HTTPException(status_code=400, detail="该优惠券仅限普通商品使用")
 
-                        # 检查优惠券金额是否超过订单金额
                         coupon_amount = Decimal(str(coupon['amount']))
                         total_amount = sum(Decimal(str(i["quantity"])) * Decimal(str(i["price"])) for i in items)
                         if coupon_amount > total_amount:
@@ -501,17 +489,14 @@ class OrderManager:
                     # ---------- 4. 订单主表 ----------
                     total = sum(Decimal(str(i["quantity"])) * Decimal(str(i["price"])) for i in items)
 
-                    # ==================== 优化：更安全的订单号生成 ====================
-                    # 使用 16 位十六进制 UUID 代替原来的 6 位数字，极大降低碰撞概率
                     order_number = (
                             datetime.now().strftime("%Y%m%d%H%M%S") +
                             str(user_id) +
-                            uuid.uuid4().hex[:16]  # 16位十六进制，比原来6位数字更安全
+                            uuid.uuid4().hex[:16]
                     )
 
                     init_status = "pending_pay"
 
-                    # 修改后的 INSERT 语句，包含 merchant_id 字段
                     cur.execute("""
                         INSERT INTO orders(
                             user_id, merchant_id, order_number, total_amount, original_amount, status, is_vip_item,
@@ -571,17 +556,42 @@ class OrderManager:
                     if not buy_now:
                         cur.execute("DELETE FROM cart WHERE user_id = %s AND selected = 1", (user_id,))
 
+                    # ==================== 新增：计算最终应付金额并处理零元订单 ====================
+                    points_discount = (points_to_use or Decimal('0')) * POINTS_DISCOUNT_RATE
+                    coupon_discount = coupon_amount if coupon_id else Decimal('0')
+                    final_amount = total - (points_discount + coupon_discount)
+
+                    is_zero_order = final_amount <= Decimal('0')
+
+                    if is_zero_order:
+                        from services.finance_service import FinanceService
+                        fs = FinanceService()
+                        fs.settle_order(
+                            order_no=order_number,
+                            user_id=user_id,
+                            order_id=oid,
+                            points_to_use=points_to_use or Decimal('0'),
+                            coupon_discount=coupon_discount,
+                            external_conn=conn
+                        )
+                        logger.info(f"零元订单处理完成: {order_number}")
+                    # ===========================================================================
+
                     # ==================== 新增：记录幂等 Key 使用（如果提供了的话） ====================
                     if idempotency_key and redis_client:
                         used_key = f"order:idempotency:{idempotency_key}"
-                        redis_client.setex(used_key, 86400, order_number)  # 24小时过期
+                        redis_client.setex(used_key, 86400, order_number)
 
                     conn.commit()
                     logger.info(f"订单创建成功: {order_number}, 用户: {user_id}, 商家: {merchant_id}")
-                    return order_number
+
+                    return {
+                        "order_number": order_number,
+                        "need_pay": not is_zero_order
+                    }
 
         finally:
-            # ==================== 新增：无论成功与否都释放 Redis 锁 ====================
+            # ==================== 释放 Redis 锁 ====================
             if lock_acquired and redis_client:
                 try:
                     redis_client.delete(lock_key)
@@ -1300,16 +1310,7 @@ class MerchantOrdersQuery(BaseModel):
 # ---------------- 路由 ----------------
 @router.post("/create", summary="创建订单")
 def create_order(body: OrderCreate):
-    """
-    创建订单接口（已增加幂等性校验，支持多商家订单）
-    
-    - 请前端在提交时生成 idempotency_key（UUID），用于防止重复创建
-    - 如果同一用户 1 分钟内已有未取消订单，会返回错误
-    - 如果 Redis 锁未释放（5 秒内），会返回 429 错误
-    - 如果 buy_now_items 中的商品属于不同商家，会返回错误（一笔订单只能属于一个商家）
-    - 如果不传 merchant_id，系统会自动从商品中推断商家
-    """
-    no = OrderManager.create(
+    result = OrderManager.create(
         body.user_id,
         body.address_id,
         body.custom_address,
@@ -1317,14 +1318,17 @@ def create_order(body: OrderCreate):
         buy_now=body.buy_now,
         buy_now_items=body.buy_now_items,
         delivery_way=body.delivery_way,
-        points_to_use=body.points_to_use,  # 传递积分参数
-        coupon_id=body.coupon_id,  # 传递优惠券参数
-        idempotency_key=body.idempotency_key,  # 传递幂等 Key
-        merchant_id=body.merchant_id  # 传递商家ID
+        points_to_use=body.points_to_use,
+        coupon_id=body.coupon_id,
+        idempotency_key=body.idempotency_key,
+        merchant_id=body.merchant_id
     )
-    if not no:
+    if not result or not result.get("order_number"):
         raise HTTPException(status_code=422, detail="购物车为空或地址缺失")
-    return {"order_number": no}
+    return {
+        "order_number": result["order_number"],
+        "need_pay": result.get("need_pay", True)
+    }
 
 
 @router.get("/{user_id}", summary="查询用户订单列表")

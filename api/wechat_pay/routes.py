@@ -109,35 +109,9 @@ async def create_jsapi_order(request: Request):
                 payable_cents -= int(pending_points * Decimal('100'))
                 payable_cents -= int(coupon_amt * Decimal('100'))
 
-                # ==================== 修改点：零元支付处理 ====================
+                # ==================== 修改版本：应付≤0时报错，提示零元订单无需支付 ====================
                 if payable_cents <= 0:
-                    logger.info(f"订单 {out_trade_no} 应付金额为0，直接完成支付")
-                    try:
-                        # 使用当前连接结算订单
-                        fs = FinanceService()
-                        fs.settle_order(
-                            order_no=out_trade_no,
-                            user_id=order_row['user_id'],
-                            order_id=order_row['id'],
-                            points_to_use=pending_points,
-                            coupon_discount=coupon_amt,
-                            external_conn=conn
-                        )
-                        # settle_order 内部已更新订单状态，无需额外操作
-                        conn.commit()
-
-                        # 返回无需支付的响应
-                        return {
-                            "prepay_id": None,
-                            "need_pay": False,
-                            "message": "订单支付成功（零元支付）",
-                            "order_no": out_trade_no
-                        }
-                    except Exception as e:
-                        conn.rollback()
-                        logger.error(f"零元支付处理失败: {e}", exc_info=True)
-                        raise HTTPException(status_code=500, detail="订单处理失败")
-                # ==================== 修改点结束 ====================
+                    raise HTTPException(status_code=400, detail="零元订单无需支付，请直接下单")
 
                 if total_fee_client_int != payable_cents:
                     logger.warning(

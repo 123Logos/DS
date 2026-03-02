@@ -90,6 +90,42 @@ class FinanceService:
             logger.error(f"查询用户余额失败: {e}")
             return Decimal('0')
 
+    def _grant_referral_points(self, cur, referrer_id: int, amount: Decimal, order_no: str):
+        """
+        向推荐人发放推荐奖励点数（referral_points 和 true_total_points）
+        """
+        if amount <= 0:
+            return
+
+        # 更新 referral_points
+        cur.execute(
+            "UPDATE users SET referral_points = COALESCE(referral_points, 0) + %s WHERE id = %s",
+            (amount, referrer_id)
+        )
+        # 更新 true_total_points
+        cur.execute(
+            "UPDATE users SET true_total_points = true_total_points + %s WHERE id = %s",
+            (amount, referrer_id)
+        )
+
+        # 查询当前 referral_points 余额（用于流水）
+        cur.execute(
+            "SELECT COALESCE(referral_points, 0) AS balance FROM users WHERE id = %s",
+            (referrer_id,)
+        )
+        new_balance = Decimal(str(cur.fetchone()['balance'] or 0))
+
+        # 记录 account_flow
+        cur.execute(
+            """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after,
+               flow_type, remark, created_at)
+               VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+            ('referral_points', referrer_id, amount, new_balance, 'income',
+             f"普通商品推荐奖励 - 订单{order_no}")
+        )
+
+        logger.info(f"普通商品推荐奖励发放: 用户{referrer_id} +{amount:.4f}点数（订单{order_no}）")
+
     # ==================== 新增：资金池余额检查辅助方法 ====================
     def _ensure_pool_balance(self, account_type: str, amount_to_deduct: Decimal) -> None:
         """
@@ -200,7 +236,9 @@ class FinanceService:
                 f"优惠券¥{coupon_discount}, 实付¥{final_amount}"
             )
 
-            # 5. 处理积分抵扣
+            # ==================== 此处已删除错误的零元订单处理代码块 ====================
+
+            # 处理积分抵扣（原代码）
             if points_to_use > Decimal('0'):
                 self._apply_points_discount_v2(cur, user_id, user, points_to_use, total_amount, order_id)
 
@@ -259,6 +297,7 @@ class FinanceService:
 
             # 8. 处理普通商品积分（不发奖励）
             normal_items = [item for item in order_items if not item['is_member_product']]
+            normal_total_amount = Decimal('0')  # ← 提前初始化，避免未定义
             if normal_items:
                 normal_total_amount = sum(
                     Decimal(str(item['unit_price'])) * Decimal(str(item['quantity']))
@@ -267,17 +306,14 @@ class FinanceService:
 
                 if user.member_level >= 1 and final_amount > Decimal('0'):
                     points_ratio = normal_total_amount / total_amount if total_amount > 0 else Decimal('0')
-                    calculation_base = final_amount  # ← 仅实付现金
+                    calculation_base = final_amount
                     if calculation_base < Decimal('0'):
                         calculation_base = Decimal('0')
-
                     normal_points_earned = calculation_base * points_ratio
-
                     cur.execute(
                         "UPDATE users SET member_points = COALESCE(member_points, 0) + %s WHERE id = %s",
                         (normal_points_earned, user_id)
                     )
-
                     cur.execute(
                         """INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at)
                            VALUES (%s, %s, (SELECT COALESCE(member_points,0) FROM users WHERE id = %s), 'member', %s, %s, NOW())""",
@@ -303,6 +339,34 @@ class FinanceService:
                 user_id
             )
 
+            # ========== 新增：查询普通商品的直接推荐人（仅当有普通商品时） ==========
+            has_referrer = False
+            referrer_id = None
+            if normal_items:  # normal_items 为之前计算的普通商品列表，非空表示有普通商品
+                cur.execute(
+                    "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
+                    (user_id,)
+                )
+                ref_row = cur.fetchone()
+                if ref_row and ref_row['referrer_id']:
+                    # 检查推荐人状态是否正常（status=0）
+                    cur.execute(
+                        "SELECT status FROM users WHERE id = %s",
+                        (ref_row['referrer_id'],)
+                    )
+                    status_row = cur.fetchone()
+                    if status_row and status_row['status'] == 0:
+                        has_referrer = True
+                        referrer_id = ref_row['referrer_id']
+
+            # 计算普通商品在实付金额中的分摊比例
+            if total_amount > 0:
+                normal_ratio = normal_total_amount / total_amount
+            else:
+                normal_ratio = Decimal('0')
+            normal_paid = distribution_base * normal_ratio
+            # =====================================================================
+
             # 各子池统一分配（从平台收入池扣减）
             for atype, ratio in allocs.items():
                 if atype == 'merchant_balance':
@@ -313,15 +377,28 @@ class FinanceService:
                     f"订单分账: {order_no} → {atype} ({ratio * 100:.0f}%)",
                     user_id
                 )
-                self._add_pool_balance(
-                    cur, atype, alloc_amount,
-                    f"订单#{order_no} {atype.replace('_', ' ')}+{int(ratio * 100)}%",
-                    user_id
-                )
+                if atype == 'fund_pool' and has_referrer and normal_paid > 0:
+                    # 计算应给推荐人的金额（基于普通商品部分）
+                    referral_amount = (normal_paid * ratio).quantize(Decimal('0.0001'))
+                    # 发放给推荐人点数
+                    self._grant_referral_points(cur, referrer_id, referral_amount, order_no)
+                    # 剩余部分进入事业发展基金
+                    fund_pool_amount = alloc_amount - referral_amount
+                    if fund_pool_amount > 0:
+                        self._add_pool_balance(
+                            cur, atype, fund_pool_amount,
+                            f"订单#{order_no} {atype.replace('_', ' ')}+{int(ratio * 100)}% (剩余部分)",
+                            user_id
+                        )
+                else:
+                    self._add_pool_balance(
+                        cur, atype, alloc_amount,
+                        f"订单#{order_no} {atype.replace('_', ' ')}+{int(ratio * 100)}%",
+                        user_id
+                    )
 
-            # ========== 新增：公司积分池独立增加（基于实付金额+优惠券金额的20%） ==========
-            base_for_company = final_amount + coupon_discount
-            company_points_amount = (base_for_company * Decimal('0.20')).quantize(Decimal('0.0001'))
+            # ========== 新增：公司积分池独立增加（基于实付金额的20%） ==========
+            company_points_amount = (distribution_base * Decimal('0.20')).quantize(Decimal('0.0001'))
             cur.execute(
                 "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'company_points'",
                 (company_points_amount,)
@@ -334,7 +411,7 @@ class FinanceService:
                    flow_type, remark, created_at)
                    VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
                 ('company_points', PLATFORM_MERCHANT_ID, company_points_amount, cp_new_balance, 'income',
-                 f"订单#{order_no} 公司积分池+20% (实付¥{final_amount:.2f}+优惠券¥{coupon_discount:.2f})")
+                 f"订单#{order_no} 公司积分池+20% ¥{company_points_amount:.4f}")
             )
             # 可选：在 points_log 中也记录公司积分池变动（便于积分报表）
             try:
