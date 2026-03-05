@@ -13,6 +13,7 @@ from services.offline_service import OfflineService   # 业务逻辑层（稍后
 import xmltodict
 from services.notify_service import handle_pay_notify
 from decimal import Decimal, ROUND_HALF_UP
+from services.finance_service import FinanceService
 
 logger = get_logger(__name__)
 security = HTTPBearer()
@@ -138,6 +139,77 @@ async def create_offline_order(
         logger.error(f"创建离线订单失败: {e}", exc_info=True)
         raise HTTPException(status_code=400, detail=str(e))
 
+# ==================== 新增：生成永久收款码 ====================
+@router.post("/permanent-qrcode", summary="生成商户永久收款码")
+async def generate_permanent_qrcode(
+    merchant_id: int = Query(..., description="商家ID"),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    为商家生成长期有效的小程序码，扫码后进入可输入金额、使用优惠券的支付页面。
+    仅商家本人或管理员可操作。
+    """
+    # 权限校验：只能操作自己的商户ID，或管理员
+    if current_user["id"] != merchant_id and not current_user.get("is_admin", False):
+        raise HTTPException(status_code=403, detail="无权操作此商户的收款码")
+
+    try:
+        # 调用服务层生成二维码
+        result = await OfflineService.generate_permanent_qrcode(
+            merchant_id=merchant_id
+        )
+        return {"code": 0, "message": "生成成功", "data": result}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"生成永久收款码失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+# ==============================================================
+
+# ==================== 新增：用户创建订单（永久码场景） ====================
+@router.post("/order/create", summary="用户创建订单（永久码场景）")
+async def create_order_for_user(
+    merchant_id: int = Query(..., description="商家ID"),
+    amount: int = Query(..., gt=0, description="订单金额（单位：分）"),
+    coupon_id: Optional[int] = Query(None, description="优惠券ID（可选）"),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    用户输入金额后调用此接口创建订单，返回订单号。
+    此接口不生成二维码，用于永久码扫码后的支付流程。
+    """
+    try:
+        order_no = await OfflineService.create_order_for_user(
+            merchant_id=merchant_id,
+            user_id=current_user["id"],
+            amount=amount,
+            coupon_id=coupon_id
+        )
+        return {"code": 0, "message": "订单创建成功", "data": {"order_no": order_no}}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"创建订单失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="服务器内部错误")
+# ==============================================================
+
+# ==================== 新增：获取当前用户可用优惠券 ====================
+@router.get("/coupons", summary="获取当前用户可用优惠券")
+async def list_available_coupons(
+    amount: Optional[int] = Query(None, gt=0, description="订单金额（分），用于过滤门槛（可选）"),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    返回用户当前可用的优惠券列表，可传入订单金额用于过滤门槛（如有）。
+    """
+    try:
+        svc = FinanceService()
+        coupons = svc.list_available(user_id=current_user["id"], amount=amount or 0)
+        return {"code": 0, "message": "查询成功", "data": coupons}
+    except Exception as e:
+        logger.error(f"查询优惠券失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="查询失败")
+# ==============================================================
 
 # ------------------ 2. 刷新收款码 ------------------
 @router.put("/shoukuanma/shuaixin", summary="刷新收款码")

@@ -16,6 +16,7 @@ from services.notify_service import notify_merchant
 from pathlib import Path
 import pymysql
 import xmltodict
+from services.wechat_api import get_wxacode_unlimit   # ✅ 新增导入
 import base64
 from services.wechat_api import get_wxacode
 
@@ -212,10 +213,9 @@ class OfflineService:
                     SET coupon_id=%s, 
                         paid_amount=%s,
                         updated_at=NOW()
-                    WHERE order_no=%s AND merchant_id=%s""",
-                    (coupon_id, final_amount, order_no, current_user_id)
+                    WHERE order_no=%s""",
+                    (coupon_id, final_amount, order_no)
                 )
-                conn.commit()
 
         # 金额兜底：库内为 0 或异常时用前端传的 total_fee（分），避免微信报「缺少参数 total_fee」
         amount_for_wx = final_amount if final_amount and final_amount > 0 else (total_fee or 0)
@@ -479,3 +479,87 @@ class OfflineService:
             )
             
             logger.info(f"[on_paid] 线下订单完成: {order_no}, 金额: {amount}, 商户实收: {merchant_amount}")
+
+# ==================== 新增：生成永久收款码 ====================
+    @staticmethod
+    async def generate_permanent_qrcode(merchant_id: int) -> dict:
+        """
+        为指定商家生成永久有效的小程序码
+        返回 base64 图片数据及过期时间（长期有效，expire_at 返回 None）
+        """
+        # 场景值编码（长度限制32字符）
+        scene = f"m={merchant_id}"
+        # 固定页面路径（需要在小程序中创建该页面）
+        page = "pages/offline/permanentPay"
+
+        try:
+            # 调用微信接口获取二维码图片二进制
+            qrcode_bytes = await get_wxacode_unlimit(scene, page)
+            qrcode_base64 = base64.b64encode(qrcode_bytes).decode()
+            qrcode_data_url = f"data:image/png;base64,{qrcode_base64}"
+
+            # 保存到数据库（幂等操作）
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    # 检查是否已存在
+                    cur.execute(
+                        "SELECT id FROM merchant_qrcode WHERE merchant_id = %s",
+                        (merchant_id,)
+                    )
+                    if cur.fetchone():
+                        # 更新
+                        cur.execute(
+                            "UPDATE merchant_qrcode SET qrcode_data = %s, updated_at = NOW() WHERE merchant_id = %s",
+                            (qrcode_data_url, merchant_id)
+                        )
+                    else:
+                        # 插入
+                        cur.execute(
+                            "INSERT INTO merchant_qrcode (merchant_id, qrcode_data) VALUES (%s, %s)",
+                            (merchant_id, qrcode_data_url)
+                        )
+                    conn.commit()
+
+            return {
+                "qrcode": qrcode_data_url,
+                "expire_at": None,  # 永久有效
+                "merchant_id": merchant_id
+            }
+        except Exception as e:
+            logger.error(f"生成商户{merchant_id}永久二维码失败: {e}", exc_info=True)
+            raise
+    # ==============================================================
+
+# ==================== 新增：用户创建订单（永久码场景） ====================
+    @staticmethod
+    async def create_order_for_user(merchant_id: int, user_id: int, amount: int, coupon_id: Optional[int] = None) -> str:
+        """
+        创建订单（不生成二维码），用于永久码场景。
+        :param merchant_id: 商家ID
+        :param user_id: 用户ID
+        :param amount: 订单金额（分）
+        :param coupon_id: 优惠券ID（可选）
+        :return: 订单号
+        """
+        import uuid
+        # ----- 新增：查询商家店铺名称 -----
+        store_name = "默认店铺"  # 兜底值
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT store_name FROM merchant_stores WHERE user_id = %s", (merchant_id,))
+                row = cur.fetchone()
+                if row:
+                    store_name = row['store_name']
+        # ------------------------------
+        order_no = f"OFF{datetime.now().strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:6]}"
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 插入订单，状态为待支付（1）
+                cur.execute("""
+                    INSERT INTO offline_order
+                    (order_no, merchant_id, user_id, amount, coupon_id, store_name, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, 1)
+                """, (order_no, merchant_id, user_id, amount, coupon_id, store_name))
+                conn.commit()
+        return order_no
+    # ==============================================================

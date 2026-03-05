@@ -320,22 +320,23 @@ class FinanceService:
                         (user_id, normal_points_earned, user_id, '购买普通商品获得积分', order_id)
                     )
 
-            # ==================== 9. 资金分账（始终执行，按实付金额） ====================
+            # ==================== 9. 资金分账（始终执行，按实付金额 + 优惠券金额） ====================
             allocs = self.get_pool_allocations()
 
-            distribution_base = final_amount
+            # 分账基数 = 实付金额 + 优惠券金额 = 原价 - 积分抵扣
+            distribution_base = final_amount + coupon_discount
             if distribution_base < Decimal('0'):
                 distribution_base = Decimal('0')
 
             logger.debug(
-                f"[分账基数] 订单{order_no} 使用实付金额作为基数: ¥{distribution_base:.2f} "
-                f"（原价¥{total_amount:.2f}，积分抵扣¥{points_discount:.2f}，优惠券¥{coupon_discount:.2f}）"
+                f"[分账基数] 订单{order_no} 使用原价减去积分抵扣作为基数: ¥{distribution_base:.2f} "
+                f"（原价¥{total_amount:.2f}，积分抵扣¥{points_discount:.2f}，优惠券¥{coupon_discount:.2f}，实付¥{final_amount:.2f}）"
             )
 
-            # 平台收入池记入 100% 实付现金
+            # 平台收入池记入 100% 实付现金（注意：平台收入池只增加实付现金部分）
             self._add_pool_balance(
-                cur, 'platform_revenue_pool', distribution_base,
-                f"订单分账: {order_no} 实付现金¥{distribution_base:.2f}（原价¥{total_amount:.2f}）",
+                cur, 'platform_revenue_pool', final_amount,  # 此处仍用实付金额，不要改为 distribution_base
+                f"订单分账: {order_no} 实付现金¥{final_amount:.2f}（原价¥{total_amount:.2f}）",
                 user_id
             )
 
@@ -1155,20 +1156,22 @@ class FinanceService:
             auto_value = MAX_POINTS_VALUE
 
         if adjusted_config:
-            current_value = adjusted_config['value']
+            manual_value = adjusted_config['value']
+            # 实际使用值取较小者
+            current_value = min(manual_value, auto_value)
             is_manual_adjusted = True
-            manual_value = float(adjusted_config['value'])
+            manual_value_float = float(manual_value)
             auto_clear = adjusted_config.get('auto_clear', False)
         else:
             current_value = auto_value
             is_manual_adjusted = False
-            manual_value = None
+            manual_value_float = None
             auto_clear = False
 
         return {
             "current_value": float(current_value),
             "is_manual_adjusted": is_manual_adjusted,
-            "manual_value": manual_value,
+            "manual_value": manual_value_float,
             "auto_clear": auto_clear,
             "auto_calculated_value": float(auto_value),
             "subsidy_pool_balance": float(pool_balance),
@@ -1269,21 +1272,22 @@ class FinanceService:
             logger.warning("❌ 总积分为0，无法发放补贴")
             return False
 
-        # 检查是否有手动调整的积分值
+        # 自动计算积分值（已受全局上限约束）
+        auto_value = daily_available / total_system_points if total_system_points > 0 else Decimal('0')
+        if auto_value > MAX_POINTS_VALUE:
+            auto_value = MAX_POINTS_VALUE
+
+        # 检查手动调整配置
         adjusted_config = self._get_adjusted_points_value()
         if adjusted_config:
-            points_value = adjusted_config['value']
+            manual_value = adjusted_config['value']
             auto_clear = adjusted_config.get('auto_clear', False)
-            theoretical_total = points_value * total_user_points
-            if theoretical_total > daily_available:
-                raise FinanceException(
-                    f"手动积分值 {points_value:.4f} 计算的理论总额 {theoretical_total:.4f} 超过当日可分配金额 {daily_available:.4f}，请调整日比例或手动值"
-                )
-            logger.info(f"使用手动调整的积分值: {points_value:.4f}")
+            # 取自动值与手动值中的较小者（手动值作为上限）
+            points_value = min(manual_value, auto_value)
+            logger.info(
+                f"使用手动调整作为上限: 手动{manual_value:.4f}, 自动{auto_value:.4f}, 实际使用{points_value:.4f}")
         else:
-            points_value = daily_available / total_system_points
-            if points_value > MAX_POINTS_VALUE:
-                points_value = MAX_POINTS_VALUE
+            points_value = auto_value
             auto_clear = False
             logger.info(
                 f"自动计算积分值: {points_value:.4f} (可分配金额 {daily_available:.2f} / 总积分 {total_system_points})")
@@ -4887,20 +4891,25 @@ class FinanceService:
                 weighted_merchant_points = total_merchant_points
                 total_points = total_user_points + weighted_merchant_points + company_points
 
-                # 3. 计算积分价值（先检查手动调整）
-                adjusted_points_value = self._get_adjusted_points_value()
+                # 自动计算积分值
+                auto_value = pool_balance / total_points if total_points > 0 else Decimal('0')
+                if auto_value > MAX_POINTS_VALUE:
+                    auto_value = MAX_POINTS_VALUE
 
-                if adjusted_points_value is not None:
-                    # 使用手动调整的积分值
-                    points_value = adjusted_points_value['value']
+                # 检查手动调整配置
+                adjusted_config = self._get_adjusted_points_value()
+                if adjusted_config:
+                    manual_value = adjusted_config['value']
+                    # 取最小值作为实际预览值
+                    points_value = min(manual_value, auto_value)
                     is_manual_adjusted = True
-                    logger.info(f"预览使用手动调整的积分值: {points_value:.4f}")
+                    manual_value_for_display = float(manual_value)
+                    logger.info(
+                        f"预览使用手动调整上限: 手动{manual_value:.4f}, 自动{auto_value:.4f}, 实际预览值{points_value:.4f}")
                 else:
-                    # 按原方案自动计算
-                    points_value = pool_balance / total_points if total_points > 0 else Decimal('0')
-                    if points_value > MAX_POINTS_VALUE:
-                        points_value = MAX_POINTS_VALUE
+                    points_value = auto_value
                     is_manual_adjusted = False
+                    manual_value_for_display = None
 
                 # ==================== 新增：用户26平台积分池特殊发放预览 ====================
                 # 查询用户26当前信息

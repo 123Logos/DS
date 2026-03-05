@@ -18,7 +18,7 @@ class TaskScheduler:
     def start(self):
         """启动所有定时任务"""
         # 延迟导入，避免启动时循环依赖
-        from api.order.wechat_shipping import WechatShippingManager
+        # 已移除微信发货管理模块的导入
 
         # 每天凌晨4点清理过期草稿
         self.scheduler.add_job(
@@ -44,34 +44,25 @@ class TaskScheduler:
             replace_existing=True
         )
 
-        # ==================== 每天零点自动发放日补贴 ====================
+        # 每天零点自动发放日补贴
         self.scheduler.add_job(
-            self.auto_distribute_daily_subsidy,  # 修正为正确的方法名
-            CronTrigger(hour=0, minute=0),  # 每天 00:00:00
+            self.auto_distribute_daily_subsidy,
+            CronTrigger(hour=0, minute=0),
             id="daily_subsidy_auto",
             replace_existing=True,
             misfire_grace_time=3600
         )
 
-        # ==================== 每月1日零点自动发放联创分红 ====================
+        # 每月1日零点自动发放联创分红
         self.scheduler.add_job(
             self.auto_distribute_unilevel_dividend,
-            CronTrigger(day=1, hour=0, minute=0),  # 每月1号 00:00:00
+            CronTrigger(day=1, hour=0, minute=0),
             id="monthly_unilevel_auto",
             replace_existing=True,
             misfire_grace_time=3600
         )
 
-        # 每天12:00 刷新微信快递公司列表缓存
-        self.scheduler.add_job(
-            WechatShippingManager.refresh_delivery_list_cache,
-            CronTrigger(hour=4, minute=0),
-            id="refresh_delivery_list_daily",
-            replace_existing=True,
-            misfire_grace_time=3600
-        )
-
-        # ==================== 每小时清理过期银行卡验证码 ====================
+        # 每小时清理过期银行卡验证码
         self.scheduler.add_job(
             self.clean_expired_bankcard_codes,
             CronTrigger(hour="*", minute=30),

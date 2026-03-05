@@ -775,6 +775,17 @@ class DatabaseManager:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
 
+            'merchant_qrcode': """
+            CREATE TABLE IF NOT EXISTS merchant_qrcode (
+                id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                merchant_id BIGINT UNSIGNED NOT NULL UNIQUE COMMENT '商家用户ID',
+                qrcode_data TEXT NOT NULL COMMENT 'base64二维码数据（含 data:image/png;base64, 前缀）',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_merchant_id (merchant_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+
             'store_logos': """
             CREATE TABLE IF NOT EXISTS store_logos (
                 id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT 'LOGO ID',
