@@ -1,0 +1,52 @@
+name: Sync upstream and restart service
+
+on:
+  push:
+    branches:
+      - zg-branch
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream and fetch
+        run: |
+          git remote add upstream https://github.com/Jisalute/DS.git
+          git fetch upstream main
+
+      - name: Merge upstream/main into main
+        run: |
+          git checkout main
+          git merge --no-edit upstream/main
+
+      - name: Push to fork
+        run: git push origin main
+
+      - name: Deploy and restart service
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+        run: |
+          if [ -z "$DEPLOY_HOST" ] || [ -z "$DEPLOY_USER" ] || [ -z "$DEPLOY_KEY" ]; then
+            echo "Missing deploy secrets; skip deploy"
+            exit 0
+          fi
+          echo "$DEPLOY_KEY" > deploy_key
+          chmod 600 deploy_key
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          ssh -i deploy_key "$DEPLOY_USER@$DEPLOY_HOST" "cd /var/www/DS && git fetch origin main && git reset --hard origin/main && sudo systemctl restart ds.service"
