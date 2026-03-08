@@ -272,6 +272,9 @@ class OrderManager:
                     has_vip = any(i["is_vip"] for i in items)
                     coupon_amount = Decimal('0')
 
+                    # 先计算商品总额，可用于优惠券/积分验证
+                    total = sum(Decimal(str(i["quantity"])) * Decimal(str(i["price"])) for i in items)
+
                     if coupon_id:
                         cur.execute("""
                             SELECT id, amount, applicable_product_type, status, valid_from, valid_to, user_id
@@ -295,9 +298,22 @@ class OrderManager:
                             raise HTTPException(status_code=400, detail="该优惠券仅限普通商品使用")
 
                         coupon_amount = Decimal(str(coupon['amount']))
-                        total_amount = sum(Decimal(str(i["quantity"])) * Decimal(str(i["price"])) for i in items)
-                        if coupon_amount > total_amount:
+                        if coupon_amount > total:
                             raise HTTPException(status_code=400, detail="优惠券金额不能大于订单金额")
+
+                    # 计算最终应付金额并判断是否零元
+                    points_discount = (points_to_use or Decimal('0')) * POINTS_DISCOUNT_RATE
+                    coupon_discount = coupon_amount if coupon_id else Decimal('0')
+                    final_amount = total - (points_discount + coupon_discount)
+                    is_zero_order = final_amount <= Decimal('0')
+
+                    # 判断初始状态和过期时间
+                    if is_zero_order:
+                        init_status = "pending_recv"  # 零元订单直接待收货
+                        expire_at = None
+                    else:
+                        init_status = "pending_pay"
+                        expire_at = datetime.now() + timedelta(hours=12)
 
                     # ---------- 3. 地址信息 ----------
                     if delivery_way == "pickup":
@@ -313,15 +329,11 @@ class OrderManager:
                         raise HTTPException(status_code=422, detail="必须上传收货地址或选择自提")
 
                     # ---------- 4. 订单主表 ----------
-                    total = sum(Decimal(str(i["quantity"])) * Decimal(str(i["price"])) for i in items)
-
                     order_number = (
                             datetime.now().strftime("%Y%m%d%H%M%S") +
                             str(user_id) +
                             uuid.uuid4().hex[:16]
                     )
-
-                    init_status = "pending_pay"
 
                     cur.execute("""
                         INSERT INTO orders(
@@ -334,12 +346,12 @@ class OrderManager:
                                 %s, %s, %s, %s, %s, %s, %s,
                                 'wechat', %s, %s, %s, %s, %s)
                     """, (
-                        user_id, merchant_id, order_number, total, total, init_status, has_vip,
+                        user_id, merchant_id, order_number, final_amount, total, init_status, has_vip,
                         consignee_name, consignee_phone,
                         province, city, district, shipping_address, delivery_way,
                         datetime.now() + timedelta(days=7),
                         specifications,
-                        datetime.now() + timedelta(hours=12) if init_status == "pending_pay" else None,
+                        expire_at,
                         points_to_use or Decimal('0'),
                         coupon_id
                     ))
@@ -382,33 +394,10 @@ class OrderManager:
                     if not buy_now:
                         cur.execute("DELETE FROM cart WHERE user_id = %s AND selected = 1", (user_id,))
 
-                    # 计算最终应付金额并处理零元订单
-                    points_discount = (points_to_use or Decimal('0')) * POINTS_DISCOUNT_RATE
-                    coupon_discount = coupon_amount if coupon_id else Decimal('0')
-                    final_amount = total - (points_discount + coupon_discount)
-
-                    is_zero_order = final_amount <= Decimal('0')
-
+                    # 结算逻辑：零元或普通订单均在 finance_service 内处理状态和优惠券
                     if is_zero_order:
                         from services.finance_service import FinanceService
                         fs = FinanceService()
-
-                        if coupon_id:
-                            cur.execute(
-                                "SELECT status FROM coupons WHERE id = %s FOR UPDATE",
-                                (coupon_id,)
-                            )
-                            coupon_row = cur.fetchone()
-                            if not coupon_row:
-                                raise HTTPException(status_code=400, detail="优惠券不存在")
-                            if coupon_row['status'] != 'unused':
-                                raise HTTPException(status_code=400, detail="优惠券不可用")
-                            cur.execute(
-                                "UPDATE coupons SET status='used', used_at=NOW() WHERE id = %s",
-                                (coupon_id,)
-                            )
-                            logger.info(f"零元订单核销优惠券: coupon_id={coupon_id}")
-
                         fs.settle_order(
                             order_no=order_number,
                             user_id=user_id,
@@ -417,7 +406,18 @@ class OrderManager:
                             coupon_discount=coupon_discount,
                             external_conn=conn
                         )
-                        logger.info(f"零元订单处理完成: {order_number}")
+
+                    if idempotency_key and redis_client:
+                        used_key = f"order:idempotency:{idempotency_key}"
+                        redis_client.setex(used_key, 86400, order_number)
+
+                    conn.commit()
+                    logger.info(f"订单创建成功: {order_number}, 用户: {user_id}, 商家: {merchant_id}")
+
+                    return {
+                        "order_number": order_number,
+                        "need_pay": not is_zero_order
+                    }
 
                     if idempotency_key and redis_client:
                         used_key = f"order:idempotency:{idempotency_key}"

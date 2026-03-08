@@ -192,6 +192,22 @@ class FinanceService:
             if not order_items:
                 raise OrderException(f"订单无商品明细: {order_no}")
 
+            # 1.1 如果存在订单表中的 pending_coupon_id，则提前锁定并核销优惠券
+            cur.execute("SELECT pending_coupon_id FROM orders WHERE order_number=%s FOR UPDATE", (order_no,))
+            order_info = cur.fetchone() or {}
+            coupon_id = order_info.get('pending_coupon_id')
+            if coupon_id:
+                cur.execute("SELECT status FROM coupons WHERE id=%s FOR UPDATE", (coupon_id,))
+                coupon_row = cur.fetchone()
+                if not coupon_row:
+                    raise OrderException(f"优惠券不存在: {coupon_id}")
+                if coupon_row.get('status') != 'unused':
+                    raise OrderException(f"优惠券不可用或已使用: {coupon_id}")
+                cur.execute(
+                    "UPDATE coupons SET status='used', used_at=NOW() WHERE id=%s AND status='unused'",
+                    (coupon_id,)
+                )
+
             # 2. 查询用户信息
             select_sql = build_dynamic_select(
                 cur, "users",
@@ -236,7 +252,10 @@ class FinanceService:
                 f"优惠券¥{coupon_discount}, 实付¥{final_amount}"
             )
 
-            # ==================== 此处已删除错误的零元订单处理代码块 ====================
+            # ==================== 新增：零元订单处理逻辑 ====================
+            # 如果实付金额为0，记录日志（后续流程会正常继续执行订单状态更新）
+            if final_amount <= Decimal('0'):
+                logger.info(f"检测到零元订单: {order_no} ，系统将自动完成结算流程")
 
             # 处理积分抵扣（原代码）
             if points_to_use > Decimal('0'):
@@ -246,14 +265,19 @@ class FinanceService:
             cur.execute("SELECT delivery_way FROM orders WHERE id=%s", (order_id,))
             order_row = cur.fetchone() or {}
             delivery_way = order_row.get("delivery_way")
-            next_status = "pending_recv" if delivery_way == "pickup" else "pending_ship"
+            
+            # 对于零元订单，直接设为待收货状态，无需发货
+            if final_amount <= Decimal('0'):
+                next_status = "pending_recv"
+            else:
+                next_status = "pending_recv" if delivery_way == "pickup" else "pending_ship"
 
             cur.execute(
                 """UPDATE orders SET 
-                   merchant_id=%s, total_amount=%s, original_amount=%s,
+                   total_amount=%s, original_amount=%s,
                    points_discount=%s, status=%s, updated_at=NOW()
                    WHERE order_number=%s""",
-                (PLATFORM_MERCHANT_ID, final_amount, total_amount, total_discount, next_status, order_no)
+                (final_amount, total_amount, total_discount, next_status, order_no)
             )
 
             # 7. 处理会员商品奖励
@@ -372,7 +396,7 @@ class FinanceService:
             for atype, ratio in allocs.items():
                 if atype == 'merchant_balance':
                     continue
-                alloc_amount = (distribution_base * ratio).quantize(Decimal('0.0001'))
+                alloc_amount = (distribution_base * ratio).quantize(Decimal('0.000001'))
                 self._add_pool_balance(
                     cur, 'platform_revenue_pool', -alloc_amount,
                     f"订单分账: {order_no} → {atype} ({ratio * 100:.0f}%)",
@@ -380,7 +404,7 @@ class FinanceService:
                 )
                 if atype == 'fund_pool' and has_referrer and normal_paid > 0:
                     # 计算应给推荐人的金额（基于普通商品部分）
-                    referral_amount = (normal_paid * ratio).quantize(Decimal('0.0001'))
+                    referral_amount = (normal_paid * ratio).quantize(Decimal('0.000001'))
                     # 发放给推荐人点数
                     self._grant_referral_points(cur, referrer_id, referral_amount, order_no)
                     # 剩余部分进入事业发展基金
@@ -399,7 +423,7 @@ class FinanceService:
                     )
 
             # ========== 新增：公司积分池独立增加（基于实付金额的20%） ==========
-            company_points_amount = (distribution_base * Decimal('0.20')).quantize(Decimal('0.0001'))
+            company_points_amount = (distribution_base * Decimal('0.20')).quantize(Decimal('0.000001'))
             cur.execute(
                 "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'company_points'",
                 (company_points_amount,)

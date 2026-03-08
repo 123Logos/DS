@@ -178,7 +178,7 @@ class OfflineService:
             with conn.cursor(pymysql.cursors.DictCursor) as cur:
                 # 1. 查询订单原始金额（仅用订单号，移除商家ID条件）
                 cur.execute(
-                    "SELECT amount, status, merchant_id, user_id FROM offline_order WHERE order_no=%s",
+                    "SELECT amount, status, merchant_id, user_id, store_name FROM offline_order WHERE order_no=%s",
                     (order_no,)
                 )
                 row = cur.fetchone()
@@ -495,6 +495,43 @@ class OfflineService:
         try:
             # 调用微信接口获取二维码图片二进制
             qrcode_bytes = await get_wxacode_unlimit(scene, page)
+
+            # ====== 新增：如果商户有头像则把头像叠加到二维码中间 ======
+            avatar_path = None
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT avatar_path FROM users WHERE id=%s", (merchant_id,))
+                        row = cur.fetchone()
+                        avatar_path = row.get("avatar_path") if row else None
+            except Exception:
+                avatar_path = None
+
+            if avatar_path:
+                try:
+                    from PIL import Image
+                    import io
+                    # 读取二维码图像
+                    qr_im = Image.open(io.BytesIO(qrcode_bytes)).convert("RGBA")
+                    # 尝试打开头像文件; avatar_path 可能是相对路径
+                    from core.config import AVATAR_UPLOAD_DIR
+                    av_file = AVATAR_UPLOAD_DIR / avatar_path
+                    if av_file.exists():
+                        av_im = Image.open(av_file).convert("RGBA")
+                        # 缩放头像到二维码中心尺寸 (约1/4 宽度)
+                        target_size = int(qr_im.width * 0.25)
+                        av_im = av_im.resize((target_size, target_size), Image.ANTIALIAS)
+                        # 计算位置并粘贴
+                        pos = ((qr_im.width - target_size) // 2, (qr_im.height - target_size) // 2)
+                        qr_im.paste(av_im, pos, av_im)
+                        # 写回 bytes
+                        buf = io.BytesIO()
+                        qr_im.save(buf, format="PNG")
+                        qrcode_bytes = buf.getvalue()
+                except Exception as e:
+                    logger.warning(f"叠加商户头像失败: {e}")
+            # ==========================================
+
             qrcode_base64 = base64.b64encode(qrcode_bytes).decode()
             qrcode_data_url = f"data:image/png;base64,{qrcode_base64}"
 
