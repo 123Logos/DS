@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     MAX_FILE_SIZE_MB: int = 10
     qrcode_expire_seconds: int = 300
 
+    # 用于生成普通二维码的基础域名，末尾不应包含斜杠。
+    # 可以在 .env 中设置，如 HOST=https://hzai.tech
+    # 如果留空，返回的链接将以根路径开头（相对 URL）。
+    HOST: str = ""
+
     # 数据库
     MYSQL_HOST: str = "127.0.0.1"
     MYSQL_PORT: int = 3306

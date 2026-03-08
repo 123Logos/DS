@@ -85,6 +85,32 @@ WECHAT_APP_SECRET=WECHAT_APP_SECRET
 - 启动后，访问 `http://127.0.0.1:<port>/docs` 查看 API 文档
 - 或访问 `http://127.0.0.1:<port>/redoc` 查看 ReDoc 文档
 
+---
+
+## 离线收款二维码支持
+
+1. 项目根目录下新增 `offline/` 文件夹，会被应用挂载为静态目录。
+   - 在该目录放置微信小程序域名验证文件（比如 `senIScNn8d.txt`），
+     即可通过 `https://<your-domain>/offline/senIScNn8d.txt` 访问。
+   - 普通扫码（非小程序码）也可以指向此路径，例如作为服务器域名验证。
+   - 请在 `.env` 中设置 `HOST` 为你的公开域名（不带尾部斜杠），
+     以便接口返回的 `url` 正常带上域名前缀；例如：
+     `HOST=https://hzai.tech`
+
+2. 新增接口 `POST /api/offline/permanent-qrcode`，返回的数据中
+   除了 `qrcode` 外还带 `url` 字段，示例：
+   `https://<your-domain>/offline/permanentPay?merchant_id=123`。
+   如果 `HOST` 未配置，该字段返回相对路径 `/offline/permanentPay?...`，
+   前端在生成二维码时需补上域名或使用 request.base_url。
+   前端应当对路径做 URL 编码（当前仅包含数字，安全）。
+
+3. 为了配合上述 URL，我们增加了一个 HTTP 路由
+   `GET /offline/permanentPay`，会根据 `merchant_id` 参数
+   重定向到对应小程序页面（使用微信 universal link）。
+   这样扫码后微信客户端会直接打开小程序并传递商家 ID。
+
+---
+
 > [!NOTE]
 >
 > `<port>` 为环境变量 `UVICORN_PORT`，若未设置则默认使用 `8000`

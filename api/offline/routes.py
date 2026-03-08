@@ -193,6 +193,32 @@ async def create_order_for_user(
         raise HTTPException(status_code=500, detail="服务器内部错误")
 # ==============================================================
 
+# ==================== 普通二维码跳转页（微信验证/外部扫描） ====================
+@router.get("/permanentPay", include_in_schema=False)
+async def offline_permanent_pay(
+    merchant_id: int = Query(..., description="商家ID")
+):
+    """
+    接收外部普通二维码请求，将用户引导至小程序的永久收款页。
+
+    二维码内容示例：
+        https://<your-domain>/offline/permanentPay?merchant_id=123
+
+    目前只是做一个简单的 302 重定向到微信提供的 universal link，
+    小程序内部会在页面 `pages/offline/permanentPay` 中根据 merchant_id
+    继续后续业务逻辑（创建订单、填写金额等）。
+    """
+    from fastapi.responses import RedirectResponse
+
+    appid = settings.WECHAT_APP_ID
+    # 参数需要 URL 编码，虽然目前只传 merchant_id 数字，但未来扩展可加更多字段
+    from urllib.parse import quote
+    path = quote(f"pages/offline/permanentPay?merchant_id={merchant_id}", safe="")
+    # 微信小程序 universal link，可省略中间的版本号“/0/”
+    url = f"https://servicewechat.com/{appid}/0/page-frame.html?path={path}"
+    return RedirectResponse(url)
+
+
 # ==================== 新增：获取当前用户可用优惠券 ====================
 @router.get("/coupons", summary="获取当前用户可用优惠券")
 async def list_available_coupons(

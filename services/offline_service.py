@@ -557,8 +557,17 @@ class OfflineService:
                         )
                     conn.commit()
 
+            # 普通可访问链接（方便生成传统二维码或进行域名验证）
+            base = getattr(settings, 'HOST', '').rstrip('/')
+            if base:
+                normal_url = f"{base}/offline/permanentPay?merchant_id={merchant_id}"
+            else:
+                # 如果 HOST 未配置，则返回相对路径；前端/扫码页面应当补全域名
+                normal_url = f"/offline/permanentPay?merchant_id={merchant_id}"
+
             return {
                 "qrcode": qrcode_data_url,
+                "url": normal_url,             # 🎯 新增字段，供前端生成普通二维码
                 "expire_at": None,  # 永久有效
                 "merchant_id": merchant_id
             }
