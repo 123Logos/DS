@@ -1174,8 +1174,11 @@ class FinanceService:
                 # 4. 总积分（分母）
                 total_system_points = total_user_points + weighted_merchant_points + company_points_balance
 
-        # 自动计算值（基于完整的总积分）
-        auto_value = pool_balance / total_system_points if total_system_points > 0 else Decimal('0')
+        # 获取日补贴比例（默认0.05）
+        daily_ratio = self.get_daily_subsidy_ratio()
+        daily_available = pool_balance * daily_ratio
+        # 自动计算值 = 每日可分配金额 / 总积分
+        auto_value = daily_available / total_system_points if total_system_points > 0 else Decimal('0')
         if auto_value > MAX_POINTS_VALUE:
             auto_value = MAX_POINTS_VALUE
 
