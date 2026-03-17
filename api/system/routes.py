@@ -190,3 +190,39 @@ def grant_system_permission(
             conn.commit()
             return {"msg": "is_merchant 已更新", "user_id": user_id, "is_merchant": is_merchant}
 
+# ========== 新增省市区接口 ==========
+from fastapi import HTTPException  # 如果已有导入则可省略
+
+@router.get("/provinces", summary="获取所有省份")
+def get_provinces():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT code, name FROM regions WHERE level = 1 ORDER BY code")
+            return cur.fetchall()
+
+@router.get("/cities/{province_code}", summary="获取某省的所有城市")
+def get_cities(province_code: str):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT code, name FROM regions WHERE parent_code = %s AND level = 2 ORDER BY code",
+                (province_code,)
+            )
+            rows = cur.fetchall()
+            if not rows:
+                raise HTTPException(status_code=404, detail="未找到该省份或该省份无城市数据")
+            return rows
+
+@router.get("/districts/{city_code}", summary="获取某市的所有区县")
+def get_districts(city_code: str):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT code, name FROM regions WHERE parent_code = %s AND level = 3 ORDER BY code",
+                (city_code,)
+            )
+            rows = cur.fetchall()
+            if not rows:
+                raise HTTPException(status_code=404, detail="未找到该城市或该城市无区县数据")
+            return rows
+

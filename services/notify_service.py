@@ -2,7 +2,8 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING, Union
 
-import pymysql   # 补充 Union
+import pymysql  # 补充 Union
+import asyncio  # 添加导入
 
 if TYPE_CHECKING:
     from wechatpayv3 import WeChatPay
@@ -24,7 +25,7 @@ settings: Settings
 logger = get_logger(__name__)
 
 # ----------- 全局 wxpay 实例 ----------
-if not settings.wx_mock_mode_bool:   # ✅ 修改为布尔属性
+if not settings.wx_mock_mode_bool:  # ✅ 修改为布尔属性
     from wechatpayv3 import WeChatPay, WeChatPayType
 
     # 加载商户私钥（字符串）
@@ -50,20 +51,20 @@ if not settings.wx_mock_mode_bool:   # ✅ 修改为布尔属性
 else:
     wxpay = None
 
+
 # 2. 给用户微信“零钱到账”通知
 async def _transfer_to_user(openid: str, amount: Decimal, desc: str) -> str:
-    if settings.wx_mock_mode_bool:   # ✅ 使用布尔属性
+    if settings.wx_mock_mode_bool:
         logger.info(f"[MOCK] 转账 {amount:.2f} 元至 {openid}（描述：{desc}）")
         return "mock_batch_id"
-    amount_int = int(amount * 100)
-    """
-    调用微信「商家转账到零钱」
-    返回微信官方订单号（可用于查询）
-    """
-    # 微信单位：分
+
+    if amount <= 0:
+        logger.info(f"[Notify] 转账金额为0，跳过")
+        return "zero_amount"
+
     amount_int = int(amount * 100)
     req = {
-        "appid": settings.WECHAT_APPID,
+        "appid": settings.WECHAT_APP_ID,
         "out_batch_no": f"MER{int(datetime.now().timestamp())}",
         "batch_name": "线下收银到账",
         "batch_remark": desc,
@@ -77,16 +78,22 @@ async def _transfer_to_user(openid: str, amount: Decimal, desc: str) -> str:
         }]
     }
     try:
-        resp = await wxpay.async_transfer_batch(req)
-        logger.info(f"[WeChat] 转账成功: {resp}")
-        return resp.get("batch_id", "")
+        # 将同步的 transfer_batch 调用放到线程池中执行
+        status_code, resp_data = await asyncio.to_thread(wxpay.transfer_batch, **req)
+        if status_code == 200:
+            logger.info(f"[WeChat] 转账成功: {resp_data}")
+            return resp_data.get("batch_id", "")
+        else:
+            logger.error(f"[WeChat] 转账失败: {resp_data}")
+            raise Exception(f"转账失败: {resp_data}")
     except Exception as e:
-        logger.error(f"[WeChat] 转账失败: {e}")
+        logger.error(f"[WeChat] 转账异常: {e}")
         raise
+
 
 # 3. 给商户微信下发「模板消息」
 async def _notify_template(openid: str, order_no: str, amount: Decimal):
-    if settings.wx_mock_mode_bool:   # ✅ 使用布尔属性
+    if settings.wx_mock_mode_bool:  # ✅ 使用布尔属性
         logger.info(f"[MOCK] 模板消息：openid={openid} 订单={order_no} 金额={amount:.2f}")
         return
     """
@@ -111,19 +118,21 @@ async def _notify_template(openid: str, order_no: str, amount: Decimal):
         r.raise_for_status()
         logger.info(f"[WeChat] 模板消息发送成功: {r.json()}")
 
+
 # 4. 获取公众号/小程序 access_token（缓存 7000s）
 async def _get_access_token() -> str:
     # 简单内存缓存，生产环境可换 Redis
     import time
     now = int(time.time())
     if not hasattr(_get_access_token, "_cache") or now - _get_access_token._cache[1] > 7000:
-        url = f"https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid={settings.WECHAT_APPID}&secret={settings.WECHAT_SECRET}"
+        url = f"https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid={settings.WECHAT_APP_ID}&secret={settings.WECHAT_APP_SECRET}"
         async with httpx.AsyncClient() as client:
             r = await client.get(url)
             r.raise_for_status()
             token = r.json()["access_token"]
             _get_access_token._cache = (token, now)
     return _get_access_token._cache[0]
+
 
 # 5. 对外唯一入口：微信到账通知
 async def notify_merchant(merchant_id: int, order_no: str, amount: int) -> None:
@@ -149,6 +158,7 @@ async def notify_merchant(merchant_id: int, order_no: str, amount: int) -> None:
     # 2. 模板消息
     await _notify_template(openid, order_no, amount_dec)
 
+
 # ====================== 支付回调（统一下单） ======================
 async def handle_pay_notify(raw_body: Union[bytes, str]) -> str:
     """
@@ -160,7 +170,7 @@ async def handle_pay_notify(raw_body: Union[bytes, str]) -> str:
         data = wxpay.parse_notify(raw_body)
         logger.info(f"[pay-notify] 微信通知内容: {data}")
         out_trade_no = data["out_trade_no"]
-        wx_total = int(data["amount"]["total"])   # 分
+        wx_total = int(data["amount"]["total"])  # 分
 
         # 2. 判断订单类型（线下订单以 OFF 开头）
         if out_trade_no.startswith("OFF"):
@@ -183,6 +193,11 @@ async def _handle_offline_pay_notify(order_no: str, wx_total: int, data: dict) -
     try:
         with get_conn() as conn:
             with conn.cursor(pymysql.cursors.DictCursor) as cur:
+                # 0. 打印调试信息：订单号、长度、当前数据库
+                cur.execute("SELECT DATABASE()")
+                db_name = cur.fetchone()['DATABASE()']
+                logger.info(f"[offline-pay] 收到回调，订单号: '{order_no}', 长度: {len(order_no)}, 数据库: {db_name}")
+
                 # 1. 查询线下订单并锁定
                 cur.execute(
                     """
@@ -194,11 +209,12 @@ async def _handle_offline_pay_notify(order_no: str, wx_total: int, data: dict) -
                     (order_no,)
                 )
                 order = cur.fetchone()
-                
+
                 if not order:
                     logger.error(f"[offline-pay] 订单不存在: {order_no}")
-                    return "<xml><return_code><![CDATA[SUCCESS]]></return_code></xml>"
-                
+                    # ✅ 修改为 FAIL，让微信重试
+                    return "<xml><return_code><![CDATA[FAIL]]></return_code></xml>"
+
                 # 2. 幂等检查：已处理过直接返回成功
                 if order["status"] != 1:  # 1=待支付
                     logger.info(f"[offline-pay] 订单已处理: {order_no}, 状态={order['status']}")
@@ -207,7 +223,7 @@ async def _handle_offline_pay_notify(order_no: str, wx_total: int, data: dict) -
                 # 3. 金额核对
                 db_total = int(Decimal(order["paid_amount"]) * 100) if order["paid_amount"] is not None else int(
                     Decimal(order["amount"]) * 100)
-                
+
                 if wx_total != db_total:
                     logger.error(f"[offline-pay] 金额不一致: 微信{wx_total}≠系统{db_total}")
                     return "<xml><return_code><![CDATA[FAIL]]></return_code></xml>"
@@ -242,15 +258,16 @@ async def _handle_offline_pay_notify(order_no: str, wx_total: int, data: dict) -
                     (data.get("transaction_id", ""), order["id"])
                 )
 
-                # 6.资金分账：平台抽成各池 + 商户转账通知
+                # 6. 资金分账：平台抽成各池 + 商户转账通知
                 try:
                     from services.offline_service import OfflineService
                     from decimal import Decimal
-                    
+
                     await OfflineService.on_paid(
                         order_no=order_no,
                         amount=Decimal(order["paid_amount"]) / 100,  # 转为元
-                        coupon_discount=Decimal(order["amount"] - order["paid_amount"]) / 100 if order["coupon_id"] else Decimal(0)
+                        coupon_discount=Decimal(order["amount"] - order["paid_amount"]) / 100 if order[
+                            "coupon_id"] else Decimal(0)
                     )
                 except Exception as e:
                     logger.error(f"[offline-pay] 资金分账失败（需人工处理）: {e}")
@@ -258,9 +275,9 @@ async def _handle_offline_pay_notify(order_no: str, wx_total: int, data: dict) -
 
                 conn.commit()
                 logger.info(f"[offline-pay] 线下订单支付成功: {order_no}")
-                
+
         return "<xml><return_code><![CDATA[SUCCESS]]></return_code></xml>"
-        
+
     except Exception as e:
         logger.error(f"[offline-pay] 处理失败: {e}", exc_info=True)
         return "<xml><return_code><![CDATA[FAIL]]></return_code></xml>"
@@ -354,8 +371,26 @@ async def _handle_online_pay_notify(order_no: str, wx_total: int, data: dict) ->
                     external_conn=conn
                 )
 
-                # 7. 更新订单状态
-                next_status = "pending_recv" if order["delivery_way"] == "pickup" else "pending_ship"
+                # 7. 判断是否为虚拟商品订单（所有商品都是虚拟商品）
+                cur.execute("""
+                    SELECT COUNT(*) as total, 
+                           SUM(CASE WHEN p.is_virtual = 1 THEN 1 ELSE 0 END) as virtual_count
+                    FROM order_items oi
+                    JOIN products p ON oi.product_id = p.id
+                    WHERE oi.order_id = %s
+                """, (order["id"],))
+                item_counts = cur.fetchone()
+                total_items = item_counts["total"] or 0
+                virtual_count = item_counts["virtual_count"] or 0
+
+                if total_items > 0 and virtual_count == total_items:
+                    # 所有商品均为虚拟商品 → 直接完成订单
+                    next_status = "completed"
+                    cur.execute("UPDATE orders SET completed_at = NOW() WHERE id = %s", (order["id"],))
+                else:
+                    # 包含实体商品 → 走原有物流流程
+                    next_status = "pending_recv" if order["delivery_way"] == "pickup" else "pending_ship"
+
                 from api.order.order import OrderManager
                 OrderManager.update_status(order_no, next_status, external_conn=conn)
 
@@ -368,13 +403,14 @@ async def _handle_online_pay_notify(order_no: str, wx_total: int, data: dict) ->
         logger.error(f"[online-pay] 处理失败: {e}", exc_info=True)
         return "<xml><return_code><![CDATA[FAIL]]></return_code></xml>"
 
+
 # 兼容调用：异步统一下单包装（服务内其他模块可能调用 ns.wxpay.async_unified_order）
 async def async_unified_order(req: dict) -> dict:
     """
     异步包装：在后台线程调用 core.wx_pay_client.wxpay_client.create_jsapi_order
     目的：兼容原来期望 ns.wxpay.async_unified_order 的调用方式
     """
-    if settings.wx_mock_mode_bool:   # ✅ 修改为布尔属性
+    if settings.wx_mock_mode_bool:  # ✅ 修改为布尔属性
         import uuid, time
         return {"prepay_id": f"MOCK_PREPAY_{int(time.time())}_{uuid.uuid4().hex[:8]}"}
 

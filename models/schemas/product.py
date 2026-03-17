@@ -65,6 +65,7 @@ class ProductModel(BaseModel):
     status: int = Field(default=ProductStatus.DRAFT, ge=0, le=3)
     user_id: Optional[int] = None
     is_member_product: bool = Field(default=False)
+    cash_only: bool = False
     buy_rule: Optional[str] = None
     freight: Decimal = Field(default=Decimal("0.00"), ge=0)
     # ✅ 新增字段：积分抵扣上限

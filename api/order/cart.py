@@ -68,10 +68,11 @@ class CartManager:
                     SELECT c.*,
                         p.name                     AS product_name,
                         s.price                    AS unit_price,
-                        (c.quantity * s.price)     AS total_price
+                        (c.quantity * s.price)     AS total_price,
+                        p.cash_only                 -- 新增字段
                     FROM cart c
                     JOIN products p  ON p.id  = c.product_id
-                    JOIN product_skus s ON s.id = c.sku_id   -- 关键：用 sku_id 精准匹配
+                    JOIN product_skus s ON s.id = c.sku_id
                     WHERE c.user_id = %s
                     ORDER BY c.added_at DESC
                 """
@@ -80,7 +81,6 @@ class CartManager:
                 for r in rows:
                     r["unit_price"] = float(r["unit_price"])
                     r["total_price"] = float(r["total_price"])
-                    # 仅反序列化库里的 JSON
                     r["specifications"] = json.loads(r["specifications"]) if r["specifications"] else None
                 return rows
 

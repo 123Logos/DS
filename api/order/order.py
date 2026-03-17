@@ -1,5 +1,5 @@
 from services.finance_service import FinanceService
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any, cast
 from core.config import Settings, settings
@@ -198,7 +198,7 @@ class OrderManager:
                         product_merchant_ids = set()
 
                         for it in buy_now_items:
-                            cur.execute("SELECT is_member_product, user_id FROM products WHERE id = %s",
+                            cur.execute("SELECT is_member_product, user_id, cash_only FROM products WHERE id = %s",
                                         (it["product_id"],))
                             prod = cur.fetchone()
                             if not prod:
@@ -227,7 +227,8 @@ class OrderManager:
                                 "product_id": it["product_id"],
                                 "quantity": it["quantity"],
                                 "price": Decimal(str(it["price"])),
-                                "is_vip": prod["is_member_product"]
+                                "is_vip": prod["is_member_product"],
+                                "cash_only": prod["cash_only"]  # 新增
                             })
 
                         if len(product_merchant_ids) > 1:
@@ -246,7 +247,8 @@ class OrderManager:
                                 s.price,
                                 p.is_member_product AS is_vip,
                                 p.user_id as merchant_id,
-                                c.specifications
+                                c.specifications,
+                                p.cash_only
                             FROM cart c
                             JOIN product_skus s ON s.id = c.sku_id
                             JOIN products p ON p.id = c.product_id
@@ -301,15 +303,25 @@ class OrderManager:
                         if coupon_amount > total:
                             raise HTTPException(status_code=400, detail="优惠券金额不能大于订单金额")
 
-                    # 计算最终应付金额并判断是否零元
+                    # 检查是否有 cash_only 商品
+                    has_cash_only = any(i.get("cash_only") for i in items)
+                    if has_cash_only:
+                        if points_to_use and points_to_use > 0:
+                            raise HTTPException(status_code=400, detail="该商品只能用现金支付，不能使用积分")
+                        if coupon_id:
+                            raise HTTPException(status_code=400, detail="该商品只能用现金支付，不能使用优惠券")
+
+                    # 计算最终应付金额
                     points_discount = (points_to_use or Decimal('0')) * POINTS_DISCOUNT_RATE
                     coupon_discount = coupon_amount if coupon_id else Decimal('0')
                     final_amount = total - (points_discount + coupon_discount)
+
+                    # 判断是否零元订单（新增）
                     is_zero_order = final_amount <= Decimal('0')
 
                     # 判断初始状态和过期时间
                     if is_zero_order:
-                        init_status = "pending_recv"  # 零元订单直接待收货
+                        init_status = "pending_recv"
                         expire_at = None
                     else:
                         init_status = "pending_pay"
@@ -341,10 +353,11 @@ class OrderManager:
                             consignee_name, consignee_phone,
                             province, city, district, shipping_address, delivery_way,
                             pay_way, auto_recv_time, refund_reason, expire_at,
-                            pending_points, pending_coupon_id)
+                            pending_points, pending_coupon_id,
+                            points_discount, coupon_discount)
                         VALUES (%s, %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s, %s, %s,
-                                'wechat', %s, %s, %s, %s, %s)
+                                'wechat', %s, %s, %s, %s, %s, %s, %s)
                     """, (
                         user_id, merchant_id, order_number, final_amount, total, init_status, has_vip,
                         consignee_name, consignee_phone,
@@ -353,7 +366,9 @@ class OrderManager:
                         specifications,
                         expire_at,
                         points_to_use or Decimal('0'),
-                        coupon_id
+                        coupon_id,
+                        points_discount,
+                        coupon_discount
                     ))
                     oid = cur.lastrowid
 
@@ -406,18 +421,6 @@ class OrderManager:
                             coupon_discount=coupon_discount,
                             external_conn=conn
                         )
-
-                    if idempotency_key and redis_client:
-                        used_key = f"order:idempotency:{idempotency_key}"
-                        redis_client.setex(used_key, 86400, order_number)
-
-                    conn.commit()
-                    logger.info(f"订单创建成功: {order_number}, 用户: {user_id}, 商家: {merchant_id}")
-
-                    return {
-                        "order_number": order_number,
-                        "need_pay": not is_zero_order
-                    }
 
                     if idempotency_key and redis_client:
                         used_key = f"order:idempotency:{idempotency_key}"
@@ -580,7 +583,7 @@ class OrderManager:
 
                 cur.execute(
                     """
-                    SELECT oi.*, p.name AS product_name, p.is_member_product, p.cover AS product_cover
+                    SELECT oi.*, p.name AS product_name, p.is_member_product, p.cover AS product_cover, p.cash_only
                     FROM order_items oi
                     LEFT JOIN products p ON oi.product_id = p.id
                     WHERE oi.order_id = %s
@@ -611,6 +614,16 @@ class OrderManager:
                     )
                     merchant_info = cur.fetchone()
 
+                                # ===== 新增：查询待支付优惠券金额 =====
+                pending_coupon_amount = None
+                pending_coupon_id = order.get("pending_coupon_id")
+                if pending_coupon_id:
+                    cur.execute("SELECT amount FROM coupons WHERE id = %s", (pending_coupon_id,))
+                    coupon_row = cur.fetchone()
+                    if coupon_row:
+                        pending_coupon_amount = float(coupon_row["amount"])
+                # ======================================
+
                 address = {
                     "consignee_name": order.get("consignee_name"),
                     "consignee_phone": order.get("consignee_phone"),
@@ -627,6 +640,13 @@ class OrderManager:
                     "address": address,
                     "items": items,
                     "specifications": order.get("refund_reason"),
+                    # ===== 新增返回 pending 字段 =====
+                    "pending_points": float(order.get("pending_points") or 0),
+                    "pending_coupon_id": pending_coupon_id,
+                    "pending_coupon_amount": pending_coupon_amount,
+                    # ===== 方便前端直接读取已抵扣金额 =====
+                    "points_discount": float(order.get("points_discount") or 0),
+                    "coupon_discount": float(order.get("coupon_discount") or 0),
                 }
 
     @staticmethod
@@ -991,6 +1011,18 @@ def create_order(body: OrderCreate):
         "order_number": result["order_number"],
         "need_pay": result.get("need_pay", True)
     }
+
+
+# 兼容旧客户端：/order/pay -> 代理到 /wechat-pay/create-order
+@router.post("/pay", summary="兼容：创建支付参数 (旧路径)")
+async def pay_compat(request: Request):
+    try:
+        # 延迟导入以避免循环依赖
+        from api.wechat_pay import routes as wechat_routes
+
+        return await wechat_routes.create_jsapi_order(request)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/{user_id}", summary="查询用户订单列表")

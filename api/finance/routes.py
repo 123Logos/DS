@@ -290,13 +290,13 @@ async def get_public_welfare_flow(
                 "id": flow['id'],
                 "related_user": flow['related_user'],
                 "user_name": get_user_name(flow['related_user']),
+                "account_type": "public_welfare",  # 新增：明确资金池
                 "change_amount": str(flow['change_amount']),
                 "balance_after": str(flow['balance_after']) if flow['balance_after'] else None,
+                "pre_balance": str(flow['pre_balance']) if flow.get('pre_balance') is not None else None,  # 新增
                 "flow_type": flow['flow_type'],
                 "remark": flow['remark'],
-                "created_at": flow['created_at'].strftime("%Y-%m-%d %H:%M:%S") if isinstance(flow['created_at'],
-                                                                                             datetime) else str(
-                    flow['created_at'])
+                "created_at": flow['created_at']
             } for flow in flows]
         }
         return ResponseModel(success=True, message="查询成功", data=data)
@@ -661,6 +661,44 @@ async def distribute_coupon(
     except Exception as e:
         logger.error(f"发放优惠券失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"发放失败: {str(e)}")
+
+# ==================== 新增请求模型 ====================
+class BatchCouponDistributeRequest(BaseModel):
+    user_ids: List[int] = Field(..., min_items=1, description="用户ID列表")
+    amount: float = Field(..., gt=0, description="优惠券金额")
+    coupon_type: str = Field('user', pattern=r'^(user|merchant)$', description="优惠券类型")
+    applicable_product_type: str = Field('all', pattern=r'^(all|normal_only|member_only)$', description="适用商品范围")
+# =====================================================
+
+# ==================== 新增：批量发放优惠券接口 ====================
+@router.post("/api/coupons/distribute-batch", response_model=ResponseModel, summary="批量发放优惠券")
+async def distribute_coupons_batch(
+    request: BatchCouponDistributeRequest,
+    service: FinanceService = Depends(get_finance_service)
+):
+    """
+    批量给多个用户发放优惠券，发放操作在同一事务中完成。
+    如果某个用户余额不足，将跳过该用户继续发放其他用户，已成功发放的优惠券会生效。
+    返回成功数量、失败用户列表及成功发放的优惠券ID列表。
+    """
+    try:
+        result = service.distribute_coupons_batch(
+            user_ids=request.user_ids,
+            amount=request.amount,
+            coupon_type=request.coupon_type,
+            applicable_product_type=request.applicable_product_type
+        )
+        return ResponseModel(
+            success=True,
+            message=f"成功发放 {result['success_count']} 张优惠券",
+            data=result
+        )
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"批量发放优惠券失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"批量发放失败: {str(e)}")
+# ===========================================================
 
 
 # ==================== 2. 推荐奖励接口 ====================
@@ -1267,17 +1305,18 @@ async def get_transform_logs(
 
 @router.get("/api/fund-pools/transform-allowed", response_model=ResponseModel, summary="获取允许转正的资金池列表")
 async def get_transform_allowed_pools():
+    """
+    获取所有支持「转正」操作的资金池类型及其名称。
+    """
     allowed = [
         {"type": "public_welfare", "name": "公益基金"},
         {"type": "maintain_pool", "name": "维护池"},
-        {"type": "subsidy_pool", "name": "补贴池"},
-        {"type": "director_pool", "name": "联创奖励池"},
         {"type": "shop_pool", "name": "店铺池"},
         {"type": "city_pool", "name": "城市池"},
         {"type": "branch_pool", "name": "分支池"},
         {"type": "fund_pool", "name": "资金池"},
     ]
-    return ResponseModel(success=True, data=allowed)
+    return ResponseModel(success=True, message="获取成功", data={"pools": allowed})
 
 def register_finance_routes(app: FastAPI):
     """注册财务管理系统路由到主应用"""

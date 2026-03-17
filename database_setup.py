@@ -123,6 +123,11 @@ class DatabaseManager:
                     freight DECIMAL(12,2) DEFAULT 0.00,
                     -- ✅ 新增字段：积分抵扣上限（支持小数，精确到4位）
                     max_points_discount DECIMAL(12,6) DEFAULT NULL COMMENT '积分抵扣上限',
+                    reward_rain DECIMAL(12,6) NOT NULL DEFAULT 0 COMMENT '购买后赠送的雨点数量（true_total_points）',
+                    reward_points DECIMAL(12,6) NOT NULL DEFAULT 0 COMMENT '购买后赠送的积分数量（member_points）',
+                    is_virtual TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否为虚拟商品（1=是，无需物流）',
+                    cash_only TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否只能用现金支付（禁止积分和优惠券）',
+                    is_home_recommend TINYINT(1) NOT NULL DEFAULT 0 COMMENT '首页推荐标志：1-推荐，0-不推荐',
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_is_member_product (is_member_product),
@@ -242,6 +247,16 @@ class DatabaseManager:
                     INDEX idx_trans     (transaction_id)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """,
+            'regions': """
+                        CREATE TABLE IF NOT EXISTS regions (
+                            code VARCHAR(20) PRIMARY KEY COMMENT '行政区划代码',
+                            name VARCHAR(100) NOT NULL COMMENT '名称',
+                            parent_code VARCHAR(20) DEFAULT NULL COMMENT '父级代码',
+                            level TINYINT NOT NULL COMMENT '级别: 1省/2市/3区',
+                            INDEX idx_parent (parent_code),
+                            INDEX idx_level (level)
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                    """,
             'order_items': """
                 CREATE TABLE IF NOT EXISTS order_items (
                     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -839,6 +854,8 @@ class DatabaseManager:
                 'pending_coupon_id': 'pending_coupon_id BIGINT UNSIGNED DEFAULT NULL COMMENT \'下单时选择的优惠券ID（支付前临时存储）\'',
                 'coupon_discount': 'coupon_discount DECIMAL(12,4) NOT NULL DEFAULT 0.0000 COMMENT \'优惠券抵扣金额（支付后写入）\'',
                 'original_amount': 'original_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT \'订单原始金额（优惠前）\'',
+                # ⬇️ 新增字段
+                'refund_no': 'refund_no VARCHAR(64) DEFAULT NULL COMMENT "商户退款单号"',
             },
             'order_items': {
                 'sku_id': 'sku_id BIGINT UNSIGNED NULL',
@@ -864,6 +881,11 @@ class DatabaseManager:
             },
             'products': {
                 'cover': "cover VARCHAR(500) NULL COMMENT '商品封面图'",
+                'is_home_recommend': "is_home_recommend TINYINT(1) NOT NULL DEFAULT 0 COMMENT '首页推荐标志：1-推荐，0-不推荐'",   # ✅ 新增
+                'reward_rain': "reward_rain DECIMAL(12,6) NOT NULL DEFAULT 0 COMMENT '购买后赠送的雨点数量（true_total_points）'",
+                'reward_points': "reward_points DECIMAL(12,6) NOT NULL DEFAULT 0 COMMENT '购买后赠送的积分数量（member_points）'",
+                'is_virtual': "is_virtual TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否为虚拟商品（1=是，无需物流）'",
+                'cash_only': "cash_only TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否只能用现金支付（禁止积分和优惠券）'",
             },
             'wx_applyment': {
                 'is_timeout_alerted': "is_timeout_alerted TINYINT(1) NOT NULL DEFAULT 0 COMMENT '审核超时提醒是否已发送'",
@@ -1706,24 +1728,3 @@ def start_background_tasks():
     """启动后台任务"""
     from core.scheduler import scheduler
     scheduler.start()
-
-
-# 在 initialize_database 函数后调用
-def initialize_database():
-    """初始化数据库表结构（如果尚未创建）"""
-    print("正在检查数据库表结构...")
-    create_database()
-
-    cfg = get_db_config()
-    conn = pymysql.connect(**cfg, cursorclass=pymysql.cursors.DictCursor)
-    try:
-        with conn.cursor() as cursor:
-            db_manager = DatabaseManager()
-            db_manager.init_all_tables(cursor)
-        conn.commit()
-    finally:
-        conn.close()
-
-    print("数据库表结构初始化完成。")
-    print("启动后台任务...")
-    start_background_tasks()

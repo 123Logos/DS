@@ -145,6 +145,13 @@ app.openapi_tags = tags_metadata
 # 按优先级先挂载 avatars（用户头像），再挂载 /pic 到商品图片目录
 app.mount("/pic/avatars", StaticFiles(directory=str(AVATAR_UPLOAD_DIR)), name="avatars")
 app.mount("/pic", StaticFiles(directory=str(PIC_PATH)), name="pic")
+
+# 挂载一个专用的 ``/offline`` 静态目录
+# 用于放置微信小程序域名/支付二维码验证文件，外部普通二维码也可指向该路径。
+offline_static_dir = Path("offline")
+offline_static_dir.mkdir(exist_ok=True)
+app.mount("/offline", StaticFiles(directory=str(offline_static_dir)), name="offline_static")
+
 # 添加 CORS 中间件和静态文件（统一配置）pic_path
 setup_cors(app)
 setup_static_files(app)

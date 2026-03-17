@@ -1055,6 +1055,44 @@ class WeChatPayClient:
             'applyment_state_msg': data.get('applyment_state_msg', '')
         }
 
+    # ==================== 退款方法（调用微信支付V3退款接口） ====================
+    def refund(self, transaction_id: str, out_refund_no: str, total_fee: int, refund_fee: int,
+               notify_url: Optional[str] = None) -> Dict[str, Any]:
+        """
+        申请退款（支持部分退款）
+        :param transaction_id: 微信支付订单号
+        :param out_refund_no: 商户退款单号（需唯一）
+        :param total_fee: 原订单总金额（分）
+        :param refund_fee: 退款金额（分）
+        :param notify_url: 退款结果回调地址（可选）
+        :return: 微信退款接口返回的 JSON 数据
+        """
+        url_path = '/v3/refund/domestic/refunds'
+        full_url = f"{self.BASE_URL}{url_path}"
+        body = {
+            "transaction_id": transaction_id,
+            "out_refund_no": out_refund_no,
+            "amount": {
+                "refund": refund_fee,
+                "total": total_fee,
+                "currency": "CNY"
+            }
+        }
+        if notify_url:
+            body["notify_url"] = notify_url
+
+        body_str = json.dumps(body, ensure_ascii=False)
+        headers = {
+            'Authorization': self._build_auth_header('POST', url_path, body_str),
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'Wechatpay-Serial': self._get_merchant_serial_no()
+        }
+        response = self.session.post(full_url, data=body_str.encode('utf-8'), headers=headers, timeout=15)
+        response.raise_for_status()
+        return response.json()
+
+
     # ==================== 本地加密解密工具 ====================
 
     @staticmethod
