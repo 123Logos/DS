@@ -8,8 +8,6 @@ from core.database import get_conn
 from core.wx_pay_client import WeChatPayClient
 import logging
 from datetime import datetime, timedelta
-import pytz
-import os
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -24,34 +22,12 @@ class TaskScheduler:
         self.lock_file = None  # 新增：锁文件句柄
 
     def start(self):
-        """启动所有定时任务（增强版：自动清理僵尸锁，显式时区）"""
-        logger.info("scheduler.start() 被调用，开始启动定时任务")
+        """启动所有定时任务（带进程间锁）"""
+        # ========== 新增：尝试获取文件锁 ==========
         lock_file_path = "/tmp/scheduler.lock"
-
-        # ========== 新增：清理可能残留的锁文件 ==========
         try:
-            # 如果锁文件存在，检查对应进程是否存活
-            if os.path.exists(lock_file_path):
-                try:
-                    with open(lock_file_path, 'r') as f:
-                        pid_str = f.read().strip()
-                    if not pid_str or not pid_str.isdigit():
-                        # 文件为空或不是数字，直接删除
-                        os.remove(lock_file_path)
-                        logger.info(f"删除无效锁文件: {lock_file_path}")
-                    else:
-                        os.kill(int(pid_str), 0)  # 存在则检查
-                except (OSError, ProcessLookupError):
-                    os.remove(lock_file_path)
-                    logger.info(f"清理僵尸锁文件: {lock_file_path} (进程 {pid_str} 已不存在)")
-            # ============================================
-
             self.lock_file = open(lock_file_path, "w")
-            # 写入当前进程PID，便于后续清理
-            self.lock_file.write(str(os.getpid()))
-            self.lock_file.flush()
             fcntl.flock(self.lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            logger.info("成功获取调度器锁，PID=%s", os.getpid())
         except BlockingIOError:
             logger.info("另一个进程已持有调度器锁，本进程跳过启动定时任务")
             self.lock_file = None
@@ -59,37 +35,29 @@ class TaskScheduler:
         except Exception as e:
             logger.error(f"获取调度器锁失败: {e}，将继续启动（可能导致重复）")
             self.lock_file = None
-
-        # ========== 新增：显式指定时区 ==========
-        from apscheduler.triggers.cron import CronTrigger
-        # 使用上海时区，如果pytz未安装则回退到UTC（可修改）
-        try:
-            tz = pytz.timezone('Asia/Shanghai')
-        except Exception:
-            tz = None
-            logger.warning("pytz未安装或时区不可用，使用系统默认时区")
         # ========================================
 
         # 每天凌晨4点清理过期草稿
         self.scheduler.add_job(
             self.clean_expired_drafts,
-            CronTrigger(hour=4, minute=0, timezone=tz),  # 增加timezone参数
+            CronTrigger(hour=4, minute=0),
             id="clean_expired_drafts",
             replace_existing=True
         )
 
-        # 每天凌晨2点同步微信订单状态
+        # ===== 新增：每天凌晨2点同步微信订单状态 =====
         self.scheduler.add_job(
             self.sync_wechat_order_status,
-            CronTrigger(hour=2, minute=0, timezone=tz),
+            CronTrigger(hour=2, minute=0),
             id="sync_wechat_order_status",
             replace_existing=True
         )
+        # ===========================================
 
         # 每10分钟轮询审核中的进件状态
         self.scheduler.add_job(
             self.poll_applyment_status,
-            CronTrigger(minute="*/10", timezone=tz),
+            CronTrigger(minute="*/10"),
             id="poll_applyment_status",
             replace_existing=True
         )
@@ -97,7 +65,7 @@ class TaskScheduler:
         # 每天9点检查审核超时（超过2个工作日）
         self.scheduler.add_job(
             self.check_audit_timeout,
-            CronTrigger(hour=9, minute=0, timezone=tz),
+            CronTrigger(hour=9, minute=0),
             id="check_audit_timeout",
             replace_existing=True
         )
@@ -105,17 +73,17 @@ class TaskScheduler:
         # 每天零点自动发放日补贴
         self.scheduler.add_job(
             self.auto_distribute_daily_subsidy,
-            CronTrigger(hour=0, minute=0, timezone=tz),  # 新增时区
+            CronTrigger(hour=0, minute=0),  # 请根据实际需要调整时间
             id="daily_subsidy_auto",
             replace_existing=True,
             misfire_grace_time=3600,
-            coalesce=True
+            coalesce=True  # 新增：合并错过的执行
         )
 
         # 每月1日零点自动发放联创分红
         self.scheduler.add_job(
             self.auto_distribute_unilevel_dividend,
-            CronTrigger(day=1, hour=0, minute=0, timezone=tz),
+            CronTrigger(day=1, hour=0, minute=0),
             id="monthly_unilevel_auto",
             replace_existing=True,
             misfire_grace_time=3600
@@ -124,7 +92,7 @@ class TaskScheduler:
         # 每小时清理过期银行卡验证码
         self.scheduler.add_job(
             self.clean_expired_bankcard_codes,
-            CronTrigger(hour="*", minute=30, timezone=tz),
+            CronTrigger(hour="*", minute=30),
             id="clean_expired_bankcard_codes",
             replace_existing=True
         )
@@ -178,16 +146,13 @@ class TaskScheduler:
         """关闭定时任务，并释放锁"""
         if hasattr(self, 'scheduler') and self.scheduler.running:
             self.scheduler.shutdown()
+        # ========== 新增：释放文件锁 ==========
         if self.lock_file:
             try:
                 fcntl.flock(self.lock_file, fcntl.LOCK_UN)
                 self.lock_file.close()
-                # 删除锁文件前检查是否存在
-                if os.path.exists(self.lock_file.name):
-                    os.remove(self.lock_file.name)
             except Exception as e:
                 logger.warning(f"释放调度器锁时出错: {e}")
-            self.lock_file = None
         logger.info("定时任务管理器已关闭")
 
     # ==================== 原有方法完整保留 ====================
