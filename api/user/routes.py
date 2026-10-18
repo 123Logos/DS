@@ -22,6 +22,8 @@ from services.points_service import add_points
 from services.reward_service import TeamRewardService
 from services.director_service import DirectorService
 from services.wechat_service import WechatService
+from services.wechat_api import require_safe_text
+from starlette.concurrency import run_in_threadpool
 from core.table_access import build_select_list
 from typing import List
 
@@ -136,6 +138,8 @@ def user_auth(body: AuthReq):
                 name = row["name"]
             else:
                 # 新用户：自动注册
+                if body.name is not None:
+                    raise HTTPException(status_code=400, detail="自定义昵称请通过微信登录或登录后的资料审核接口设置")
                 try:
                     user_id = UserService.register(
                         mobile=body.mobile,
@@ -162,19 +166,27 @@ def user_auth(body: AuthReq):
             )
 
 @router.post("/user/update-profile", summary="修改资料（动态字段/兼容老库）")
-def update_profile(body: UpdateProfileReq):
+async def update_profile(body: UpdateProfileReq, user: dict = Depends(get_current_user)):
+    if body.mobile != user.get("mobile"):
+        raise HTTPException(status_code=403, detail="只能修改本人资料")
     if body.avatar_path is not None:
         raise HTTPException(status_code=400, detail="头像必须通过头像审核上传接口修改")
+    if body.name is not None:
+        await require_safe_text(body.name, openid=user.get("openid") or "", scene=1)
+    return await run_in_threadpool(_update_profile, body, user["id"])
+
+
+def _update_profile(body: UpdateProfileReq, authenticated_user_id: int):
     with get_conn() as conn:
         with conn.cursor() as cur:
             # 1. 取用户 id & 当前密码哈希
             select_sql = build_dynamic_select(
                 cur,
                 "users",
-                where_clause="mobile=%s",
+                where_clause="id=%s",
                 select_fields=["id", "password_hash"]
             )
-            cur.execute(select_sql, (body.mobile,))
+            cur.execute(select_sql, (authenticated_user_id,))
             u = cur.fetchone()
             if not u:
                 raise HTTPException(status_code=404, detail="用户不存在")
@@ -1277,6 +1289,8 @@ async def wechat_login(request: Request):
 
     if not code or not nick_name:
         raise HTTPException(status_code=400, detail="缺少参数")
+    if not isinstance(nick_name, str) or not nick_name.strip() or len(nick_name) > 100:
+        raise HTTPException(status_code=400, detail="昵称必须为1至100字的非空白文本")
 
     try:
         # 调用微信接口，通过 code 换取 openid（及服务端用的 session_key，可选 unionid）
@@ -1298,6 +1312,7 @@ async def wechat_login(request: Request):
 
         if not user:
             # 注册新用户
+            await require_safe_text(nick_name, openid=openid, scene=1)
             user_id = WechatService.register_user(openid, nick_name)
             level = 0
             is_new_user = True

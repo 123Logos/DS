@@ -316,20 +316,51 @@ async def get_or_create_permanent_pay_openlink(merchant_user_id: int) -> str:
 
 
 # ---------- 内容安全检测（msgSecCheck） ----------
-async def msg_sec_check(content: str, *, scene: int = 1, openid: str | None = None) -> dict:
-    """调用微信内容安全检测 msgSecCheck（version 2）。
-
-    :param content: 待检测文本内容
-    :param scene: 场景值：1=资料, 2=评论, 3=论坛, 4=社交日志
-    :param openid: 用户 openid（version 2 要求，建议传入）
-    :return: 微信原始响应 dict，包含 errcode / errmsg
-    """
+async def msg_sec_check(content: str, *, scene: int = 1, openid: str) -> dict:
+    """调用微信 v2；openid 必须来自服务端认证身份，文本上限 2500 字。"""
+    if not isinstance(content, str) or not content.strip() or len(content) > 2500:
+        raise ValueError("文本必须为非空字符串且不超过2500字")
+    if type(scene) is not int or scene not in (1, 2, 3, 4):
+        raise ValueError("无效的内容安全场景")
+    if not isinstance(openid, str) or not openid.strip():
+        raise ValueError("缺少微信用户 openid")
     token = await get_access_token()
     url = f"https://api.weixin.qq.com/wxa/msg_sec_check?access_token={token}"
-    body: dict = {"content": content, "version": 2, "scene": scene}
-    if openid:
-        body["openid"] = openid
+    body = {"content": content, "version": 2, "scene": scene, "openid": openid}
     async with httpx.AsyncClient() as cli:
         resp = await cli.post(url, json=body, timeout=10)
         resp.raise_for_status()
         return resp.json()
+
+
+async def check_text_security(content: str, *, openid: str, scene: int = 1) -> str:
+    """统一判定：只有 v2 明确 pass 才允许写入；未知结果视为不可用。"""
+    if not openid:
+        return "unavailable"
+    try:
+        data = await msg_sec_check(content, openid=openid, scene=scene)
+    except Exception as exc:
+        # HTTP 异常包含带 access_token 的 URL，禁止记录异常正文或 traceback。
+        logger.warning("文本审核调用失败: type=%s", type(exc).__name__)
+        return "unavailable"
+    if not isinstance(data, dict) or type(data.get("errcode")) is not int:
+        return "unavailable"
+    if data["errcode"] == 87014:
+        return "risky"
+    if data["errcode"] != 0:
+        logger.warning("文本审核上游错误: errcode=%s", data["errcode"])
+        return "unavailable"
+    result = data.get("result")
+    suggest = result.get("suggest") if isinstance(result, dict) else None
+    return suggest if suggest in ("pass", "risky", "review") else "unavailable"
+
+
+async def require_safe_text(content: str, *, openid: str, scene: int = 1) -> None:
+    """写入端必须独立审核，不能信任客户端曾调用预检的声明。"""
+    from fastapi import HTTPException
+
+    decision = await check_text_security(content, openid=openid, scene=scene)
+    if decision == "unavailable":
+        raise HTTPException(status_code=503, detail="内容审核暂不可用，请稍后重试")
+    if decision != "pass":
+        raise HTTPException(status_code=400, detail="内容未通过安全审核，请修改后重试")

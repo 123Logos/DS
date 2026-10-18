@@ -1,6 +1,6 @@
 # models/schemas/user.py - 用户系统 Pydantic 模型
 from fastapi import Query
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 from typing import Optional
 from core.config import UserStatus
 from datetime import datetime
@@ -83,7 +83,7 @@ class AuthReq(BaseModel):
     """认证请求"""
     mobile: str
     password: str
-    name: Optional[str] = None
+    name: Optional[str] = Field(None, description="旧字段；新用户注册禁止提供自定义昵称，请走微信登录后的资料审核")
 
 
 class AuthResp(BaseModel):
@@ -113,10 +113,17 @@ class UserInfoResp(BaseModel):
 class UpdateProfileReq(BaseModel):
     """更新资料请求"""
     mobile: str
-    name: Optional[str] = None
+    name: Optional[str] = Field(None, min_length=1, max_length=100, description="昵称；提供时需经微信文本审核")
     avatar_path: Optional[str] = None
     old_password: Optional[str] = None
     new_password: Optional[str] = None
+
+    @field_validator("name")
+    @classmethod
+    def nonblank_name(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and not value.strip():
+            raise ValueError("昵称不能为空白")
+        return value
 
 
 class ResetPwdReq(BaseModel):

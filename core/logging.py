@@ -4,6 +4,7 @@ RotatingFileHandler + 可选请求关联 ID
 """
 import logging
 import os
+import re
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -18,6 +19,12 @@ LOG_FILE_ABS = LOG_FILE.resolve() if not LOG_FILE.is_absolute() else LOG_FILE
 class RequestIdFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         rid = get_request_id()
+        # httpx 的 INFO 请求日志和 HTTPError 都可能带微信 access_token。
+        message = record.getMessage()
+        redacted = re.sub(r"([?&]access_token=)[^\s&\"'<>]+", r"\1[REDACTED]", message)
+        if redacted != message:
+            record.msg = redacted
+            record.args = ()
         record.request_id = rid if rid else "-"
         return True
 

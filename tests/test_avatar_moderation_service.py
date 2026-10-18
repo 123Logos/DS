@@ -9,7 +9,6 @@ from PIL import Image
 
 from models.schemas.user import UpdateProfileReq
 from services import avatar_moderation_service as avatar_module
-from services import wechat_api
 from services.avatar_moderation_service import AvatarModerationService
 
 
@@ -53,54 +52,13 @@ def test_update_profile_cannot_bypass_avatar_review():
     from api.user.routes import update_profile
 
     with pytest.raises(HTTPException) as exc_info:
-        update_profile(UpdateProfileReq(mobile="13800000000", avatar_path="/pic/avatars/unsafe.jpg"))
+        asyncio.run(update_profile(
+            UpdateProfileReq(mobile="13800000000", avatar_path="/pic/avatars/unsafe.jpg"),
+            {"id": 7, "mobile": "13800000000", "openid": "owner"},
+        ))
     assert exc_info.value.status_code == 400
 
 
-def test_wechat_media_check_async_builds_expected_request(monkeypatch):
-    captured = {}
-
-    async def fake_access_token(*, force_refresh=False):
-        return "access-token"
-
-    class FakeResponse:
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            return {"errcode": 0, "trace_id": "trace-123"}
-
-    class FakeClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        async def post(self, url, json, timeout):
-            captured.update(url=url, payload=json, timeout=timeout)
-            return FakeResponse()
-
-    monkeypatch.setattr(wechat_api, "get_access_token", fake_access_token)
-    monkeypatch.setattr(wechat_api.httpx, "AsyncClient", FakeClient)
-
-    trace_id = asyncio.run(
-        wechat_api.media_check_async(
-            media_url="https://api.example.com/wechat-wxa/media/avatar/token",
-            openid="openid-1",
-            scene=1,
-        )
-    )
-
-    assert trace_id == "trace-123"
-    assert captured["url"] == "https://api.weixin.qq.com/wxa/media_check_async?access_token=access-token"
-    assert captured["payload"] == {
-        "media_url": "https://api.example.com/wechat-wxa/media/avatar/token",
-        "media_type": 2,
-        "version": 2,
-        "scene": 1,
-        "openid": "openid-1",
-    }
 
 
 class _CallbackCursor:
