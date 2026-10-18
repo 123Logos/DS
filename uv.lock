@@ -296,6 +296,15 @@ wheels = [
 ]
 
 [[package]]
+name = "dbutils"
+version = "3.2.0"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/1f/92/dd56acef02f17cffdf1f332a5fd4486b34dec7896973156d5b5903eacda6/dbutils-3.2.0.tar.gz", hash = "sha256:dfe3f5eb6e383042d68ad07e4e9778b2abbcc4627a283f85efc8210319c075d2" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/51/08/7b88774c4af482423684157374a90df8e0f54b04b63787c62fe45776f6f7/dbutils-3.2.0-py3-none-any.whl", hash = "sha256:5b512edbff29697d118359c1a7a48ce9f93b9b6e4ecebad25396b987b4bce947" },
+]
+
+[[package]]
 name = "et-xmlfile"
 version = "2.0.0"
 source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
@@ -761,6 +770,7 @@ dependencies = [
     { name = "bcrypt" },
     { name = "crypto" },
     { name = "cryptography" },
+    { name = "dbutils" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "openpyxl" },
@@ -792,6 +802,7 @@ requires-dist = [
     { name = "bcrypt", specifier = ">=4.2.0" },
     { name = "crypto", specifier = ">=1.4.1" },
     { name = "cryptography", specifier = ">=46.0.3" },
+    { name = "dbutils", specifier = ">=3.1.0" },
     { name = "fastapi", specifier = ">=0.123.9" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "openpyxl", specifier = ">=3.1.5" },

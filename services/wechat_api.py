@@ -313,3 +313,23 @@ async def get_or_create_permanent_pay_openlink(merchant_user_id: int) -> str:
     with _scheme_memo_lock:
         _scheme_memo[cache_key] = (link, now)
     return link
+
+
+# ---------- 内容安全检测（msgSecCheck） ----------
+async def msg_sec_check(content: str, *, scene: int = 1, openid: str | None = None) -> dict:
+    """调用微信内容安全检测 msgSecCheck（version 2）。
+
+    :param content: 待检测文本内容
+    :param scene: 场景值：1=资料, 2=评论, 3=论坛, 4=社交日志
+    :param openid: 用户 openid（version 2 要求，建议传入）
+    :return: 微信原始响应 dict，包含 errcode / errmsg
+    """
+    token = await get_access_token()
+    url = f"https://api.weixin.qq.com/wxa/msg_sec_check?access_token={token}"
+    body: dict = {"content": content, "version": 2, "scene": scene}
+    if openid:
+        body["openid"] = openid
+    async with httpx.AsyncClient() as cli:
+        resp = await cli.post(url, json=body, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
