@@ -6,7 +6,7 @@ import os
 from dotenv import load_dotenv
 from pathlib import Path
 from urllib.parse import urlparse
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 加载环境变量
@@ -82,6 +82,10 @@ class Settings(BaseSettings):
     WECHAT_WXA_ENV_VERSION: str = "release"
     # 小程序「开发 - 开发管理 - 消息推送」服务器配置中的 Token（明文模式校验 URL 用）
     WECHAT_WXA_MSG_TOKEN: str = ""
+    # 用户头像内容安全审核。生产环境应保持开启，并配置公网 HOST。
+    WECHAT_CONTENT_SECURITY_ENABLED: bool = True
+    WECHAT_CONTENT_SECURITY_SCENE: int = 1
+    AVATAR_REVIEW_TTL_MINUTES: int = Field(default=60, ge=1, le=1440)
 
     # ==================== 微信支付服务商配置（新增）====================
     WECHAT_PAY_SP_MCH_ID: str = ""  # 服务商商户号（平台作为服务商时使用）
@@ -143,8 +147,44 @@ class Settings(BaseSettings):
     # 生产环境必填；开发/测试若留空则使用 core.middleware 内置的本地默认列表
     CORS_ALLOW_ORIGINS: str = ""
 
+    # 财务敏感接口管理口令（Query: admin_key=）；生产环境必填
+    ADMIN_API_KEY: SecretStr = SecretStr("")
+    # 允许通过 Bearer Token 操作财务敏感接口的用户 ID，逗号分隔，如 1,26
+    ADMIN_USER_IDS: str = "1"
+
+    # 生产环境 /docs、/openapi.json、/redoc 允许访问的 IP/CIDR，逗号分隔；留空则仅本机
+    DOCS_ALLOW_IPS: str = ""
+    # 全局拒绝访问的 IP，逗号分隔
+    IP_BLOCKLIST: str = "89.117.53.228"
+    # 财务敏感 POST 接口每 IP 每分钟最大请求数
+    FINANCE_ADMIN_RATE_LIMIT_PER_MIN: int = 5
+
 # 实例化设置
 settings = Settings()
+
+
+def parse_csv_ids(raw: str) -> frozenset[int]:
+    ids: set[int] = set()
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if part.isdigit():
+            ids.add(int(part))
+    return frozenset(ids)
+
+
+def parse_csv_strings(raw: str) -> tuple[str, ...]:
+    return tuple(x.strip() for x in (raw or "").split(",") if x.strip())
+
+
+def get_admin_api_key() -> str:
+    """管理口令；开发环境未配置时回退 admin2025（与 user 路由一致）。"""
+    key = settings.ADMIN_API_KEY.get_secret_value().strip()
+    if key:
+        return key
+    env = (settings.ENVIRONMENT or "").lower()
+    if env in ("production", "prod"):
+        return ""
+    return "admin2025"
 
 # ==================== JWT配置 ====================
 JWT_SECRET_KEY: Final[str] = settings.JWT_SECRET_KEY.get_secret_value()
@@ -210,6 +250,8 @@ MAX_POINTS_VALUE: Final[Decimal] = Decimal('0.005')    # 正确：0.5%
 TAX_RATE: Final[Decimal] = Decimal('0.06')
 POINTS_DISCOUNT_RATE: Final[Decimal] = Decimal('1.0')
 COUPON_VALID_DAYS: Final[int] = 30
+RAIN_POINT_COUPON_BASE: Final[Decimal] = Decimal('330')
+RAIN_POINT_MONTHLY_COUPON: Final[Decimal] = Decimal('30')
 MAX_PURCHASE_PER_DAY: Final[int] = 2
 MAX_TEAM_LAYER: Final[int] = 10
 
@@ -231,6 +273,8 @@ class UnilevelLevel(IntEnum):
 BASE_PIC_DIR: Final[Path] = Path(__file__).resolve().parent.parent / "user_pic"
 AVATAR_UPLOAD_DIR: Final[Path] = BASE_PIC_DIR / "avatars"
 AVATAR_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+AVATAR_PENDING_DIR: Final[Path] = BASE_PIC_DIR / "avatar_pending"
+AVATAR_PENDING_DIR.mkdir(parents=True, exist_ok=True)
 # ==================== 奖励类型 ====================
 class RewardType(StrEnum):
     REFERRAL = 'referral'

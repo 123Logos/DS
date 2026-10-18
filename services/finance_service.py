@@ -36,6 +36,7 @@ from services.finance.discount_helpers import (
     parse_offline_coupon_ids,
     parse_pending_coupon_ids,
 )
+from services.finance.rain_point_policy import calculate_conversion
 
 logger = get_logger(__name__)
 
@@ -988,7 +989,7 @@ class FinanceService:
         """
         创建推荐和团队奖励（严格层级版）
 
-        核心修复：
+        核心规则：
         1. 团队奖励必须由≥目标层级的用户获得（L2奖励只能由L2+用户获得）
         2. 如果第N层用户不满足星级，则向上寻找该层的"替代者"
         3. 防止低层级用户获得高层级奖励（如L1用户拿L2奖励）
@@ -996,6 +997,7 @@ class FinanceService:
         业务规则：
         - 推荐奖励：仅首次购买（0星→1星）且直接推荐人≥1星时发放
         - 团队奖励：只为新达到的层级发放，必须由≥目标层级的用户获得
+        - 推荐奖励和团队奖励可同时发放，互不影响
         """
         logger.info(f"开始发放奖励: 订单#{order_id}, 购买者={buyer_id}({old_level}→{new_level}星)")
 
@@ -1013,7 +1015,6 @@ class FinanceService:
         # ===================================================
 
         total_distributed = Decimal('0')
-        referral_paid = False  # 防止推荐奖励和团队奖励同时触发
 
         # 1. 推荐奖励（首次购买 + 推荐人必须是星级会员）
         if old_level == 0:  # 只有0星升1星时才发推荐奖励
@@ -1062,18 +1063,11 @@ class FinanceService:
 
                     logger.info(f"推荐奖励发放: 用户{referrer['referrer_id']}({referrer_level}星) +{reward_amount:.2f}")
                     total_distributed += reward_amount
-                    referral_paid = True
                 else:
                     logger.debug(f"推荐人{referrer['referrer_id']}不是星级会员({referrer_level}星)，不发放推荐奖励")
             else:
                 logger.debug("购买者无推荐人，跳过推荐奖励")
 
-        # 2. 团队奖励（只为新达到的层级发放；0→1 也发放），且不与推荐奖励同发
-        if referral_paid:
-            logger.debug("已发放推荐奖励，本次跳过团队奖励")
-            return
-
-        # 继续判断是否提升等级
         # 2. 团队奖励（只为新达到的层级发放；0→1 也发放）
         if new_level <= old_level:
             logger.debug("等级未提升，不产生团队奖励")
@@ -1540,10 +1534,30 @@ class FinanceService:
             return False
 
     # ==================== 补贴发放 ====================
-    def distribute_daily_subsidy(self) -> bool:
+    def _daily_subsidy_already_distributed(self, today) -> bool:
+        """检查当日是否已执行过日补贴（会员积分批次）。"""
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1 FROM weekly_subsidy_records
+                    WHERE week_start = %s AND remark LIKE %s
+                    LIMIT 1
+                    """,
+                    (today, "日补贴（每日可分配%"),
+                )
+                return cur.fetchone() is not None
+
+    def distribute_daily_subsidy(self, force: bool = False) -> bool:
         """
         发放日补贴（每日可分配金额 = 补贴池余额 × 日补贴比例）
+        force=True 时跳过当日防重复（仅管理员手动强制发放时使用）。
         """
+        today = datetime.now().date()
+        if not force and self._daily_subsidy_already_distributed(today):
+            logger.warning("日补贴发放跳过：今日 %s 已发放过", today)
+            raise FinanceException(f"今日({today})日补贴已发放，请勿重复执行")
+
         logger.info("日补贴发放开始（每日可分配金额 = 补贴池余额 × 日比例）")
 
         pool_balance = self.get_account_balance('subsidy_pool')
@@ -1606,7 +1620,6 @@ class FinanceService:
 
         total_distributed = Decimal('0')
         total_points_deducted = Decimal('0')
-        today = datetime.now().date()
 
         try:
             with get_conn() as conn:
@@ -2805,7 +2818,7 @@ class FinanceService:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT id, user_id, amount FROM coupons
+                    SELECT id, user_id, amount, rain_settlement_id FROM coupons
                     WHERE status = %s AND valid_to < %s
                     ORDER BY id
                     """,
@@ -2826,11 +2839,12 @@ class FinanceService:
                     if cur.rowcount == 0:
                         continue
                     if amt > 0:
+                        destination_pool = 'director_pool' if r.get('rain_settlement_id') else 'subsidy_pool'
                         self._add_pool_balance(
                             cur,
-                            'subsidy_pool',
+                            destination_pool,
                             amt,
-                            f"优惠券#{cid}过期未使用，面额归入补贴池",
+                            f"优惠券#{cid}过期未使用，面额归入{destination_pool}",
                             related_user=uid,
                         )
                         cur.execute(
@@ -2854,6 +2868,89 @@ class FinanceService:
             total_amount,
         )
         return {"processed": processed, "total_amount": float(total_amount)}
+
+    def settle_monthly_rain_points(self, settlement_period: Optional[str] = None) -> Dict[str, Any]:
+        """Convert each member's rain-point balance once per month."""
+        from calendar import monthrange
+
+        period = settlement_period or datetime.now().strftime('%Y-%m')
+        try:
+            period_date = datetime.strptime(period, '%Y-%m').date()
+        except ValueError as exc:
+            raise FinanceException("settlement_period must use YYYY-MM") from exc
+        period_end = period_date.replace(day=monthrange(period_date.year, period_date.month)[1])
+
+        processed = 0
+        skipped = 0
+        total_converted = Decimal('0')
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM users WHERE status = 1 ORDER BY id")
+                for row in cur.fetchall() or []:
+                    user_id = int(row['id'])
+                    cur.execute(
+                        "SELECT id, true_total_points FROM users WHERE id = %s FOR UPDATE",
+                        (user_id,),
+                    )
+                    user = cur.fetchone()
+                    if not user:
+                        continue
+                    cur.execute(
+                        "SELECT id FROM rain_point_monthly_settlements WHERE user_id = %s AND settlement_period = %s",
+                        (user_id, period),
+                    )
+                    if cur.fetchone():
+                        skipped += 1
+                        continue
+
+                    balance = Decimal(str(user['true_total_points'] or 0))
+                    amount, mode = calculate_conversion(balance)
+
+                    cur.execute(
+                        """INSERT INTO rain_point_monthly_settlements
+                           (user_id, settlement_period, conversion_mode, rain_points_before, converted_amount)
+                           VALUES (%s, %s, %s, %s, %s)""",
+                        (user_id, period, mode, balance, amount),
+                    )
+                    settlement_id = cur.lastrowid
+                    if amount <= 0:
+                        processed += 1
+                        continue
+
+                    new_balance = balance - amount
+                    cur.execute(
+                        "UPDATE users SET true_total_points = %s WHERE id = %s",
+                        (new_balance, user_id),
+                    )
+                    cur.execute(
+                        """INSERT INTO coupons
+                           (user_id, coupon_type, amount, applicable_product_type, valid_from, valid_to,
+                            status, rain_settlement_id)
+                           VALUES (%s, 'user', %s, 'all', %s, %s, 'unused', %s)""",
+                        (user_id, amount, period_date, period_end, settlement_id),
+                    )
+                    coupon_id = cur.lastrowid
+                    cur.execute(
+                        "UPDATE rain_point_monthly_settlements SET coupon_id = %s WHERE id = %s",
+                        (coupon_id, settlement_id),
+                    )
+                    cur.execute(
+                        """INSERT INTO account_flow
+                           (account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
+                           VALUES ('true_total_points', %s, %s, %s, 'expense', %s, NOW())""",
+                        (user_id, -amount, new_balance,
+                         f"rain point monthly conversion: {period}/{mode}/coupon={coupon_id}"),
+                    )
+                    processed += 1
+                    total_converted += amount
+                conn.commit()
+
+        return {
+            'settlement_period': period,
+            'processed': processed,
+            'skipped': skipped,
+            'total_converted': float(total_converted),
+        }
 
     # ----------------------------------
     # 供线下模块调用的快捷接口

@@ -109,12 +109,30 @@ class TaskScheduler:
             misfire_grace_time=3600
         )
 
+        self.scheduler.add_job(
+            self.settle_monthly_rain_points,
+            CronTrigger(day=1, hour=0, minute=5),
+            id="monthly_rain_point_coupon",
+            replace_existing=True,
+            misfire_grace_time=3600,
+            coalesce=True,
+        )
+
         # 每小时清理过期银行卡验证码
         self.scheduler.add_job(
             self.clean_expired_bankcard_codes,
             CronTrigger(hour="*", minute=30),
             id="clean_expired_bankcard_codes",
             replace_existing=True
+        )
+
+        # Clean non-public avatar files after review requests expire.
+        self.scheduler.add_job(
+            self.clean_expired_avatar_reviews,
+            CronTrigger(minute="*/10"),
+            id="clean_expired_avatar_reviews",
+            replace_existing=True,
+            coalesce=True,
         )
 
         self.scheduler.start()
@@ -140,6 +158,7 @@ class TaskScheduler:
         """每天零点自动发放日补贴"""
         try:
             from services.finance_service import FinanceService
+            from core.exceptions import FinanceException
 
             logger.info("=" * 50)
             logger.info("[定时任务] 开始执行日补贴自动发放")
@@ -153,6 +172,8 @@ class TaskScheduler:
             else:
                 logger.warning("[定时任务] 日补贴发放失败，可能余额不足或无可发放用户")
 
+        except FinanceException as e:
+            logger.warning("[定时任务] 日补贴发放跳过或失败: %s", e)
         except Exception as e:
             logger.error(f"[定时任务] 日补贴发放异常: {str(e)}", exc_info=True)
 
@@ -177,6 +198,15 @@ class TaskScheduler:
         except Exception as e:
             logger.error(f"[定时任务] 联创分红发放异常: {str(e)}", exc_info=True)
 
+    def settle_monthly_rain_points(self):
+        """Run the monthly rain-point to coupon conversion."""
+        try:
+            from services.finance_service import FinanceService
+            result = FinanceService().settle_monthly_rain_points()
+            logger.info("[scheduled] monthly rain-point conversion completed: %s", result)
+        except Exception as e:
+            logger.error("[scheduled] monthly rain-point conversion failed: %s", e, exc_info=True)
+
     def shutdown(self):
         """关闭定时任务，并释放锁"""
         if hasattr(self, 'scheduler') and self.scheduler.running:
@@ -199,6 +229,17 @@ class TaskScheduler:
             logger.info(f"[定时任务] 清理过期银行卡验证码: {deleted}条")
         except Exception as e:
             logger.error(f"[定时任务] 清理过期验证码失败: {e}")
+
+    def clean_expired_avatar_reviews(self):
+        """Mark expired avatar reviews and remove their pending files."""
+        try:
+            from services.avatar_moderation_service import AvatarModerationService
+
+            deleted = AvatarModerationService.expire_stale()
+            if deleted:
+                logger.info("[定时任务] 清理过期头像审核记录: %s", deleted)
+        except Exception as e:
+            logger.error("[定时任务] 清理过期头像审核失败: %s", e, exc_info=True)
 
     def clean_expired_drafts(self):
         """清理过期草稿"""

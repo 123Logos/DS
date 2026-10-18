@@ -1,0 +1,22 @@
+CREATE TABLE IF NOT EXISTS avatar_review_submissions (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    batch_id CHAR(36) NOT NULL,
+    user_id BIGINT UNSIGNED NOT NULL,
+    openid VARCHAR(128) NOT NULL,
+    trace_id VARCHAR(128) NULL,
+    media_token_hash CHAR(64) NOT NULL,
+    pending_file_path VARCHAR(512) NOT NULL,
+    status ENUM('pending', 'review', 'pass', 'risky', 'failed', 'expired') NOT NULL DEFAULT 'pending',
+    suggest VARCHAR(16) NULL,
+    label INT NULL,
+    wechat_errcode INT NULL,
+    wechat_errmsg VARCHAR(255) NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at DATETIME NOT NULL,
+    reviewed_at DATETIME NULL,
+    UNIQUE KEY uk_avatar_review_trace_id (trace_id),
+    UNIQUE KEY uk_avatar_review_media_token (media_token_hash),
+    KEY idx_avatar_review_batch (batch_id),
+    KEY idx_avatar_review_user (user_id, created_at),
+    KEY idx_avatar_review_expire (status, expires_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

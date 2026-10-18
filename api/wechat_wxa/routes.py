@@ -8,10 +8,12 @@ https://developers.weixin.qq.com/miniprogram/dev/platform-capabilities/business-
 from __future__ import annotations
 
 import hashlib
+import hmac
+import json
 import xml.etree.ElementTree as ET
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 
 from core.config import ENVIRONMENT, settings
 from core.logging import get_logger
@@ -32,15 +34,28 @@ def _verify_wxa_url_signature(signature: str, timestamp: str, nonce: str, token:
         return False
     tmp = "".join(sorted([token, str(timestamp), str(nonce)]))
     expect = hashlib.sha1(tmp.encode("utf-8")).hexdigest()
-    return expect == signature
+    return hmac.compare_digest(expect, signature)
 
 
 def _parse_plain_xml_body(body: bytes) -> dict:
     root = ET.fromstring(body)
-    out: dict = {}
-    for child in root:
-        out[child.tag] = (child.text or "").strip()
-    return out
+
+    def convert(node: ET.Element):
+        children = list(node)
+        if not children:
+            return (node.text or "").strip()
+        return {child.tag: convert(child) for child in children}
+
+    return convert(root)
+
+
+def _parse_wxa_message(body: bytes, content_type: str) -> dict:
+    if "json" in content_type.lower() or body.lstrip().startswith(b"{"):
+        data = json.loads(body.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("message body must be an object")
+        return data
+    return _parse_plain_xml_body(body)
 
 
 @router.get("/msg", summary="小程序消息推送 URL 校验")
@@ -66,7 +81,7 @@ async def wxa_msg_verify(
 
 @router.post("/msg", summary="小程序消息推送（发货管理等事件）")
 async def wxa_msg_push(request: Request):
-    token = (settings.WCHAT_WXA_MSG_TOKEN or "").strip()
+    token = (settings.WECHAT_WXA_MSG_TOKEN or "").strip()
     signature = request.query_params.get("signature", "")
     timestamp = request.query_params.get("timestamp", "")
     nonce = request.query_params.get("nonce", "")
@@ -83,19 +98,23 @@ async def wxa_msg_push(request: Request):
         raise HTTPException(status_code=503, detail="未配置 WECHAT_WXA_MSG_TOKEN")
 
     try:
-        data = _parse_plain_xml_body(body)
-    except ET.ParseError as e:
-        logger.error("解析小程序 XML 消息失败: %s", e)
-        raise HTTPException(status_code=400, detail="invalid xml") from e
+        data = _parse_wxa_message(body, request.headers.get("content-type", ""))
+    except (ET.ParseError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as e:
+        logger.error("解析小程序消息失败: %s", e)
+        raise HTTPException(status_code=400, detail="invalid message") from e
 
-    msg_type = data.get("MsgType", "")
-    event = data.get("Event", "")
+    msg_type = data.get("MsgType") or data.get("msg_type") or ""
+    event = data.get("Event") or data.get("event") or ""
     logger.info("小程序推送 MsgType=%s Event=%s keys=%s", msg_type, event, list(data.keys()))
 
     if msg_type != "event" or not event:
         return PlainTextResponse(content="success")
 
-    if event == "trade_manage_remind_shipping":
+    if event == "wxa_media_check":
+        from services.avatar_moderation_service import AvatarModerationService
+
+        AvatarModerationService.handle_result(data)
+    elif event == "trade_manage_remind_shipping":
         process_trade_manage_remind_shipping(data)
     elif event == "trade_manage_order_settlement":
         process_trade_manage_order_settlement(data)
@@ -107,6 +126,28 @@ async def wxa_msg_push(request: Request):
         logger.info("未专门处理的小程序事件 Event=%s，已忽略", event)
 
     return PlainTextResponse(content="success")
+
+
+@router.get(
+    "/media/avatar/{media_token}",
+    include_in_schema=False,
+    summary="微信头像审核临时媒体访问",
+)
+def get_avatar_review_media(media_token: str):
+    from services.avatar_moderation_service import AvatarModerationService
+
+    media = AvatarModerationService.get_media(media_token)
+    if not media:
+        raise HTTPException(status_code=404, detail="media not found")
+    path, media_type = media
+    return FileResponse(
+        path,
+        media_type=media_type,
+        headers={
+            "Cache-Control": "no-store, max-age=0",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 def register_wechat_wxa_routes(app):

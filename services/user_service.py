@@ -10,11 +10,7 @@ import random
 from core.logging import get_logger
 import os
 from core.config import AVATAR_UPLOAD_DIR
-from fastapi import UploadFile, HTTPException
 from typing import List
-from pathlib import Path
-from PIL import Image
-import json
 
 
 logger = get_logger(__name__)
@@ -365,50 +361,6 @@ class UserService:
                 row = cur.fetchone()
                 return row["member_level"] if row else 0
 
-
-
-    @staticmethod
-    def upload_avatar(user_id: int, files: List[UploadFile]) -> List[str]:
-        """
-        行为与 upload_product_images 完全一致：
-        1. 支持多张（≤3）
-        2. 单张 ≤2MB
-        3. 统一压缩、重命名、返回 URL 数组
-        4. 留空则清空头像
-        """
-        if len(files) > 3:
-            raise HTTPException(status_code=400, detail="头像最多3张")
-
-        urls = []
-        for f in files:
-            if f.size > 2 * 1024 * 1024:
-                raise HTTPException(status_code=400, detail="单张头像不能超过2MB")
-            ext = Path(f.filename).suffix.lower()
-            if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
-                raise HTTPException(status_code=400, detail="仅支持 JPG/PNG/WEBP")
-
-            name = f"avatar_{user_id}_{uuid.uuid4().hex}{ext}"
-            path = AVATAR_UPLOAD_DIR / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-
-            with Image.open(f.file) as im:
-                im = im.convert("RGB")
-                im.thumbnail((300, 300), Image.LANCZOS)  # 头像统一 300×300
-                im.save(path, "JPEG", quality=85, optimize=True)
-
-            urls.append(f"/pic/avatars/{name}")
-
-        # 写库（仿照商品图更新 main_image）
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE users SET avatar_path = %s, updated_at = NOW() WHERE id = %s",
-                    (json.dumps(urls, ensure_ascii=False), user_id)
-                )
-                conn.commit()
-
-        return urls
-
     # ==================== 优惠券查询功能 ====================
 
     def query_user_coupons(self, user_id: int, status: str = 'all',
@@ -442,7 +394,7 @@ class UserService:
                            used_at, created_at
                     FROM coupons
                     WHERE {where_clause}
-                    ORDER BY created_at DESC
+                    ORDER BY created_at DESC, id DESC
                     LIMIT %s OFFSET %s
                 """
                 params.extend([page_size, offset])

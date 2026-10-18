@@ -104,15 +104,18 @@ async def adjust_subsidy_points_value(
         raise HTTPException(status_code=500, detail=str(e))
 @router.post("/api/subsidy/distribute", response_model=ResponseModel, summary="发放日补贴")
 async def distribute_subsidy(
+        force: bool = Query(False, description="强制发放（跳过当日防重复，慎用）"),
         service: FinanceService = Depends(get_finance_service)
 ):
-    """手动触发日补贴发放（每日最多使用补贴池余额的5%）"""
+    """手动触发日补贴发放（每日最多使用补贴池余额的5%）。"""
     try:
-        success = service.distribute_daily_subsidy()  # 方法名也改为 daily
+        success = service.distribute_daily_subsidy(force=force)
         if success:
             return ResponseModel(success=True, message="日补贴发放成功（增加 subsidy_points）")
         else:
             raise HTTPException(status_code=500, detail="补贴发放失败，请检查日志")
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"日补贴失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))

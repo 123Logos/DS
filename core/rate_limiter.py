@@ -53,7 +53,7 @@ class RateLimiter:
         self.period = period
         self.calls = defaultdict(deque)
         self.lock = threading.Lock()
-        logger.info("RateLimiter初始化: max_calls=%s, period=%ss", max_calls, period)
+        logger.debug("RateLimiter初始化: max_calls=%s, period=%ss", max_calls, period)
 
     def __call__(self, func: Callable) -> Callable:
         if asyncio.iscoroutinefunction(func):

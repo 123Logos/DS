@@ -12,6 +12,7 @@ import re
 from core.json_response import DecimalJSONResponse, register_exception_handlers
 from fastapi.staticfiles import StaticFiles
 from core.middleware import setup_cors, setup_static_files, setup_request_id
+OPENAPI_PATH = "/openapi.json"
 from core.health import router as health_router
 from core.config import get_db_config, PIC_PATH, AVATAR_UPLOAD_DIR, UVICORN_PORT, settings
 from core.logging import setup_logging
@@ -73,8 +74,8 @@ app = FastAPI(
     version="1.0.0",
     # 必须为 None：否则内置 /docs 会先注册，自定义备案页永远不会被匹配到
     docs_url=None,
-    redoc_url="/redoc",  # ReDoc 文档地址
-    openapi_url="/openapi.json",  # OpenAPI Schema 地址
+    redoc_url=None,
+    openapi_url=None,
     default_response_class=DecimalJSONResponse
 )
 # 注册全局异常处理器（放在 core/json_response.py 中实现）
@@ -305,7 +306,7 @@ async def custom_swagger_ui_html():
     try:
         # 获取原始 Swagger UI HTML
         swagger_html = get_swagger_ui_html(
-            openapi_url=app.openapi_url,
+            openapi_url=OPENAPI_PATH,
             title=f"{app.title} - Swagger UI",
             oauth2_redirect_url=app.swagger_ui_oauth2_redirect_url,
             init_oauth=app.swagger_ui_init_oauth,
@@ -319,7 +320,7 @@ async def custom_swagger_ui_html():
         logger.error(f"Failed to get Swagger UI HTML: {e}", exc_info=True)
         # 出错时返回原始响应（不带备案号），保证页面正常显示
         return get_swagger_ui_html(
-            openapi_url=app.openapi_url,
+            openapi_url=OPENAPI_PATH,
             title=f"{app.title} - Swagger UI",
             oauth2_redirect_url=app.swagger_ui_oauth2_redirect_url,
             init_oauth=app.swagger_ui_init_oauth,
@@ -362,7 +363,12 @@ async def swagger_ui_redirect():
 # ReDoc 页面（全文搜索），保留在 /redoc
 @app.get("/redoc", include_in_schema=False)
 async def redoc_html():
-    return get_redoc_html(openapi_url=app.openapi_url, title=f"{app.title} - ReDoc")
+    return get_redoc_html(openapi_url=OPENAPI_PATH, title=f"{app.title} - ReDoc")
+
+
+@app.get(OPENAPI_PATH, include_in_schema=False)
+async def openapi_json():
+    return app.openapi()
 
 
 if __name__ == "__main__":

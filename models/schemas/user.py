@@ -174,9 +174,24 @@ class ChangeMobileReq(BaseModel):
     old_mobile: str
     new_mobile: str
 
+class AvatarReviewItem(BaseModel):
+    submission_id: int
+    status: str
+
+
 class AvatarUploadResp(BaseModel):
+    batch_id: Optional[str] = None
+    status: str
+    items: List[AvatarReviewItem]
+    message: Optional[str] = None
     avatar_urls: List[str]          # ← 与商品图一样返回数组
     uploaded_at: datetime
+
+
+class AvatarReviewStatusResp(BaseModel):
+    batch_id: str
+    status: str
+    items: List[AvatarReviewItem]
 
 
 class CouponInfo(BaseModel):

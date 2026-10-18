@@ -92,6 +92,50 @@ async def get_access_token(*, force_refresh: bool = False) -> str:
         get_access_token._cache = (token, now, ttl)
         return token
 
+
+async def media_check_async(
+    *,
+    media_url: str,
+    openid: str,
+    scene: int = 1,
+) -> str:
+    """提交微信小程序图片内容安全异步检测，返回 trace_id。"""
+    if not media_url or not media_url.startswith(("https://", "http://")):
+        raise ValueError("media_url 必须是可被微信访问的完整 URL")
+    if not openid:
+        raise ValueError("缺少微信用户 openid")
+
+    payload = {
+        "media_url": media_url,
+        "media_type": 2,
+        "version": 2,
+        "scene": int(scene),
+        "openid": openid,
+    }
+    for attempt in range(2):
+        token = await get_access_token(force_refresh=attempt > 0)
+        url = f"https://api.weixin.qq.com/wxa/media_check_async?access_token={token}"
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(url, json=payload, timeout=15)
+                response.raise_for_status()
+                data = response.json()
+            if data.get("errcode"):
+                message = str(data.get("errmsg") or data)
+                if attempt == 0 and _looks_like_stale_access_token(message):
+                    continue
+                raise ValueError(message)
+            trace_id = data.get("trace_id")
+            if not trace_id:
+                raise ValueError("微信内容安全接口未返回 trace_id")
+            return str(trace_id)
+        except (httpx.HTTPError, ValueError):
+            if attempt == 0:
+                raise
+            raise
+
+    raise ValueError("微信内容安全接口调用失败")
+
 async def get_wxacode(path: str, scene: str = "", width: int = 280) -> bytes:
     """获取临时小程序码二进制"""
     last_err: BaseException | None = None

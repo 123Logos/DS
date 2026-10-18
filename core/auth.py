@@ -6,7 +6,7 @@
 
 import uuid
 import logging
-import secrets  # ✅ 新增：用于生成安全随机token
+import secrets
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 
@@ -15,7 +15,13 @@ from fastapi import HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from core.database import get_conn
-from core.config import JWT_SECRET_KEY, JWT_ALGORITHM, JWT_EXPIRE_MINUTES, ENABLE_UUID_AUTH
+from core.config import (
+    settings,
+    JWT_SECRET_KEY,
+    JWT_ALGORITHM,
+    JWT_EXPIRE_MINUTES,
+    ENABLE_UUID_AUTH,
+)
 from core.logging import get_logger
 
 # 初始化日志

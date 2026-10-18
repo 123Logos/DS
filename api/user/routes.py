@@ -7,6 +7,7 @@ from models.schemas.user import (
     FreezeReq, ResetPwdReq, AdminResetPwdReq, SetLevelReq, AddressReq,
     UpdateAddressReq,
     PointsReq, UserInfoResp, BindReferrerReq,MobileResp,Query,AvatarUploadResp,
+    AvatarReviewStatusResp,
     UnilevelStatusResponse, UnilevelPromoteResponse,UserAllPointsResponse,UserPointsSummaryResponse,SetUnilevelReq,
     ReferralQRResponse,DecryptPhoneReq, DecryptPhoneResp,GetPhoneReq, GetPhoneResp
 )
@@ -14,7 +15,7 @@ from core.config import WECHAT_APP_ID, WECHAT_APP_SECRET
 from core.database import get_conn
 from core.logging import get_logger
 from core.table_access import build_dynamic_select, get_table_structure, _quote_identifier
-from core.auth import create_access_token  # ✅ 新增：导入 Token 创建函数
+from core.auth import create_access_token, get_current_user
 from services.user_service import UserService, UserStatus, verify_pwd, hash_pwd
 from services.address_service import AddressService
 from services.points_service import add_points
@@ -162,6 +163,8 @@ def user_auth(body: AuthReq):
 
 @router.post("/user/update-profile", summary="修改资料（动态字段/兼容老库）")
 def update_profile(body: UpdateProfileReq):
+    if body.avatar_path is not None:
+        raise HTTPException(status_code=400, detail="头像必须通过头像审核上传接口修改")
     with get_conn() as conn:
         with conn.cursor() as cur:
             # 1. 取用户 id & 当前密码哈希
@@ -185,8 +188,7 @@ def update_profile(body: UpdateProfileReq):
             updates = {}
             if "name" in cols and body.name is not None:
                 updates["name"] = body.name
-            if "avatar_path" in cols and body.avatar_path is not None:
-                updates["avatar_path"] = body.avatar_path
+            # avatar_path 只能由头像内容安全审核通过后的服务端流程写入。
 
             # 4. 密码单独处理（需校验旧密码）
             if body.new_password is not None:
@@ -1394,13 +1396,18 @@ def get_unilevel(mobile: str):
             level = UserService.get_unilevel(u["id"])
             return {"unilevel": level}
 
-@router.post("/user/{user_id}/avatar", summary="上传用户头像", response_model=AvatarUploadResp)
-def upload_avatar(
+@router.post(
+    "/user/{user_id}/avatar",
+    summary="上传用户头像并提交内容安全审核",
+    response_model=AvatarUploadResp,
+)
+async def upload_avatar(
     user_id: int = Path(..., gt=0, description="用户ID"),
     avatar_files: List[UploadFile] = File(
         [],
         description="头像文件，1-3张，单张≤2MB，仅JPG/PNG/WEBP，留空则清空头像"
-    )
+    ),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     行为与 /api/products/{id}/images 完全一致：
@@ -1409,13 +1416,38 @@ def upload_avatar(
     3. 返回数组 URL
     4. 留空则清空原有头像
     """
+    if int(current_user.get("id", 0)) != user_id:
+        raise HTTPException(status_code=403, detail="无权修改其他用户头像")
     try:
-        urls = UserService.upload_avatar(user_id, avatar_files)
-        return AvatarUploadResp(avatar_urls=urls, uploaded_at=datetime.datetime.now())
+        from services.avatar_moderation_service import AvatarModerationService
+
+        result = await AvatarModerationService.submit(user_id, avatar_files)
+        return AvatarUploadResp(
+            **result,
+            avatar_urls=[],
+            uploaded_at=datetime.datetime.now(datetime.timezone.utc),
+        )
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"头像上传失败：{e}")
+        logger.exception("头像上传失败: %s", e)
+        raise HTTPException(status_code=500, detail="头像上传失败") from e
+
+
+@router.get(
+    "/user/avatar/review/{batch_id}",
+    summary="查询头像内容安全审核状态",
+    response_model=AvatarReviewStatusResp,
+)
+def get_avatar_review_status(
+    batch_id: str = Path(..., min_length=36, max_length=36, pattern=r"^[0-9a-fA-F-]{36}$"),
+    current_user: dict = Depends(get_current_user),
+):
+    from services.avatar_moderation_service import AvatarModerationService
+
+    return AvatarReviewStatusResp(
+        **AvatarModerationService.get_status(int(current_user["id"]), batch_id)
+    )
 
 @router.get("/my", summary="查询我的优惠券")
 def get_my_coupons(
@@ -1703,27 +1735,19 @@ def decrypt_phone(req: DecryptPhoneReq):
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.delete("/user/avatar", tags=["用户中心"], summary="清空头像")
-def clear_avatar(user_id: int):
+def clear_avatar(user_id: int, current_user: dict = Depends(get_current_user)):
     """
     一键清空头像
     前端调用：wx.request({ url: '/user/avatar', method: 'DELETE', ... })
     """
+    if int(current_user.get("id", 0)) != user_id:
+        raise HTTPException(status_code=403, detail="无权清空其他用户头像")
     try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                # 清空头像路径
-                cur.execute(
-                    """
-                    UPDATE users 
-                    SET avatar_path = NULL, updated_at = NOW() 
-                    WHERE id = %s
-                    """,
-                    (user_id,)
-                )
-                conn.commit()
+        from services.avatar_moderation_service import AvatarModerationService
 
-        logger.info(f"✅ 用户 {user_id} 清空头像成功")
-        return {"message": "头像已清空", "success": True}
+        result = AvatarModerationService.clear(user_id)
+        logger.info("用户 %s 清空头像成功", user_id)
+        return {"message": result["message"], "success": True}
 
     except Exception as e:
         logger.exception(f"清空头像失败: {e}")
