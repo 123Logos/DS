@@ -42,6 +42,7 @@ from api.store_setup.routes import register_store_routes
 from api.bankcard.routes import register_bankcard_routes
 from api.offline.routes import register_offline_routes, pay_bridge_router
 from api.order.refund import router as refund_router   # ✅ 新增导入
+from api.security.routes import register_security_routes
 
 def ensure_database():
     """确保数据库存在"""
@@ -252,6 +253,7 @@ register_wechat_wxa_routes(app)
 register_store_routes(app)
 register_bankcard_routes(app) # 修改：注册新的银行卡路由
 register_offline_routes(app)
+register_security_routes(app)
 
 # ✅ 注册退款路由（根路径 + /api 前缀，兼容不同前端请求；标准路径另有 /refund/*）
 # 必须传 tags，否则 operation 无 tags，Swagger UI 会归到「default」分组
