@@ -9,6 +9,7 @@ from core.config import BASE_PIC_DIR, CATEGORY_CHOICES
 from core.table_access import build_dynamic_select, get_table_structure
 from pypinyin import lazy_pinyin, Style
 from core.auth import get_current_user
+from services.wechat_api import require_safe_text
 from core.logging import get_logger  # ✅ 新增：日志
 
 logger = get_logger(__name__)  # ✅ 新增：模块级 logger
@@ -38,6 +39,22 @@ def register_routes(app):
     from .ext import router as product_ext_router
     app.include_router(router, prefix="/api", tags=["商品管理"])
     app.include_router(product_ext_router, prefix="/api", tags=["商品管理"])
+
+
+async def _review_product_texts(
+    values: List[Any], openid: Optional[str],
+) -> None:
+    """Review every public product text before it can be persisted."""
+    if not openid:
+        raise HTTPException(status_code=403, detail="当前账户未绑定微信审核身份")
+    for value in values:
+        if value is None:
+            continue
+        text = value if isinstance(value, str) else json.dumps(
+            value, ensure_ascii=False, separators=(",", ":")
+        )
+        if text.strip():
+            await require_safe_text(text, openid=openid, scene=1)
 
 
 def to_pinyin(text: str) -> str:
@@ -476,7 +493,7 @@ def get_product(id: int):
 
 # ✅ 新增商品（需要登录且必须是商家或平台）
 @router.post("/products", summary="➕ 新增商品")
-def add_product(
+async def add_product(
     payload: ProductCreate,
     current_user: Dict[str, Any] = Depends(get_current_user)  # 新增依赖
 ):
@@ -486,6 +503,12 @@ def add_product(
     merchant_type = current_user.get('is_merchant', 0)
     if merchant_type not in [1, 2]:
         raise HTTPException(status_code=403, detail="只有商家或平台可以发布商品")
+    texts: List[Any] = [
+        payload.name, payload.description, payload.category, payload.buy_rule,
+        payload.attributes,
+        [sku.specifications for sku in payload.skus],
+    ]
+    await _review_product_texts(texts, current_user.get("openid"))
 
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -606,7 +629,7 @@ def set_home_recommend(
 
 # ✅ 更新商品（需要登录且必须是商品拥有者或平台管理员）
 @router.put("/products/{id}", summary="✏️ 更新商品")
-def update_product(
+async def update_product(
     id: int,
     payload: ProductUpdate,
     current_user: Dict[str, Any] = Depends(get_current_user)  # 新增依赖
@@ -620,6 +643,19 @@ def update_product(
                 product = cur.fetchone()
                 if not product:
                     raise HTTPException(status_code=404, detail="商品不存在")
+                if current_user.get("is_merchant") != 2 and int(product["user_id"]) != int(current_user["id"]):
+                    raise HTTPException(status_code=403, detail="无权修改该商品")
+                await _review_product_texts(
+                    [
+                        payload.name,
+                        payload.description,
+                        payload.category,
+                        payload.buy_rule,
+                        payload.attributes,
+                        [sku.specifications for sku in (payload.skus or [])],
+                    ],
+                    current_user.get("openid"),
+                )
 
                 # 权限校验：必须是商品拥有者或平台管理员
                 if product['user_id'] != current_user['id'] and current_user.get('is_merchant') != 2:

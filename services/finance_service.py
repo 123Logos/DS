@@ -3823,7 +3823,15 @@ class FinanceService:
         if not user_row:
             raise FinanceException(f"用户不存在: {user_id}")
 
-        current_balance = Decimal(str(user_row.get('true_total_points', 0) or 0))
+        # Lock the asset row for the whole coupon insertion/debit transaction.
+        cur.execute(
+            "SELECT true_total_points FROM users WHERE id=%s FOR UPDATE",
+            (user_id,),
+        )
+        locked_row = cur.fetchone()
+        if not locked_row:
+            raise FinanceException(f"用户不存在: {user_id}")
+        current_balance = Decimal(str(locked_row.get('true_total_points', 0) or 0))
         if current_balance < amount:
             raise FinanceException(
                 f"用户 {user_id} true_total_points 余额不足，当前余额: {current_balance:.4f}，需要 {amount:.4f}"
@@ -3842,9 +3850,12 @@ class FinanceService:
         # 3. 扣除 true_total_points
         new_balance = current_balance - amount
         cur.execute(
-            "UPDATE users SET true_total_points = %s WHERE id = %s",
-            (new_balance, user_id)
+            "UPDATE users SET true_total_points = %s "
+            "WHERE id = %s AND true_total_points >= %s",
+            (new_balance, user_id, amount)
         )
+        if cur.rowcount != 1:
+            raise FinanceException("余额已变化，请重试")
 
         # 4. 记录扣除流水
         cur.execute(
@@ -8706,5 +8717,4 @@ def generate_statement():
                 (1, yesterday, opening, income, withdraw_amount, closing)
             )
             conn.commit()
-
 

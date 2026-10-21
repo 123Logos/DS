@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
@@ -8,6 +8,12 @@ from services.finance_service import reverse_split_on_refund
 from core.wx_pay_client import wxpay_client
 from core.config import settings
 from core.logging import get_logger
+from core.auth import (
+    get_current_user,
+    require_admin_or_merchant,
+    require_platform_admin,
+    is_platform_admin,
+)
 from decimal import Decimal
 from services.finance_service import FinanceService, reverse_split_on_refund
 
@@ -18,9 +24,16 @@ router = APIRouter()
 
 class RefundManager:
     @staticmethod
-    def apply(order_number: str, refund_type: str, reason_code: str) -> bool:
+    def apply(order_number: str, refund_type: str, reason_code: str, user_id: int) -> bool:
         with get_conn() as conn:
             with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT status FROM orders WHERE order_number=%s AND user_id=%s FOR UPDATE",
+                    (order_number, user_id),
+                )
+                order = cur.fetchone()
+                if not order or order["status"] not in ("pending_ship", "pending_recv", "completed"):
+                    return False
                 select_sql = build_dynamic_select(
                     cur,
                     "refunds",
@@ -276,9 +289,11 @@ class RefundAudit(BaseModel):
 
 # ---------------- 路由 ----------------
 @router.post("/apply", summary="申请退款")
-def refund_apply(body: RefundApply):
+def refund_apply(body: RefundApply, current_user: dict = Depends(get_current_user)):
     logger.info(f"🔥 申请退款接口被调用: order_number={body.order_number}, refund_type={body.refund_type}, reason={body.reason_code}")
-    ok = RefundManager.apply(body.order_number, body.refund_type, body.reason_code)
+    ok = RefundManager.apply(
+        body.order_number, body.refund_type, body.reason_code, int(current_user["id"])
+    )
     if not ok:
         logger.warning(f"申请退款失败: 订单 {body.order_number} 已申请过退款")
         raise HTTPException(status_code=400, detail="该订单已申请过退款")
@@ -287,8 +302,21 @@ def refund_apply(body: RefundApply):
 
 
 @router.post("/audit", summary="审核退款申请")
-def refund_audit(body: RefundAudit):
+def refund_audit(
+    body: RefundAudit,
+    current_user: dict = Depends(require_admin_or_merchant),
+):
     logger.info(f"🔥 退款审核接口被调用: order_number={body.order_number}, approve={body.approve}")
+    if not is_platform_admin(current_user):
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT merchant_id FROM orders WHERE order_number=%s",
+                    (body.order_number,),
+                )
+                order = cur.fetchone()
+        if not order or int(order.get("merchant_id") or 0) != int(current_user["id"]):
+            raise HTTPException(status_code=403, detail="无权审核该订单退款")
     RefundManager.audit(
         body.order_number,
         body.approve,
@@ -299,13 +327,25 @@ def refund_audit(body: RefundAudit):
 
 
 @router.get("/progress/{order_number}", summary="查询退款进度")
-def refund_progress(order_number: str):
-    return RefundManager.progress(order_number) or {}
+def refund_progress(order_number: str, current_user: dict = Depends(get_current_user)):
+    result = RefundManager.progress(order_number) or {}
+    if not result:
+        return {}
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id, merchant_id FROM orders WHERE order_number=%s", (order_number,))
+            order = cur.fetchone()
+    if not order or (
+        not is_platform_admin(current_user)
+        and int(current_user["id"]) not in {int(order.get("user_id") or 0), int(order.get("merchant_id") or 0)}
+    ):
+        raise HTTPException(status_code=403, detail="无权查看该退款")
+    return result
 
 # ==================== 新增：退款查询接口 ====================
 
 @router.get("/query/{order_number}", summary="查询退款状态")
-def query_refund_status(order_number: str):
+def query_refund_status(order_number: str, current_user: dict = Depends(get_current_user)):
     """
     查询订单退款状态（包括微信侧状态）
     """
@@ -321,6 +361,8 @@ def query_refund_status(order_number: str):
             
             if not order:
                 raise HTTPException(status_code=404, detail="订单不存在")
+            if not is_platform_admin(current_user) and int(current_user["id"]) != int(order.get("user_id") or 0):
+                raise HTTPException(status_code=403, detail="无权查看该退款")
             
             # 查询资金回冲流水
             cur.execute(
@@ -363,7 +405,7 @@ def query_refund_status(order_number: str):
 
 
 @router.post("/sync-status/{order_number}", summary="同步微信退款状态（手动）")
-def sync_refund_status(order_number: str):
+def sync_refund_status(order_number: str, current_user: dict = Depends(require_platform_admin)):
     """
     手动同步微信退款状态（当回调未收到时使用）
     """
@@ -394,6 +436,5 @@ def sync_refund_status(order_number: str):
     return {
         "order_number": order_number,
         "refund_no": refund_no,
-        "message": "请确认微信商户平台退款状态后，如需更新可联系管理员手动更新",
-        "manual_update_sql": f"UPDATE orders SET status='refunded' WHERE order_number='{order_number}';"
+        "message": "请确认微信商户平台退款状态后，如需更新请通过受控后台流程处理"
     }

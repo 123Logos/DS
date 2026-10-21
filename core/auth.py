@@ -21,6 +21,7 @@ from core.config import (
     JWT_ALGORITHM,
     JWT_EXPIRE_MINUTES,
     ENABLE_UUID_AUTH,
+    parse_csv_ids,
 )
 from core.logging import get_logger
 
@@ -61,6 +62,7 @@ def _has_sessions_table() -> bool:
 # 安全方案实例
 security = HTTPBearer()
 
+
 # ========================================
 # 主认证函数 - 修复版
 # ========================================
@@ -87,7 +89,7 @@ async def get_current_user(
     # 防御性移除 Bearer 前缀
     if token.lower().startswith("bearer "):
         token = token[7:].strip()
-        logger.warning(f"Token 包含多余的 Bearer 前缀，已自动移除: {raw_token[:20]}...")
+        logger.warning("Token 包含多余的 Bearer 前缀")
 
     if not token:
         raise HTTPException(
@@ -104,7 +106,7 @@ async def get_current_user(
     elif len(token) == 36 and '-' in token:
         # UUID 格式（36位）
         if bool(ENABLE_UUID_AUTH):
-            logger.info(f"检测到 UUID 令牌，使用 UUID 认证 - Token: {token[:8]}...")
+            logger.info("检测到 UUID 令牌，使用 UUID 认证")
             return await _get_user_from_uuid(token)
         else:
             raise HTTPException(
@@ -124,6 +126,37 @@ async def get_current_user(
         )
 
 
+def _is_platform_admin(user: Dict[str, Any]) -> bool:
+    """Return whether the authenticated account is configured as a platform admin."""
+    try:
+            return int(user.get("id")) in parse_csv_ids(settings.ADMIN_USER_IDS)
+    except (TypeError, ValueError):
+            return False
+
+
+async def require_platform_admin(
+    user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Require an authenticated platform administrator for sensitive operations."""
+    if not _is_platform_admin(user):
+            raise HTTPException(status_code=403, detail="需要平台管理员权限")
+    return user
+
+
+async def require_admin_or_merchant(
+    user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Require a platform administrator or an authenticated merchant account."""
+    if _is_platform_admin(user) or bool(user.get("is_merchant")):
+            return user
+    raise HTTPException(status_code=403, detail="需要商家或平台管理员权限")
+
+
+def is_platform_admin(user: Dict[str, Any]) -> bool:
+    """Expose the role check for routes that must compare a resource owner."""
+    return _is_platform_admin(user)
+
+
 # ✅ 新增：124位微信Token认证实现
 async def _get_user_from_wechat_token(token: str) -> Dict[str, Any]:
     """微信Token认证逻辑（124位）"""
@@ -136,7 +169,7 @@ async def _get_user_from_wechat_token(token: str) -> Dict[str, Any]:
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
-        logger.debug(f"验证微信Token: {token[:20]}...")
+        logger.debug("验证微信Token")
 
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -163,7 +196,7 @@ async def _get_user_from_wechat_token(token: str) -> Dict[str, Any]:
                 user = cur.fetchone()
 
                 if not user:
-                    logger.warning(f"微信Token无效或过期: {token[:20]}...")
+                    logger.warning("微信Token无效或过期")
                     raise HTTPException(
                         status_code=401,
                         detail="认证令牌无效或已过期",
@@ -178,7 +211,7 @@ async def _get_user_from_wechat_token(token: str) -> Dict[str, Any]:
                         detail=status_msg.get(user["status"], "账号状态异常"),
                     )
 
-                logger.info(f"微信Token认证成功 - 用户: {user['name']}({user['mobile']})")
+                logger.info("微信Token认证成功 - 用户ID: %s", user["id"])
                 return dict(user)
 
     except HTTPException:
@@ -242,11 +275,11 @@ async def _get_user_from_jwt(token: str) -> Dict[str, Any]:
                         detail=status_msg.get(user["status"], "账号状态异常"),
                     )
 
-                logger.info(f"JWT认证成功 - 用户: {user['name']}({user['mobile']})")
+                logger.info("JWT认证成功 - 用户ID: %s", user["id"])
                 return dict(user)
 
     except jwt.ExpiredSignatureError:
-        logger.warning(f"Token 已过期: {token[:20]}...")
+        logger.warning("Token 已过期")
         raise HTTPException(
             status_code=401,
             detail="Token已过期，请重新登录",
@@ -254,7 +287,7 @@ async def _get_user_from_jwt(token: str) -> Dict[str, Any]:
         )
 
     except jwt.InvalidTokenError as e:
-        logger.warning(f"无效Token格式: {str(e)} - {token[:20]}...")
+        logger.warning("无效Token格式: %s", type(e).__name__)
         raise HTTPException(
             status_code=401,
             detail=f"无效的Token格式: {str(e)}",
@@ -281,13 +314,13 @@ async def _get_user_from_uuid(token: str) -> Dict[str, Any]:
         uuid_obj = uuid.UUID(token, version=4)
         token_str = str(uuid_obj)
 
-        logger.debug(f"验证 UUID Token: {token_str[:8]}...")
+        logger.debug("验证 UUID Token")
 
     except ValueError:
-        logger.warning(f"UUID格式错误: {token[:20]}...")
+        logger.warning("UUID格式错误")
         raise HTTPException(
             status_code=401,
-            detail=f"认证令牌格式错误: 预期UUID4格式，但得到 {token[:20]}...",
+            detail="认证令牌格式错误：预期 UUID4 格式",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -318,7 +351,7 @@ async def _get_user_from_uuid(token: str) -> Dict[str, Any]:
                 user = cur.fetchone()
 
                 if not user:
-                    logger.warning(f"UUID Token 无效或过期: {token_str[:8]}...")
+                    logger.warning("UUID Token 无效或过期")
                     raise HTTPException(
                         status_code=401,
                         detail="认证令牌无效或已过期",
@@ -333,7 +366,7 @@ async def _get_user_from_uuid(token: str) -> Dict[str, Any]:
                         detail=status_msg.get(user["status"], "账号状态异常"),
                     )
 
-                logger.info(f"UUID认证成功 - 用户: {user['name']}({user['mobile']})")
+                logger.info("UUID认证成功 - 用户ID: %s", user["id"])
                 return dict(user)
 
     except HTTPException:
@@ -421,7 +454,7 @@ def _create_uuid_token(user_id: int) -> str:
 
                 conn.commit()
 
-        logger.info(f"创建 UUID Token 成功 - 用户ID: {user_id}, Token: {token[:8]}...")
+        logger.info("创建 UUID Token 成功 - 用户ID: %s", user_id)
         return token
 
     except Exception as e:
@@ -456,7 +489,7 @@ def _create_wechat_token(user_id: int) -> str:
 
                 conn.commit()
 
-        logger.info(f"创建微信Token成功 - 用户ID: {user_id}, Token: {token[:20]}...")
+        logger.info("创建微信Token成功 - 用户ID: %s", user_id)
         return token
 
     except Exception as e:
@@ -501,7 +534,7 @@ def invalidate_token(token: str) -> bool:
                 conn.commit()
 
                 if deleted:
-                    logger.info(f"Token 已失效: {token[:8]}...")
+                    logger.info("Token 已失效")
 
                 return deleted
 

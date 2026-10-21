@@ -24,7 +24,7 @@ from models.schemas.finance import (
     CouponUseRequest, RefundRequest,
     MerchantWithdrawToBankcardRequest, MerchantWithdrawQueryRequest
 )
-from core.auth import get_current_user   # 如果已存在
+from core.auth import get_current_user, require_platform_admin   # 如果已存在
 from typing import List, Optional
 from pydantic import BaseModel, Field
 
@@ -52,7 +52,8 @@ async def root():
     return {"message": "财务管理系统API运行中", "version": "3.2.0"}
 
 
-@router.post("/api/init", response_model=ResponseModel, summary="初始化数据库")
+@router.post("/api/init", response_model=ResponseModel, summary="初始化数据库",
+             dependencies=[Depends(require_platform_admin)])
 async def init_database(db_manager: DatabaseManager = Depends(get_database_manager)):
     try:
         from core.database import get_conn
@@ -80,7 +81,8 @@ async def get_current_points_value(
     except Exception as e:
         logger.error(f"查询积分值失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-@router.post("/api/subsidy/points-value/adjust", response_model=ResponseModel, summary="调整积分值")
+@router.post("/api/subsidy/points-value/adjust", response_model=ResponseModel, summary="调整积分值",
+             dependencies=[Depends(require_platform_admin)])
 async def adjust_subsidy_points_value(
         points_value: Optional[float] = Query(None, ge=0, le=0.005,  # ← 改为 0.005
                                               description="积分值（0-0.005），不传或传null取消手动调整"),
@@ -102,7 +104,8 @@ async def adjust_subsidy_points_value(
     except Exception as e:
         logger.error(f"调整积分值失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-@router.post("/api/subsidy/distribute", response_model=ResponseModel, summary="发放日补贴")
+@router.post("/api/subsidy/distribute", response_model=ResponseModel, summary="发放日补贴",
+             dependencies=[Depends(require_platform_admin)])
 async def distribute_subsidy(
         force: bool = Query(False, description="强制发放（跳过当日防重复，慎用）"),
         service: FinanceService = Depends(get_finance_service)
@@ -162,7 +165,8 @@ async def get_unilevel_dividend_preview(
         logger.error(f"分红预览计算失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/api/unilevel/adjust", response_model=ResponseModel, summary="调整联创分红金额（含上限预警）")
+@router.post("/api/unilevel/adjust", response_model=ResponseModel, summary="调整联创分红金额（含上限预警）",
+             dependencies=[Depends(require_platform_admin)])
 async def adjust_unilevel_dividend(
         amount_per_weight: Optional[float] = Query(None, ge=0, description="每个权重的分红金额（传入0或null取消调整）"),
         service: FinanceService = Depends(get_finance_service)
@@ -204,7 +208,8 @@ async def adjust_unilevel_dividend(
 
 
 # ========== 执行联创分红接口（已增强） ==========
-@router.post("/api/unilevel/dividend", summary="发放联创星级分红（手动触发）")
+@router.post("/api/unilevel/dividend", summary="发放联创星级分红（手动触发）",
+             dependencies=[Depends(require_platform_admin)])
 async def distribute_unilevel_dividend(
         service: FinanceService = Depends(get_finance_service)
 ):
@@ -225,7 +230,8 @@ async def distribute_unilevel_dividend(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/api/subsidy/fund", response_model=ResponseModel, summary="增加补贴资金（累加）")
+@router.post("/api/subsidy/fund", response_model=ResponseModel, summary="增加补贴资金（累加）",
+             dependencies=[Depends(require_platform_admin)])
 async def fund_subsidy_pool(
         service: FinanceService = Depends(get_finance_service),
         amount: float = Query(..., gt=0, description="要增加的金额")
@@ -576,7 +582,8 @@ async def get_transaction_chain_report(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/api/fund-pools/clear", response_model=ResponseModel, summary="清空指定资金池")
+@router.post("/api/fund-pools/clear", response_model=ResponseModel, summary="清空指定资金池",
+             dependencies=[Depends(require_platform_admin)])
 async def clear_fund_pools(
         request: ClearFundPoolsRequest,
         service: FinanceService = Depends(get_finance_service)
@@ -746,7 +753,8 @@ async def get_pool_allocations(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/api/fund-pools/allocations", response_model=ResponseModel, summary="更新资金池分配配置")
+@router.post("/api/fund-pools/allocations", response_model=ResponseModel, summary="更新资金池分配配置",
+             dependencies=[Depends(require_platform_admin)])
 async def set_pool_allocations(
         request: AllocationsRequest,
         service: FinanceService = Depends(get_finance_service)
@@ -766,7 +774,8 @@ async def set_pool_allocations(
 
 
 # ==================== 1. 优惠券发放接口 ====================
-@router.post("/api/coupons/distribute", response_model=ResponseModel, summary="为指定用户发放1元优惠券")
+@router.post("/api/coupons/distribute", response_model=ResponseModel, summary="为指定用户发放1元优惠券",
+             dependencies=[Depends(require_platform_admin)])
 async def distribute_coupon(
     user_id: int = Query(..., gt=0, description="用户ID"),
     amount: float = Query(
@@ -824,7 +833,8 @@ class BatchCouponDistributeRequest(BaseModel):
 # =====================================================
 
 # ==================== 新增：批量发放优惠券接口 ====================
-@router.post("/api/coupons/distribute-batch", response_model=ResponseModel, summary="批量发放优惠券")
+@router.post("/api/coupons/distribute-batch", response_model=ResponseModel, summary="批量发放优惠券",
+             dependencies=[Depends(require_platform_admin)])
 async def distribute_coupons_batch(
     request: BatchCouponDistributeRequest,
     service: FinanceService = Depends(get_finance_service)
@@ -854,7 +864,8 @@ async def distribute_coupons_batch(
 # ===========================================================
 
 
-@router.post("/api/coupons/exchange", response_model=ResponseModel, summary="雨点兑换优惠券（平台批量发放）")
+@router.post("/api/coupons/exchange", response_model=ResponseModel, summary="雨点兑换优惠券（平台批量发放）",
+             dependencies=[Depends(require_platform_admin)])
 async def exchange_coupons(
     count: Optional[int] = Query(None, gt=0, description="每个用户发放的优惠券数量，不传则按雨点余额全量兑换（受系统上限限制）"),
     service: FinanceService = Depends(get_finance_service)
@@ -1448,7 +1459,8 @@ async def get_all_points_detail_report(
 
 # 在 merchant_withdraw_to_bankcard 接口之后或适当位置添加
 
-@router.post("/api/fund-pools/transform-to-coupon", response_model=ResponseModel, summary="资金池转正：将池子金额转化为优惠券赠送给用户")
+@router.post("/api/fund-pools/transform-to-coupon", response_model=ResponseModel, summary="资金池转正：将池子金额转化为优惠券赠送给用户",
+             dependencies=[Depends(require_platform_admin)])
 async def transform_pool_to_coupon(
     pool_type: str = Query(..., description="资金池类型，如 public_welfare"),
     user_id: int = Query(..., gt=0, description="接收优惠券的用户ID"),
@@ -1635,7 +1647,8 @@ async def list_merchant_withdraw_records(
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==================== 日补贴比例调整接口 ====================
-@router.post("/api/subsidy/daily-ratio/adjust", response_model=ResponseModel, summary="调整日补贴比例")
+@router.post("/api/subsidy/daily-ratio/adjust", response_model=ResponseModel, summary="调整日补贴比例",
+             dependencies=[Depends(require_platform_admin)])
 async def adjust_daily_subsidy_ratio(
     ratio: float = Query(..., gt=0, le=1, description="日补贴比例，0-1之间"),
     service: FinanceService = Depends(get_finance_service)

@@ -1,6 +1,8 @@
 from fastapi import HTTPException, APIRouter, Request,File, UploadFile,Path, Depends
 import uuid
 import datetime
+import hashlib
+import hmac
 import requests
 from models.schemas.user import (
     SetStatusReq, AuthReq, AuthResp, UpdateProfileReq, SelfDeleteReq,
@@ -11,11 +13,16 @@ from models.schemas.user import (
     UnilevelStatusResponse, UnilevelPromoteResponse,UserAllPointsResponse,UserPointsSummaryResponse,SetUnilevelReq,
     ReferralQRResponse,DecryptPhoneReq, DecryptPhoneResp,GetPhoneReq, GetPhoneResp
 )
-from core.config import WECHAT_APP_ID, WECHAT_APP_SECRET
+from core.config import WECHAT_APP_ID, WECHAT_APP_SECRET, JWT_SECRET_KEY
 from core.database import get_conn
 from core.logging import get_logger
 from core.table_access import build_dynamic_select, get_table_structure, _quote_identifier
-from core.auth import create_access_token, get_current_user
+from core.auth import (
+    create_access_token,
+    get_current_user,
+    require_platform_admin,
+    is_platform_admin,
+)
 from services.user_service import UserService, UserStatus, verify_pwd, hash_pwd
 from services.address_service import AddressService
 from services.points_service import add_points
@@ -46,7 +53,8 @@ def register_routes(app):
 
 
 # 将所有路由从 @app. 改为 @router.
-@router.post("/user/set-status", summary="冻结/注销/恢复正常（动态字段/自动建表）")
+@router.post("/user/set-status", summary="冻结/注销/恢复正常（动态字段/自动建表）",
+             dependencies=[Depends(require_platform_admin)])
 def set_user_status(body: SetStatusReq):
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -156,7 +164,7 @@ def user_auth(body: AuthReq):
             # ✅ 关键修复：创建并持久化 Token（保存到 sessions 表或 users.token 字段）
             token = create_access_token(user_id, token_type="uuid")
 
-            logger.info(f"用户认证成功 - ID: {user_id}, 手机: {body.mobile}, Token: {token[:8]}...")
+            logger.info("用户认证成功 - ID: %s", user_id)
 
             return AuthResp(
                 uid=user_id,
@@ -277,11 +285,9 @@ def self_delete(body: SelfDeleteReq):
             conn.commit()
             return {"msg": "账号已注销"}
 
-@router.put("/user/freeze", summary="后台冻结用户")
+@router.put("/user/freeze", summary="后台冻结用户",
+            dependencies=[Depends(require_platform_admin)])
 def freeze_user(body: FreezeReq):
-    if body.admin_key != "admin2025":
-        raise HTTPException(status_code=403, detail="后台口令错误")
-
     with get_conn() as conn:
         with conn.cursor() as cur:
             select_sql = build_dynamic_select(
@@ -305,11 +311,9 @@ def freeze_user(body: FreezeReq):
             conn.commit()
     return {"msg": "已冻结"}
 
-@router.put("/user/unfreeze", summary="后台解冻用户")
+@router.put("/user/unfreeze", summary="后台解冻用户",
+            dependencies=[Depends(require_platform_admin)])
 def unfreeze_user(body: FreezeReq):
-    if body.admin_key != "admin2025":
-        raise HTTPException(status_code=403, detail="后台口令错误")
-
     with get_conn() as conn:
         with conn.cursor() as cur:
             select_sql = build_dynamic_select(
@@ -331,13 +335,60 @@ def unfreeze_user(body: FreezeReq):
             conn.commit()
     return {"msg": "已解冻"}
 
+def _consume_password_reset_code(cur, mobile: str, sms_code: str) -> bool:
+    """Consume a short-lived, purpose-bound code issued by the SMS service."""
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS password_reset_codes (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            mobile VARCHAR(32) NOT NULL,
+            code_hash CHAR(64) NOT NULL,
+            expires_at DATETIME NOT NULL,
+            failed_attempts TINYINT UNSIGNED NOT NULL DEFAULT 0,
+            consumed_at DATETIME NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_password_reset_mobile (mobile, consumed_at, expires_at)
+        )
+        """
+    )
+    cur.execute(
+        """
+        SELECT id, code_hash, expires_at, failed_attempts
+        FROM password_reset_codes
+        WHERE mobile=%s AND consumed_at IS NULL AND expires_at > NOW()
+        ORDER BY id DESC
+        LIMIT 1
+        FOR UPDATE
+        """,
+        (mobile,),
+    )
+    row = cur.fetchone()
+    expected = hmac.new(
+        JWT_SECRET_KEY.encode(), f"{mobile}:{sms_code}".encode(), hashlib.sha256
+    ).hexdigest()
+    if not row or row["failed_attempts"] >= 5 or not hmac.compare_digest(
+        row["code_hash"], expected
+    ):
+        if row and row["failed_attempts"] < 5:
+            cur.execute(
+                "UPDATE password_reset_codes SET failed_attempts=failed_attempts+1 WHERE id=%s",
+                (row["id"],),
+            )
+        return False
+    cur.execute(
+        "UPDATE password_reset_codes SET consumed_at=NOW() WHERE id=%s AND consumed_at IS NULL",
+        (row["id"],),
+    )
+    return cur.rowcount == 1
+
+
 @router.post("/user/reset-password", summary="找回密码（短信验证）")
 def reset_password(body: ResetPwdReq):
-    if body.sms_code != "111111":
-        raise HTTPException(status_code=400, detail="验证码错误")
-
     with get_conn() as conn:
         with conn.cursor() as cur:
+            if not _consume_password_reset_code(cur, body.mobile, body.sms_code):
+                conn.rollback()
+                raise HTTPException(status_code=400, detail="验证码错误或已过期")
             select_sql = build_dynamic_select(
                 cur,
                 "users",
@@ -351,14 +402,18 @@ def reset_password(body: ResetPwdReq):
 
             new_hash = hash_pwd(body.new_password)
             cur.execute("UPDATE users SET password_hash=%s WHERE id=%s", (new_hash, u["id"]))
+            cur.execute("SHOW TABLES LIKE 'sessions'")
+            if cur.fetchone():
+                cur.execute("DELETE FROM sessions WHERE user_id=%s", (u["id"],))
+            cur.execute("SHOW COLUMNS FROM users LIKE 'token'")
+            if cur.fetchone():
+                cur.execute("UPDATE users SET token=NULL WHERE id=%s", (u["id"],))
             conn.commit()
     return {"msg": "密码已重置"}
 
-@router.put("/admin/user/reset-pwd", summary="后台重置用户密码")
+@router.put("/admin/user/reset-pwd", summary="后台重置用户密码",
+            dependencies=[Depends(require_platform_admin)])
 def admin_reset_password(body: AdminResetPwdReq):
-    if body.admin_key != "admin2025":
-        raise HTTPException(status_code=403, detail="后台口令错误")
-
     with get_conn() as conn:
         with conn.cursor() as cur:
             select_sql = build_dynamic_select(
@@ -377,7 +432,8 @@ def admin_reset_password(body: AdminResetPwdReq):
             conn.commit()
     return {"msg": "密码已重置"}
 
-@router.post("/user/upgrade", summary="升 1 星（动态字段/兼容老库）")
+@router.post("/user/upgrade", summary="升 1 星（动态字段/兼容老库）",
+             dependencies=[Depends(require_platform_admin)])
 def upgrade(mobile: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -431,7 +487,8 @@ def upgrade(mobile: str):
             conn.commit()
             return {"new_level": new_level}
 
-@router.post("/user/set-level", summary="后台调星（动态字段/兼容老库）")
+@router.post("/user/set-level", summary="后台调星（动态字段/兼容老库）",
+             dependencies=[Depends(require_platform_admin)])
 def set_level(body: SetLevelReq):
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -572,6 +629,7 @@ def user_list(
         level_end: int = 6,
         page: int = 1,
         size: int = 20,
+        current_user: dict = Depends(require_platform_admin),
 ):
     if level_start > level_end or (id_start is not None and id_end is not None and id_start > id_end):
         _err("区间左值不能大于右值")
@@ -756,7 +814,9 @@ def refer_team(mobile: str, max_layer: int = 6):
 
 # 地址模块
 @router.post("/address", summary="新增地址（兼容老表结构）")
-def address_add(body: AddressReq):
+def address_add(body: AddressReq, current_user: dict = Depends(get_current_user)):
+    if not is_platform_admin(current_user) and body.mobile != current_user.get("mobile"):
+        raise HTTPException(status_code=403, detail="只能为本人新增地址")
     with get_conn() as conn:
         with conn.cursor() as cur:
             # 1. 取用户id
@@ -805,7 +865,10 @@ def address_add(body: AddressReq):
 
 
 @router.put("/address/{addr_id}", summary="更新地址（部分字段可选）")
-def address_update(addr_id: int, body: UpdateAddressReq):
+def address_update(addr_id: int, body: UpdateAddressReq,
+                   current_user: dict = Depends(get_current_user)):
+    if not is_platform_admin(current_user) and body.mobile != current_user.get("mobile"):
+        raise HTTPException(status_code=403, detail="只能修改本人地址")
     with get_conn() as conn:
         with conn.cursor() as cur:
             # 1. 验证用户存在并获取 user_id
@@ -831,7 +894,10 @@ def address_update(addr_id: int, body: UpdateAddressReq):
 
     return {"msg": "ok"}
 @router.put("/address/default", summary="设为默认地址")
-def set_default_addr(addr_id: int, mobile: str):
+def set_default_addr(addr_id: int, mobile: str,
+                     current_user: dict = Depends(get_current_user)):
+    if not is_platform_admin(current_user) and mobile != current_user.get("mobile"):
+        raise HTTPException(status_code=403, detail="只能操作本人地址")
     with get_conn() as conn:
         with conn.cursor() as cur:
             # 校验地址存在且属于当前用户
@@ -854,7 +920,10 @@ def set_default_addr(addr_id: int, mobile: str):
     return {"msg": "ok"}
 
 @router.delete("/address/{addr_id}", summary="删除地址")
-def delete_addr(addr_id: int, mobile: str):
+def delete_addr(addr_id: int, mobile: str,
+                current_user: dict = Depends(get_current_user)):
+    if not is_platform_admin(current_user) and mobile != current_user.get("mobile"):
+        raise HTTPException(status_code=403, detail="只能操作本人地址")
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT user_id FROM addresses WHERE id=%s", (addr_id,))
@@ -874,7 +943,10 @@ def delete_addr(addr_id: int, mobile: str):
     return {"msg": "ok"}
 
 @router.get("/address/list", summary="地址列表")
-def address_list(mobile: str, page: int = 1, size: int = 5):
+def address_list(mobile: str, page: int = 1, size: int = 5,
+                 current_user: dict = Depends(get_current_user)):
+    if not is_platform_admin(current_user) and mobile != current_user.get("mobile"):
+        raise HTTPException(status_code=403, detail="只能查看本人地址")
     with get_conn() as conn:
         with conn.cursor() as cur:
             select_sql = build_dynamic_select(cur, "users", where_clause="mobile=%s", select_fields=["id"])
@@ -983,7 +1055,8 @@ def get_platform_return_address():
             }
 
 
-@router.post("/admin/platform-return-address", summary="设置平台退货地址（管理员）")
+@router.post("/admin/platform-return-address", summary="设置平台退货地址（管理员）",
+             dependencies=[Depends(require_platform_admin)])
 def set_platform_return_address(
         name: str = Query(..., description="收货人姓名"),
         phone: str = Query(..., description="联系电话"),
@@ -993,9 +1066,6 @@ def set_platform_return_address(
         detail: str = Query(..., description="详细地址"),
         admin_key: str = Query(..., description="后台口令")
 ):
-    if admin_key != "admin2025":
-        raise HTTPException(status_code=403, detail="后台口令错误")
-
     with get_conn() as conn:
         with conn.cursor() as cur:
             # ==================== 新增：临时禁用外键检查 ====================
@@ -1059,7 +1129,8 @@ def set_platform_return_address(
 
 
 # 积分模块
-@router.post("/points", summary="增减积分")
+@router.post("/points", summary="增减积分",
+             dependencies=[Depends(require_platform_admin)])
 def points(body: PointsReq):
     try:
         from decimal import Decimal
@@ -1082,7 +1153,9 @@ def points(body: PointsReq):
         _err(str(e))
 
 @router.get("/points/balance", summary="积分余额")
-def points_balance(mobile: str):
+def points_balance(mobile: str, current_user: dict = Depends(get_current_user)):
+    if not is_platform_admin(current_user) and mobile != current_user.get("mobile"):
+        raise HTTPException(status_code=403, detail="只能查看本人积分")
     with get_conn() as conn:
         with conn.cursor() as cur:
             # 使用动态表访问，自动处理字段不存在的情况
@@ -1099,7 +1172,10 @@ def points_balance(mobile: str):
             return row
 
 @router.get("/points/log", summary="积分流水")
-def points_log(mobile: str, points_type: str = "member", page: int = 1, size: int = 10):
+def points_log(mobile: str, points_type: str = "member", page: int = 1, size: int = 10,
+               current_user: dict = Depends(get_current_user)):
+    if not is_platform_admin(current_user) and mobile != current_user.get("mobile"):
+        raise HTTPException(status_code=403, detail="只能查看本人积分流水")
     with get_conn() as conn:
         with conn.cursor() as cur:
             select_sql = build_dynamic_select(
@@ -1218,11 +1294,9 @@ def reward_by_order(order_id: int):
 #             rows = cur.fetchall()
 #             return {"rows": rows, "total": total, "page": page, "size": size}
 
-@router.post("/user/grant-merchant", summary="后台赋予商户身份（动态字段/自动升级表）")
+@router.post("/user/grant-merchant", summary="后台赋予商户身份（动态字段/自动升级表）",
+             dependencies=[Depends(require_platform_admin)])
 def grant_merchant(mobile: str, admin_key: str):
-    if admin_key != "gm2025":
-        raise HTTPException(status_code=403, detail="口令错误")
-
     with get_conn() as conn:
         with conn.cursor() as cur:
             # 1. 嗅探 users 表真实字段
@@ -1324,7 +1398,7 @@ async def wechat_login(request: Request):
         # ✅ 关键修改：使用微信专用Token类型，生成124位Token
         token = create_access_token(user_id, token_type="wechat")
 
-        logger.info(f"微信登录成功 - 用户ID: {user_id}, Token: {token[:20]}..., Token长度: {len(token)}, openid={openid}")
+        logger.info("微信登录成功 - 用户ID: %s", user_id)
 
         # 返回业务 token 与 openid/unionid；切勿下发 session_key
         return {
@@ -1342,14 +1416,12 @@ async def wechat_login(request: Request):
         logger.exception("微信登录失败")
         raise HTTPException(status_code=500, detail="微信登录失败")
 
-@router.get("/user/mobile", response_model=MobileResp, summary="根据用户ID获取手机号")
+@router.get("/user/mobile", response_model=MobileResp, summary="根据用户ID获取手机号",
+            dependencies=[Depends(require_platform_admin)])
 def get_mobile_by_uid(
     user_id: int = Query(..., gt=0, description="用户ID"),
     key: str = Query(..., description="后台口令")
 ):
-    if key != "gm2025":
-        raise HTTPException(status_code=403, detail="口令错误")
-
     with get_conn() as conn:
         with conn.cursor() as cur:
             select_sql = build_dynamic_select(
@@ -1361,16 +1433,14 @@ def get_mobile_by_uid(
                 raise HTTPException(status_code=404, detail="用户不存在")
             return {"mobile": row["mobile"]}
 
-@router.put("/user/mobile", summary="后台修改手机号（无验证码）")
+@router.put("/user/mobile", summary="后台修改手机号（无验证码）",
+            dependencies=[Depends(require_platform_admin)])
 def change_mobile(
     user_id: int = Query(..., gt=0, description="用户ID"),
     old_mobile: str = Query(..., description="原手机号"),
     new_mobile: str = Query(..., description="新手机号"),
     key: str = Query(..., description="后台口令")
 ):
-    if key != "gm2025":
-        raise HTTPException(status_code=403, detail="口令错误")
-
     with get_conn() as conn:
         with conn.cursor() as cur:
             # 1. 旧手机号是否属于该用户
@@ -1582,7 +1652,8 @@ def get_user_all_points(
         raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
 '''
 
-@router.post("/points/clear-reward", summary="后台一键清除推荐和团队奖励点数")
+@router.post("/points/clear-reward", summary="后台一键清除推荐和团队奖励点数",
+             dependencies=[Depends(require_platform_admin)])
 def clear_reward_points(body: ClearRewardPointsReq):
     """
     清除用户的团队奖励专用点数和推荐奖励专用点数
@@ -1591,9 +1662,6 @@ def clear_reward_points(body: ClearRewardPointsReq):
     操作记录：自动记录到points_clear_log审计表
     幂等性：如果点数已为0，返回无需清除提示
     """
-    if body.admin_key != "admin2025":
-        raise HTTPException(status_code=403, detail="后台口令错误")
-
     try:
         result = UserService.clear_reward_points(body.user_id, body.reason)
         return result
@@ -1603,7 +1671,8 @@ def clear_reward_points(body: ClearRewardPointsReq):
         raise HTTPException(status_code=500, detail=f"清除失败: {str(e)}")
 
 
-@router.post("/points/clear-subsidy", summary="后台一键清除周补贴点数")
+@router.post("/points/clear-subsidy", summary="后台一键清除周补贴点数",
+             dependencies=[Depends(require_platform_admin)])
 def clear_subsidy_points(body: ClearSubsidyPointsReq):
     """
     清除用户的周补贴专用点数
@@ -1611,9 +1680,6 @@ def clear_subsidy_points(body: ClearSubsidyPointsReq):
     权限验证：需要正确的admin_key
     幂等性：如果点数已为0，返回无需清除提示
     """
-    if body.admin_key != "admin2025":
-        raise HTTPException(status_code=403, detail="后台口令错误")
-
     try:
         result = UserService.clear_subsidy_points(body.user_id, body.reason)
         return result
@@ -1623,7 +1689,8 @@ def clear_subsidy_points(body: ClearSubsidyPointsReq):
         raise HTTPException(status_code=500, detail=f"清除失败: {str(e)}")
 
 
-@router.post("/points/clear-unilevel", summary="后台一键清除联创星级点数")
+@router.post("/points/clear-unilevel", summary="后台一键清除联创星级点数",
+             dependencies=[Depends(require_platform_admin)])
 def clear_unilevel_points(body: ClearUnilevelPointsReq):
     """
     清除用户的联创星级专用点数
@@ -1631,9 +1698,6 @@ def clear_unilevel_points(body: ClearUnilevelPointsReq):
     权限验证：需要正确的admin_key
     幂等性：如果点数已为0，返回无需清除提示
     """
-    if body.admin_key != "admin2025":
-        raise HTTPException(status_code=403, detail="后台口令错误")
-
     try:
         result = UserService.clear_unilevel_points(body.user_id, body.reason)
         return result
@@ -1663,7 +1727,8 @@ def get_points_summary(
         raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
 
 
-@router.post("/admin/unilevel/set", summary="后台设置联创星级")
+@router.post("/admin/unilevel/set", summary="后台设置联创星级",
+             dependencies=[Depends(require_platform_admin)])
 def set_unilevel(body: SetUnilevelReq):
     """
     后台直接设置用户的联创星级等级
@@ -1672,9 +1737,6 @@ def set_unilevel(body: SetUnilevelReq):
     自动建表：user_unilevel 表不存在时自动创建
     幂等性：等级未变化时返回提示
     """
-    if body.admin_key != "admin2025":
-        raise HTTPException(status_code=403, detail="后台口令错误")
-
     try:
         result = UserService.set_unilevel(body.user_id, body.level)
         return result

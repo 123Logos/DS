@@ -1,5 +1,6 @@
 # api/wechat_pay/routes.py
-from fastapi import APIRouter, Request, HTTPException, Response
+from fastapi import APIRouter, Request, HTTPException, Response, Depends
+from core.auth import get_current_user, is_platform_admin
 from core.wx_pay_client import WeChatPayClient
 from core.config import WECHAT_PAY_API_V3_KEY, POINTS_DISCOUNT_RATE
 from core.response import success_response
@@ -481,7 +482,11 @@ async def wechat_refund_notify(request: Request):
         body = await request.body()
         headers = request.headers
         
-        logger.info(f"【退款回调】收到通知，headers: {dict(headers)}")
+        logger.info(
+            "【退款回调】收到通知，content_type=%s, has_signature=%s",
+            headers.get("content-type"),
+            bool(headers.get("Wechatpay-Signature")),
+        )
 
         # 1. 验签（可选但推荐）
         signature = headers.get("Wechatpay-Signature")
@@ -950,7 +955,10 @@ async def _handle_online_pay_success(order_no: str, transaction_id: str, amount:
         # 异常已由上层捕获，订单状态保持 pending_pay，不会错误更新
 
 @router.post("/refund", summary="申请订单退款")
-async def create_refund(request: Request):
+async def create_refund(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
     """
     主动申请微信退款（支持线上订单）
     请求体: {
@@ -976,14 +984,24 @@ async def create_refund(request: Request):
             with conn.cursor(pymysql.cursors.DictCursor) as cur:
                 # 查询订单
                 cur.execute(
-                    """SELECT id, order_number, transaction_id, total_amount, status, user_id 
-                    FROM orders WHERE order_number=%s""",
+                    """                    SELECT id, order_number, transaction_id, total_amount, status, user_id, refund_no
+                    FROM orders WHERE order_number=%s FOR UPDATE""",
                     (order_number,)
                 )
                 order = cur.fetchone()
                 
                 if not order:
                     raise HTTPException(404, "订单不存在")
+                if not is_platform_admin(current_user) and int(order["user_id"]) != int(current_user["id"]):
+                    raise HTTPException(403, "无权操作该订单")
+                if order["status"] == "refunding":
+                    return {
+                        "success": True,
+                        "refund_no": order.get("refund_no"),
+                        "message": "退款已在处理中",
+                    }
+                if order["status"] == "refunded":
+                    raise HTTPException(409, "该订单已完成退款")
                 
                 if order["status"] not in ["pending_ship", "pending_recv", "completed"]:
                     raise HTTPException(400, f"订单状态 {order['status']} 不允许退款")
@@ -1019,9 +1037,13 @@ async def create_refund(request: Request):
                 
                 # 更新订单状态为退款中
                 cur.execute(
-                    "UPDATE orders SET status='refunding', refund_no=%s, updated_at=NOW() WHERE id=%s",
+                    "UPDATE orders SET status='refunding', refund_no=%s, updated_at=NOW() "
+                    "WHERE id=%s AND status IN ('pending_ship','pending_recv','completed')",
                     (out_refund_no, order["id"])
                 )
+                if cur.rowcount != 1:
+                    conn.rollback()
+                    raise HTTPException(409, "订单状态已变化，请勿重复申请退款")
                 conn.commit()
                 
                 return {
