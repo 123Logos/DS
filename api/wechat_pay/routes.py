@@ -231,7 +231,10 @@ async def create_jsapi_order(request: Request):
                         body = e.response.text
                     except Exception:
                         body = str(e.response)
-                    logger.error(f"微信下单返回 HTTP 错误: status={getattr(e.response,'status_code', '')} body={body}")
+                    logger.error(
+                        "微信下单返回 HTTP 错误: status=%s",
+                        getattr(e.response, "status_code", ""),
+                    )
                     try:
                         data = json.loads(body)
                         code = data.get('code')

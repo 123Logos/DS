@@ -387,7 +387,7 @@ def reset_password(body: ResetPwdReq):
     with get_conn() as conn:
         with conn.cursor() as cur:
             if not _consume_password_reset_code(cur, body.mobile, body.sms_code):
-                conn.rollback()
+                conn.commit()
                 raise HTTPException(status_code=400, detail="验证码错误或已过期")
             select_sql = build_dynamic_select(
                 cur,
@@ -549,7 +549,9 @@ def set_level(body: SetLevelReq):
             return {"old_level": old_level, "new_level": body.new_level}
 
 @router.get("/user/info", summary="用户详情（个人中心）", response_model=UserInfoResp)
-def user_info(mobile: str):
+def user_info(mobile: str, current_user: dict = Depends(get_current_user)):
+    if not is_platform_admin(current_user) and mobile != current_user.get("mobile"):
+        raise HTTPException(status_code=403, detail="只能查询本人信息")
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1539,9 +1541,12 @@ def get_my_coupons(
     status: str = "all",
     page: int = 1,
     page_size: int = Query(20, ge=1, le=99999),
-    user_id: int = Query(..., description="用户ID")  # ← 改为必填查询参数
+    user_id: int = Query(..., description="用户ID"),
+    current_user: dict = Depends(get_current_user),
 ):
     """查询指定用户的优惠券（user_id从查询参数获取）"""
+    if not is_platform_admin(current_user) and user_id != current_user.get("id"):
+        raise HTTPException(status_code=403, detail="只能查询本人优惠券")
     service = UserService()
     return service.query_user_coupons(
         user_id=user_id,
@@ -1709,7 +1714,8 @@ def clear_unilevel_points(body: ClearUnilevelPointsReq):
 
 @router.get("/points/summary", response_model=UserPointsSummaryResponse, summary="查询用户点数汇总（累计/已用/剩余）")
 def get_points_summary(
-    user_id: int = Query(..., description="用户ID", gt=0)
+    user_id: int = Query(..., description="用户ID", gt=0),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     查询用户的点数完整信息：
@@ -1718,6 +1724,8 @@ def get_points_summary(
     - 剩余可用点数（true_total_points）
     - 已使用点数（累计 - 剩余）
     """
+    if not is_platform_admin(current_user) and user_id != current_user.get("id"):
+        raise HTTPException(status_code=403, detail="只能查询本人积分")
     try:
         summary = UserService.get_points_summary(user_id)
         return summary

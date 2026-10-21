@@ -352,7 +352,7 @@ def query_refund_status(order_number: str, current_user: dict = Depends(get_curr
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """SELECT id, status, refund_no, transaction_id, total_amount, 
+                """SELECT id, user_id, merchant_id, status, refund_no, transaction_id, total_amount,
                           created_at, updated_at
                    FROM orders WHERE order_number=%s""",
                 (order_number,)
@@ -361,7 +361,12 @@ def query_refund_status(order_number: str, current_user: dict = Depends(get_curr
             
             if not order:
                 raise HTTPException(status_code=404, detail="订单不存在")
-            if not is_platform_admin(current_user) and int(current_user["id"]) != int(order.get("user_id") or 0):
+            allowed = (
+                is_platform_admin(current_user)
+                or int(current_user["id"]) == int(order.get("user_id") or 0)
+                or int(current_user["id"]) == int(order.get("merchant_id") or 0)
+            )
+            if not allowed:
                 raise HTTPException(status_code=403, detail="无权查看该退款")
             
             # 查询资金回冲流水

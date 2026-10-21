@@ -13,6 +13,7 @@ from database_setup import DatabaseManager
 from services.finance_service import FinanceService
 from core.exceptions import FinanceException, OrderException, InsufficientBalanceException
 from core.config import (
+    settings,
     PLATFORM_MERCHANT_ID,
     MEMBER_PRODUCT_PRICE,
     MAX_TEAM_LAYER,
@@ -968,10 +969,14 @@ async def use_coupon(
     coupon_id: int = Query(..., gt=0, description="优惠券ID"),
     user_id: int = Query(..., gt=0, description="用户ID"),
     order_type: Optional[str] = Query(None, pattern=r'^(normal|member)$', description="订单商品类型（可选，用于验证优惠券适用范围）"),  # 新增参数
-    service: FinanceService = Depends(get_finance_service)
+    service: FinanceService = Depends(get_finance_service),
+    current_user: dict = Depends(get_current_user),
 ):
     """使用优惠券，使其状态变为已使用（从列表消失）"""
     try:
+        is_admin = str(current_user.get("id")) in settings.ADMIN_USER_IDS.split(",")
+        if not is_admin and user_id != current_user.get("id"):
+            raise HTTPException(status_code=403, detail="只能使用本人优惠券")
         success = service.use_coupon(coupon_id, user_id, order_type)  # 传递订单类型
         if success:
             return ResponseModel(success=True, message="优惠券使用成功")
@@ -1347,7 +1352,8 @@ async def get_member_points_detail_report(
 async def donate_true_total_points(
     user_id: int = Query(..., gt=0, description="用户ID"),
     amount: float = Query(..., gt=0, description="捐赠金额"),
-    service: FinanceService = Depends(get_finance_service)
+    service: FinanceService = Depends(get_finance_service),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     用户将 true_total_points 捐赠到公益基金账户
@@ -1356,6 +1362,9 @@ async def donate_true_total_points(
     - 可在公益基金流水中查询捐赠记录
     """
     try:
+        is_admin = str(current_user.get("id")) in settings.ADMIN_USER_IDS.split(",")
+        if not is_admin and user_id != current_user.get("id"):
+            raise HTTPException(status_code=403, detail="只能操作本人积分")
         result = service.donate_true_total_points(user_id, amount)
         return ResponseModel(
             success=True,

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel, field_validator, StringConstraints
 from typing import Optional, List, Dict, Any, Annotated
 from core.database import get_conn
@@ -7,6 +7,7 @@ from services.finance_service import get_balance, withdraw
 from decimal import Decimal
 from .refund import RefundManager
 from core.logging import get_logger
+from core.auth import get_current_user, require_platform_admin
 
 router = APIRouter()
 logger = get_logger(__name__)
@@ -14,7 +15,7 @@ logger = get_logger(__name__)
 
 class MerchantManager:
     @staticmethod
-    def list_orders(status: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+    def list_orders(status: Optional[str] = None, limit: int = 50, merchant_id: Optional[int] = None) -> List[Dict[str, Any]]:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -37,6 +38,10 @@ class MerchantManager:
                 if status:
                     sql += " WHERE o.status=%s"
                     params.append(status)
+                if merchant_id is not None:
+                    sql += " AND" if status else " WHERE"
+                    sql += " o.merchant_id=%s"
+                    params.append(merchant_id)
                 sql += " ORDER BY o.created_at DESC LIMIT %s"
                 params.append(limit)
                 cur.execute(sql, tuple(params))
@@ -316,12 +321,13 @@ class MBindBank(BaseModel):
 
 
 @router.get("/orders", summary="查询订单列表")
-def m_orders(status: Optional[str] = None):
-    return MerchantManager.list_orders(status)
+def m_orders(status: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+    merchant_id = None if str(current_user.get("id")) in settings.ADMIN_USER_IDS.split(",") else current_user.get("id")
+    return MerchantManager.list_orders(status, merchant_id=merchant_id)
 
 
 @router.post("/wx/remind-confirm-receive", summary="微信官方-提醒用户确认收货（仅快递，每单一次）")
-def m_wx_remind_confirm_receive(body: MWxRemindConfirmReceive):
+def m_wx_remind_confirm_receive(body: MWxRemindConfirmReceive, _: dict = Depends(require_platform_admin)):
     import time as time_mod
 
     ts = body.received_time if body.received_time is not None else int(time_mod.time())
@@ -332,7 +338,7 @@ def m_wx_remind_confirm_receive(body: MWxRemindConfirmReceive):
 
 
 @router.post("/wx/shipping-msg-jump-path", summary="微信官方-设置发货/确认收货消息跳转小程序路径")
-def m_wx_shipping_msg_jump_path(body: MWxShippingMsgJumpPath):
+def m_wx_shipping_msg_jump_path(body: MWxShippingMsgJumpPath, _: dict = Depends(require_platform_admin)):
     result = MerchantManager.wx_set_shipping_msg_jump_path(body.path)
     if not result["ok"]:
         raise HTTPException(status_code=400, detail=result.get("message") or "设置失败")
@@ -340,14 +346,14 @@ def m_wx_shipping_msg_jump_path(body: MWxShippingMsgJumpPath):
 
 
 @router.post("/ship/parse-scan", summary="解析扫码/面单文本为运单号与快递公司（仅解析，不写入）")
-def m_ship_parse_scan(body: MShipScanParse):
+def m_ship_parse_scan(body: MShipScanParse, _: dict = Depends(get_current_user)):
     from services.logistics_scan_parse import parse_ship_scan
 
     return {"ok": True, "data": parse_ship_scan(body.raw)}
 
 
 @router.post("/ship", summary="订单发货")
-def m_ship(body: MShip):
+def m_ship(body: MShip, current_user: dict = Depends(get_current_user)):
     tracking_number = body.tracking_number
     express_company = body.express_company
     if body.scan_text:
@@ -357,6 +363,13 @@ def m_ship(body: MShip):
         tracking_number = tracking_number or parsed.get("tracking_number")
         express_company = express_company or parsed.get("express_company")
 
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT merchant_id FROM orders WHERE order_number=%s", (body.order_number,))
+            order = cur.fetchone()
+    if not order or (str(current_user.get("id")) not in settings.ADMIN_USER_IDS.split(",")
+                     and order.get("merchant_id") != current_user.get("id")):
+        raise HTTPException(status_code=403, detail="无权操作该订单")
     result = MerchantManager.ship(
         order_number=body.order_number,
         tracking_number=tracking_number,
@@ -370,13 +383,20 @@ def m_ship(body: MShip):
 
 
 @router.post("/approve_refund", summary="审核退款申请")
-def m_refund_audit(body: MRefundAudit):
+def m_refund_audit(body: MRefundAudit, current_user: dict = Depends(get_current_user)):
+    if str(current_user.get("id")) not in settings.ADMIN_USER_IDS.split(","):
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT merchant_id FROM orders WHERE order_number=%s", (body.order_number,))
+                order = cur.fetchone()
+        if not order or order.get("merchant_id") != current_user.get("id"):
+            raise HTTPException(status_code=403, detail="无权审核该订单")
     MerchantManager.approve_refund(body.order_number, body.approve, body.reject_reason)
     return {"ok": True}
 
 
 @router.post("/withdraw", summary="申请提现", operation_id="merchant_withdraw")
-def m_withdraw(body: MWithdraw):
+def m_withdraw(body: MWithdraw, _: dict = Depends(get_current_user)):
     ok = withdraw(Decimal(str(body.amount)))
     if not ok:
         raise HTTPException(status_code=400, detail="余额不足")
@@ -384,7 +404,9 @@ def m_withdraw(body: MWithdraw):
 
 
 @router.post("/bind_bank", summary="绑定银行卡", operation_id="merchant_bind_bank")
-def m_bind(body: MBindBank):
+def m_bind(body: MBindBank, current_user: dict = Depends(get_current_user)):
+    if str(current_user.get("id")) not in settings.ADMIN_USER_IDS.split(",") and body.user_id != current_user.get("id"):
+        raise HTTPException(status_code=403, detail="只能操作本人银行卡")
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT 1 FROM users WHERE id=%s LIMIT 1", (body.user_id,))
