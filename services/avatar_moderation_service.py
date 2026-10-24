@@ -315,10 +315,19 @@ class AvatarModerationService:
         detail = data.get("detail") or data.get("Detail") or {}
         if not isinstance(detail, dict):
             detail = {}
-        try:
-            errcode = int(data.get("errcode") or result.get("errcode") or detail.get("errcode") or 0)
-        except (TypeError, ValueError):
+        errcode_value = next(
+            (
+                source["errcode"]
+                for source in (data, result, detail)
+                if "errcode" in source
+            ),
+            None,
+        )
+        if type(errcode_value) is not int:
+            logger.warning("Avatar review callback has invalid errcode: trace_id=%s", trace_id)
             errcode = -1
+        else:
+            errcode = errcode_value
         suggest = str(result.get("suggest") or data.get("suggest") or "").lower()
         if errcode != 0:
             status = "failed"

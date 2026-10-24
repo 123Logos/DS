@@ -145,3 +145,19 @@ def test_risky_callback_removes_the_triggering_file_and_is_idempotent(monkeypatc
 
     assert state["status"] == "risky"
     assert cleaned == [pending]
+
+
+def test_callback_without_strict_success_code_fails_closed(monkeypatch, tmp_path: Path):
+    pending = tmp_path / "avatar_pending.jpg"
+    pending.write_bytes(b"image")
+    state = {"status": "pending"}
+    monkeypatch.setattr(avatar_module, "AVATAR_PENDING_DIR", tmp_path)
+    monkeypatch.setattr(avatar_module, "get_conn", lambda: _CallbackConnection(state, pending))
+    monkeypatch.setattr(AvatarModerationService, "_cleanup_paths", staticmethod(lambda paths: None))
+
+    AvatarModerationService.handle_result({
+        "trace_id": "trace-1",
+        "result": {"suggest": "pass"},
+    })
+
+    assert state["status"] == "failed"
