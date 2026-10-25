@@ -256,7 +256,7 @@ class StoreSetupService:
                 # 计算压缩后文件大小
                 file_size = file_path.stat().st_size
         except Exception as e:
-            logger.error(f"LOGO图片处理失败: {str(e)}")
+            logger.error("Store logo processing failed: error_type=%s", type(e).__name__)
             raise HTTPException(status_code=500, detail="图片处理失败")
 
         # 6. 保存到数据库（仿照头像写库逻辑）
@@ -353,10 +353,10 @@ class StoreSetupService:
                     if os.path.exists(file_path):
                         return file_path
                     else:
-                        logger.warning(f"LOGO文件不存在: {file_path}")
+                        logger.warning("Store logo file missing")
                         return None
                 except Exception as e:
-                    logger.exception(f"查询LOGO路径失败: {str(e)}")
+                    logger.error("Store logo path lookup failed: error_type=%s", type(e).__name__)
                     return None
 
 

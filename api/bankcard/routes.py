@@ -52,7 +52,8 @@ class BankcardModifyRequest(BaseModel):
     new_bank_name: str = Field(..., min_length=2, max_length=128, description="新开户行全称")
     bank_branch_id: Optional[str] = Field(None, max_length=128, description="新开户行联行号")
     bank_address_code: Optional[str] = Field(None, pattern=r'^\d{6}$', description="新开户地区码")
-    sms_code: str = Field(..., description="短信验证码")
+    sms_code: str = Field(pattern=r"^\d{6}$")
+    session_id: str = Field(min_length=32, max_length=32)
 
     @validator('new_account_number')
     def validate_account_number(cls, v):
@@ -98,7 +99,7 @@ async def bind_bankcard(
         )
         return {"code": 0, "message": "绑定成功", "data": result}
     except Exception as e:
-        logger.error(f"绑定失败: {e}")
+        logger.error("security_operation_failed")
         error_msg = str(e)
         if error_msg.startswith("F"):
             code = error_msg.split(":")[0]
@@ -109,14 +110,18 @@ async def bind_bankcard(
 
 @router.post("/sms/send", summary="发送短信验证码", tags=["银行卡管理"])
 async def send_sms_code(
+        request: Request,
         account_number: str = Form(..., description="银行卡号", pattern=r'^\d{16,30}$'),
+        purpose: str = Form("bankcard_bind", pattern=r"^bankcard_(bind|modify)$"),
+        device_id: str = Form(..., min_length=16, max_length=128),
         current_user: dict = Depends(get_current_user)
 ):
-    """发送短信验证码（测试环境返回模拟验证码，生产环境真实发送）"""
+    """向当前用户绑定手机号发送用途绑定的真实短信。"""
     try:
         result = await BankcardService.send_sms_code(
             user_id=current_user["id"],
-            account_number=account_number
+            account_number=account_number, purpose=purpose,
+            ip=request.client.host if request.client else "unknown", device=device_id
         )
 
         response = {
@@ -128,14 +133,11 @@ async def send_sms_code(
             }
         }
 
-        if result.get("mock_code"):
-            response["data"]["mock_code"] = result["mock_code"]
-            response["message"] = "验证码已发送（测试模式）"
-
         return response
-    except Exception as e:
-        logger.error(f"发送验证码失败: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=503, detail="短信服务暂不可用")
 
 
 @router.post("/modify/apply", summary="申请改绑银行卡", tags=["银行卡管理"])
@@ -145,7 +147,7 @@ async def apply_modify_bankcard(
 ):
     """申请改绑银行卡（需验证微信数据，原卡自动解绑）"""
     try:
-        result = BankcardService.modify_bankcard(
+        result = await BankcardService.modify_bankcard(
             user_id=current_user["id"],
             new_bank_name=request.new_account_bank,
             new_bank_account=request.new_account_number,
@@ -153,11 +155,11 @@ async def apply_modify_bankcard(
             bank_branch_id=request.bank_branch_id,
             bank_address_code=request.bank_address_code,
             admin_key=None,
-            ip_address="127.0.0.1"
+            ip_address="127.0.0.1", sms_code=request.sms_code, session_id=request.session_id
         )
         return {"code": 0, "message": "改绑申请已提交", "data": result}
     except Exception as e:
-        logger.error(f"改绑申请失败: {e}")
+        logger.error("security_operation_failed")
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -174,7 +176,7 @@ async def get_modify_status(
         )
         return {"code": 0, "message": "查询成功", "data": result}
     except Exception as e:
-        logger.error(f"查询改绑状态失败: {e}")
+        logger.error("security_operation_failed")
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -187,7 +189,7 @@ async def list_bankcards(
         result = BankcardService.list_bankcards(user_id=current_user["id"])
         return {"code": 0, "message": "查询成功", "data": result}
     except Exception as e:
-        logger.error(f"查询列表失败: {e}")
+        logger.error("security_operation_failed")
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -200,7 +202,7 @@ async def get_bind_status(
         result = BankcardService.query_bind_status(user_id=current_user["id"])
         return {"code": 0, "message": "查询成功", "data": result}
     except Exception as e:
-        logger.error(f"查询状态失败: {e}")
+        logger.error("security_operation_failed")
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -217,7 +219,7 @@ async def get_logs(
         )
         return {"code": 0, "message": "查询成功", "data": result}
     except Exception as e:
-        logger.error(f"获取日志失败: {e}")
+        logger.error("security_operation_failed")
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -230,7 +232,7 @@ async def get_my_bankcard(
         result = BankcardService.query_my_bankcard(user_id=current_user["id"])
         return {"code": 0, "message": "查询成功", "data": result}
     except Exception as e:
-        logger.error(f"查询我的银行卡失败: {e}")
+        logger.error("security_operation_failed")
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -247,7 +249,7 @@ async def set_default_bankcard(
         )
         return {"code": 0, "message": "设置成功", "data": result}
     except Exception as e:
-        logger.error(f"设置默认卡失败: {e}")
+        logger.error("security_operation_failed")
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -265,4 +267,4 @@ def register_bankcard_routes(app):
             500: {"description": "服务器内部错误"}
         }
     )
-    logger.info("✅ 银行卡路由注册完成 (路径: /api/bankcard/*)")
+    logger.info("security_operation_event")

@@ -85,14 +85,19 @@ WECHAT_APP_SECRET=WECHAT_APP_SECRET
 - 启动后，访问 `http://127.0.0.1:<port>/docs` 查看 API 文档
 - 或访问 `http://127.0.0.1:<port>/redoc` 查看 ReDoc 文档
 
-### 会员权益需求与内容安全联调
+### 会员权益需求、安全契约与验证
 
-- [业务接口文档与 V1.1 需求差异](docs/禹泽小程序接口文档.md)：区分当前接口与尚未实现的咯哒权益、白酒专区目标契约。
-- [msgSecCheck 与资料写入契约](docs/api/msg-sec-check.md)：微信 v2 仅明确 `pass` 放行；代理违规/异常仍返回 HTTP 200 + `pass=false`。资料修改必须登录并匹配本人，昵称写入端独立审核。
-- [安全与 WSL 测试报告](docs/禹泽项目安全与测试报告.md)：48 项回归通过及 HTTP 冒烟边界；仍有未修复的资金、权限、找回密码风险，不能据此宣称可安全上线。
-- [待完成事项](docs/待完成事项.md)：前端迁移、真实微信联调、业务确认与上线阻断问题。
-
-2026-10-18 内容安全变更：`/user/update-profile` 新增 Bearer 认证；新微信注册昵称需审核；`/user/auth` 新注册不再接受自定义 `name`。旧客户端需按接口文档迁移，不提供匿名或异常放行兼容路径。
+- [业务接口文档与 V1.1 需求差异](docs/禹泽小程序接口文档.md)：区分当前接口、安全变更、未实现的咯哒权益/白酒目标契约；Q1–Q17及原资产政策未由本轮改动。
+- [认证与用户隐私契约](docs/api/security-auth.md)：session-backed Bearer、短信挑战/密码找回、用户/银行卡权限与迁移要求。
+- [订单、支付与退款契约](docs/api/security-payments.md)：服务端权威价格、状态竞态、持久退款恢复和回调。
+- [财务安全契约](docs/api/security-finance.md)：默认管理员访问、个人数据作用域、持久幂等发券、提款供应商未接入边界。
+- [内容审核契约](docs/api/msg-sec-check.md)：微信文本审核与商品嵌套字段/最终快照写入规则。
+- [隔离验证执行指南](docs/PR220-isolation-execution.md)：候选环境运行说明；不代表已经运行或通过。
+- [PR218 安全验证报告](docs/PR218-security-verification-20261025.md)：baseline实测证据、隔离基础设施和候选待验/外部边界。
+- [历史安全与测试报告](docs/禹泽项目安全与测试报告.md)：2026-10-21历史内容安全48项记录，不是PR218候选验收证据。
+- [系统权限接口](docs/api/security-auth.md#system-merchant-role-administration)：`POST /api/system/grant-system` 和 `PUT /api/system/sentences` 需管理员 Bearer；公开 `GET /api/system/sentences` 为只读投影。密码挑战绑定账号ID，不是仅绑定手机号。
+- [待完成事项](docs/待完成事项.md)：保留需求历史，分列已实现待验、外部provider及仍未实现业务。
+2026-10-25 PR218最终扩展round 4的WSL和confined server suite均为141 passed；服务和测试资源已清理，90个生产源文件hash未变。完整环境版本、JUnit、cleanup与限制见[PR218验证报告](docs/PR218-security-verification-20261025.md)。这是候选隔离测试，不等于实际生产部署、全面暴露审计或真实provider交易；真实短信、微信审核/支付/退款和商户银行卡提款仍未完成外部验证或接入。
 
 ---
 

@@ -116,7 +116,7 @@ class UpdateProfileReq(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=100, description="昵称；提供时需经微信文本审核")
     avatar_path: Optional[str] = None
     old_password: Optional[str] = None
-    new_password: Optional[str] = None
+    new_password: Optional[str] = Field(None, min_length=8, max_length=72)
 
     @field_validator("name")
     @classmethod
@@ -129,15 +129,15 @@ class UpdateProfileReq(BaseModel):
 class ResetPwdReq(BaseModel):
     """重置密码请求"""
     mobile: str
-    sms_code: str = Field(..., description="短信验证码（先 mock 111111）")
-    new_password: str
+    sms_code: str = Field(pattern=r"^\d{6}$", description="真实短信验证码，仅最新签发有效")
+    new_password: str = Field(min_length=8, max_length=72)
 
 
 class AdminResetPwdReq(BaseModel):
     """管理员重置密码请求"""
     mobile: str
-    new_password: str
-    admin_key: str = Field(..., description="后台口令")
+    new_password: str = Field(min_length=8, max_length=72)
+    admin_key: Optional[str] = Field(None, description="旧字段，不参与授权")
 
 
 class SelfDeleteReq(BaseModel):
@@ -150,7 +150,7 @@ class SelfDeleteReq(BaseModel):
 class FreezeReq(BaseModel):
     """冻结请求"""
     mobile: str
-    admin_key: str = Field(..., description="后台口令")
+    admin_key: Optional[str] = Field(None, description="旧字段，不参与授权")
     reason: str = "后台冻结/解冻"
 
 
@@ -291,7 +291,7 @@ class SetUnilevelReq(BaseModel):
     """后台设置联创星级请求"""
     user_id: int = Field(..., gt=0, description="用户ID")
     level: int = Field(..., ge=0, le=3, description="联创等级：0=无, 1=一星, 2=二星, 3=三星")
-    admin_key: str = Field(..., description="后台口令")
+    admin_key: Optional[str] = Field(None, description="旧字段，不参与授权")
 
 
 class ReferralQRResponse(BaseModel):

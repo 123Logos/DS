@@ -34,17 +34,13 @@ def _wxacode_response_to_png(resp: httpx.Response, context: str) -> bytes:
     try:
         err = json.loads(raw.decode("utf-8"))
         if isinstance(err, dict) and "errcode" in err:
-            msg = err.get("errmsg", str(err))
-            logger.error("%s 微信返回错误: %s", context, err)
-            raise ValueError(msg)
+            errcode = err.get("errcode")
+            logger.error("%s 微信返回错误: errcode=%s", context, errcode)
+            raise ValueError(f"微信返回图片错误 (errcode={errcode})")
     except (UnicodeDecodeError, json.JSONDecodeError):
         pass
-    logger.error(
-        "%s 响应非图片(前16字节=%r), content-type=%s",
-        context,
-        raw[:16],
-        resp.headers.get("content-type", ""),
-    )
+    logger.error("%s 响应非图片: response_bytes=%s content_type=%s",
+                 context, len(raw), resp.headers.get("content-type", ""))
     raise ValueError("微信返回非图片数据，请检查 access_token、路径与 env_version 配置")
 
 
@@ -84,8 +80,8 @@ async def get_access_token(*, force_refresh: bool = False) -> str:
             ret.raise_for_status()
             data = ret.json()
         if data.get("errcode"):
-            logger.error("stable_token 失败: %s", data)
-            raise ValueError(data.get("errmsg") or str(data))
+            logger.error("stable_token request failed: errcode=%s", data.get("errcode"))
+            raise ValueError("stable_token request failed")
         token = data["access_token"]
         expires_in = int(data.get("expires_in") or 7200)
         ttl = max(120, min(7000, expires_in - 300))
@@ -151,7 +147,7 @@ async def get_wxacode(path: str, scene: str = "", width: int = 280) -> bytes:
         except ValueError as e:
             last_err = e
             if attempt == 0 and _looks_like_stale_access_token(str(e)):
-                logger.warning("getwxacode token 失效，将强制刷新后重试: %s", e)
+                logger.warning("getwxacode token refresh retry: error_type=%s", type(e).__name__)
                 continue
             raise
     assert last_err is not None
@@ -193,7 +189,7 @@ async def get_wxacode_unlimit(scene: str, page: str, width: int = 280) -> bytes:
         except ValueError as e:
             last_err = e
             if attempt == 0 and _looks_like_stale_access_token(str(e)):
-                logger.warning("getwxacodeunlimit token 失效，将强制刷新后重试: %s", e)
+                logger.warning("getwxacodeunlimit token refresh retry: error_type=%s", type(e).__name__)
                 continue
             raise
     assert last_err is not None
@@ -225,17 +221,17 @@ async def generate_miniprogram_urllink(*, path: str, query: str = "") -> str:
         async with httpx.AsyncClient() as client:
             resp = await client.post(api_url, json=body, timeout=15)
             resp.raise_for_status()
-        data = resp.json()
+            data = resp.json()
         errcode = int(data.get("errcode") or 0)
         if errcode:
-            logger.error("generate_urllink 失败: %s", data)
+            logger.error("generate_urllink failed: errcode=%s", errcode)
             if attempt == 0 and errcode == 40001:
-                logger.warning("generate_urllink 40001，将强制刷新 stable_token 后重试")
+                logger.warning("generate_urllink token refresh retry")
                 continue
-            raise ValueError(data.get("errmsg") or str(data))
+            raise ValueError("generate_urllink request failed")
         link = data.get("url_link")
         if not link:
-            logger.error("generate_urllink 无 url_link: %s", data)
+            logger.error("generate_urllink response missing link")
             raise ValueError("微信未返回 url_link")
         return link
     raise RuntimeError("generate_urllink: 重试后仍失败")
@@ -281,17 +277,17 @@ async def generate_miniprogram_openlink(*, path: str, query: str = "") -> str:
         async with httpx.AsyncClient() as client:
             resp = await client.post(api_url, json=body, timeout=15)
             resp.raise_for_status()
-        data = resp.json()
+            data = resp.json()
         errcode = int(data.get("errcode") or 0)
         if errcode:
-            logger.error("generatescheme 失败: %s", data)
+            logger.error("generatescheme failed: errcode=%s", errcode)
             if attempt == 0 and errcode == 40001:
-                logger.warning("generatescheme 40001，将强制刷新 stable_token 后重试")
+                logger.warning("generatescheme token refresh retry")
                 continue
-            raise ValueError(data.get("errmsg") or str(data))
+            raise ValueError("generatescheme request failed")
         openlink = data.get("openlink")
         if not openlink:
-            logger.error("generatescheme 无 openlink: %s", data)
+            logger.error("generatescheme response missing openlink")
             raise ValueError("微信未返回 openlink")
         return openlink
     raise RuntimeError("generatescheme: 重试后仍失败")

@@ -97,7 +97,6 @@ def test_legacy_registration_cannot_publish_unreviewed_name(monkeypatch):
 @pytest.mark.parametrize("verdict,status", [("risky", 400), ("review", 400), ("pass", 200)])
 def test_new_wechat_user_requires_nickname_verdict(monkeypatch, verdict, status):
     monkeypatch.setattr(routes, "get_conn", _EmptyConnection)
-    monkeypatch.setattr(routes.WechatService, "ensure_openid_column", lambda: None)
     monkeypatch.setattr(routes.WechatService, "get_openid_by_code", lambda code: "verified-owner")
     monkeypatch.setattr(routes.WechatService, "check_user_by_openid", lambda openid: None)
     registered = []

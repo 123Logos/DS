@@ -99,13 +99,13 @@ async def wxa_msg_push(request: Request):
 
     try:
         data = _parse_wxa_message(body, request.headers.get("content-type", ""))
-    except (ET.ParseError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as e:
-        logger.error("解析小程序消息失败: %s", e)
-        raise HTTPException(status_code=400, detail="invalid message") from e
+    except (ET.ParseError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        logger.warning("小程序消息格式无效")
+        raise HTTPException(status_code=400, detail="invalid message") from None
 
     msg_type = data.get("MsgType") or data.get("msg_type") or ""
     event = data.get("Event") or data.get("event") or ""
-    logger.info("小程序推送 MsgType=%s Event=%s keys=%s", msg_type, event, list(data.keys()))
+    logger.info("小程序推送 received")
 
     if msg_type != "event" or not event:
         return PlainTextResponse(content="success")
@@ -123,7 +123,7 @@ async def wxa_msg_push(request: Request):
     elif event == "wxa_trade_controlled":
         process_wxa_trade_controlled(data)
     else:
-        logger.info("未专门处理的小程序事件 Event=%s，已忽略", event)
+        logger.info("未专门处理的小程序事件，已忽略")
 
     return PlainTextResponse(content="success")
 

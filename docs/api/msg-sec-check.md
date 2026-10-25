@@ -144,6 +144,66 @@ Content-Type: application/json
 ## 旧手机号注册入口影响
 
 `POST /user/auth` 的新用户分支禁止非null的 `name`（400，`detail="自定义昵称请通过微信登录或登录后的资料审核接口设置"`）；省略或null仍使用现有服务端默认昵称。已有账号密码登录不改昵称。本入口无可信微信openid，不允许伪造身份送审。旧客户端应省略注册name，并在微信登录后的资料修改接口设置昵称；本次未实现手机号验证码认证或账号绑定新流程。
+## 商品创建与更新的文本安全审核
+
+适用接口：`POST /api/products` 新建商品、`PUT /api/products/{id}` 修改商品。两者均要求 Bearer 登录；创建者必须是商家或平台，更新者必须是商品所属商家或平台管理员。Content-Type 和响应 Content-Type 为 `application/json`，成功返回 HTTP 200。
+
+### 请求参数及审核范围
+
+| 参数 | 位置 | JSON类型 | 必填/默认 | 校验及业务含义 |
+| --- | --- | --- | --- | --- |
+| Authorization | header | string | 是/无 | `Bearer <business-token>`，服务端确定操作者；客户端 `user_id` 不能覆盖身份 |
+| Content-Type | header | string | 是/无 | 必须为 `application/json` |
+| name | body | string/null | 创建必填；更新可选 | 商品名称；实际保存的最终值独立审核 |
+| description | body | string/null | 否/null | 商品描述；创建/更新最终值独立审核 |
+| category | body | string/null | 创建必填；更新可选 | 必须为项目既有类别；最终值审核 |
+| buy_rule | body | string/null | 否/null | 对外购买规则；最终值审核 |
+| attributes | body | object[]/null | 否/null | 属性数组；审核每个属性键、名称和值文本，不将 JSON 整体送审。字段兼容 `{ "name": "材质", "value": "棉" }` 与单键 `{ "材质": "棉" }` |
+| skus | body | object[]/null | 创建必填；更新可选 | 每个 SKU 的 `sku_code`、规格对象每个 key/value 文本分别审核。创建SKU另需价格、库存；更新已有SKU可带 id，新增SKU不带 id且需 sku_code/price/stock |
+
+产品字段完整说明：`user_id` 为body integer/null，创建时忽略、更新时仅平台管理员可更改；`is_member_product` boolean默认false；`status` integer默认0且仅允许0/1/2/3（草稿/上架/下架/缺货）；`freight` number默认0且只接受0；`max_points_discount`、`reward_rain`、`reward_points` 为非负number/null；`is_virtual`、`cash_only` boolean默认false。这些机器/非文本字段不送审。创建需要 `skus` 数组；每个SKU `sku_code` string必填、`price` number与`stock` integer必填非负、`original_price` 非负number/null，`specifications` 是可嵌套JSON object/null。更新SKU的 `id` integer/null；无id为新增（需sku_code/price/stock），带id必须属于该商品；提供列表沿用现有语义：未列出的SKU删除。`attributes` object[]/null；缺省/null不修改，提供数组时替换现有属性；无效空属性项保持原有跳过行为。
+
+仅审核公开文本字符串叶项及对象键；数字/布尔/内部ID等机器字段不送审。SKU规格的所有嵌套键与字符串值递归逐项审核；空白文本不调用微信。每个文本项按Python `len()` (Unicode code points)上限2500字符，超过时HTTP 400并返回字段路径，不截断；多个文本项累计长度不限制，不把JSON聚合长度当限制。
+
+### 请求示例
+
+```http
+POST https://<API_HOST>/api/products
+Authorization: Bearer <business-token>
+Content-Type: application/json
+
+{"name":"棉质上衣","description":"日常穿着","category":"服装鞋帽","buy_rule":"每人限购","skus":[{"sku_code":"shirt-blue","price":99,"stock":5,"specifications":{"颜色":"蓝色","尺码":["M","L"]}}],"attributes":[{"name":"材质","value":"棉"}]}
+```
+
+更新示例：`PUT https://<API_HOST>/api/products/42`，同样Headers，Body可为 `{"description":"新描述","attributes":[{"name":"材质","value":"棉"}]}`；非法示例包括任一公开文本项为2510字符，或将 `specifications` 的嵌套值设为违规内容，返回审核/长度错误且不写入任何产品、属性或SKU部分数据。
+
+成功返回原有商品响应：`status`（string，必返，`success`）、`message`（string，必返，创建/更新结果）、`data`（object，必返，完整商品记录）。`data.id` 是商品integer ID；`name`、`pinyin`、`description`、`category`、`status`、`user_id` 分别是商品文本/状态/拥有者；`main_image`、`detail_images`、`banner_images` 是图片路径或列表（无图时可为null/空列表）；`is_member_product`、`buy_rule`、`freight`、`max_points_discount`、`is_home_recommend`、`reward_rain`、`reward_points`、`is_virtual`、`cash_only` 为商品销售/展示属性；`created_at`、`updated_at` 是时间戳。`skus` 是数组，每项 `id` (integer)、`sku_code` (string)、`price` (number)、`original_price` (number/null)、`stock` (integer)、`specifications` (object/null)。`attributes` 是数组，每项 `name` 和 `value` 为string。未另行给值的字段仍按实际schema返回；无SKU/属性时是空数组。成功响应示例结构：`{"status":"success","message":"商品已创建","data":{"id":42,"name":"棉质上衣","pinyin":"mianzhi shangyi","description":"日常穿着","category":"服装鞋帽","status":0,"user_id":7,"main_image":null,"detail_images":[],"skus":[{"id":11,"sku_code":"shirt-blue","price":99.0,"original_price":null,"stock":5,"specifications":{"颜色":"蓝色","尺码":["M","L"]}}],"attributes":[{"name":"材质","value":"棉"}]}}`。
+
+
+### 使用规则、错误与兼容性
+
+写入端每次调用都独立送审，不依赖客户端预检；所有文本项明确通过后才执行插入/更新。任一违规、review、上游不可用/异常即 fail-closed，不发生部分写入。更新先读取不可变内容快照并关闭数据库连接，再调用审核服务；审核后启动短事务锁定商品、SKU及属性，若任何已审核商品文本或嵌套SKU/属性文本与快照不一致，则返回409且不写入。未发生冲突才在同一事务保存，禁止审核期间持有连接/锁。平台管理员可更新任何商品，但无openid仍不能写入；必须有服务端绑定openid。
+
+| HTTP | 触发 | 客户端处理 |
+| --- | --- | --- |
+| 200 | 审核通过且完整写入 | 使用响应中的 `data` 刷新商品 |
+| 400 | 审核拒绝、单项文本超过2500字符或数据库输入错误 | 保留草稿；超长项按detail中的字段路径缩短，不自动截断；不得假设有部分更新 |
+| 403 | 角色/所有权不符或当前账户无微信审核openid | 禁止提交/先绑定微信身份 |
+| 404 | 更新商品不存在 | 刷新商品列表 |
+| 422 | 请求模型字段无效 | 按字段错误修正 |
+| 409 | WeChat审核期间商品文本被其他写请求修改，导致最终快照已过期 | 丢弃此次结果，重新加载商品内容后再次编辑/送审；不自动重试覆盖 |
+| 503 | 微信审核不可用 | 保留草稿，稍后重试；服务暂不可用不得放行 |
+
+旧客户端请求/响应形状不变；更新时遗漏文本字段仍保存原值，但原值也纳入最终快照审核。没有审核票据、额度扣减或幂等Key；重复调用会重新消耗审核额度。快照冲突返回409，客户端应重新加载再提交，不自动覆盖并发写入。事务短锁仅用于快照一致性检查和保存。当前SKU/属性结构与请求兼容，不需迁移。
+
+## 商品文本审核变更记录（CONTENT-001）
+
+| 变更前 | 变更后 | 影响 |
+| --- | --- | --- |
+| 商品attributes与SKU规格以整段JSON审核，长JSON可能超过服务上限或漏审内部字段 | 逐个审核公开文本键/值及SKU文本，不做聚合JSON和截断 | 多次微信审核调用，但每项遵守2500字符限制 |
+| 已更新只审核请求字段，或在数据库事务锁中等待上游审核 | 读取快照后关闭DB连接再审核；通过后锁定记录并比较全部审核文本，冲突HTTP409，不写入 | 网络等待不持锁；并发编辑者重新载入后再提交 |
+
+真实微信端字符边界和provider行为仍需授权环境联调；本地控制流/mock测试不构成真实微信验证。
 
 ## 验证记录
 

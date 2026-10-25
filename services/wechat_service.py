@@ -1,8 +1,6 @@
 # services/wechat_service.py - 微信登录服务
 import uuid
 import pymysql
-import jwt
-import datetime
 import requests
 import base64
 import json
@@ -21,21 +19,6 @@ logger = get_logger(__name__)
 class WechatService:
     """微信登录服务"""
 
-    @staticmethod
-    def ensure_openid_column():
-        """确保 users 表存在 openid 字段（兼容旧库）"""
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SHOW COLUMNS FROM users LIKE 'openid'")
-                exists = cur.fetchone()
-                if not exists:
-                    try:
-                        cur.execute("ALTER TABLE users ADD COLUMN openid VARCHAR(64) UNIQUE")
-                        conn.commit()
-                    except pymysql.err.InternalError as e:
-                        if e.args[0] == 1060:  # 字段已存在
-                            return
-                        raise
 
     @staticmethod
     def check_user_by_openid(openid: str) -> Optional[Dict[str, Any]]:
@@ -155,7 +138,7 @@ class WechatService:
             raise HTTPException(status_code=500, detail="未配置微信小程序 AppId/Secret，请在 .env 中设置 WECHAT_APP_ID 与 WECHAT_APP_SECRET")
 
         url = f"https://api.weixin.qq.com/sns/jscode2session?appid={WECHAT_APP_ID}&secret={WECHAT_APP_SECRET}&js_code={code}&grant_type=authorization_code"
-        response = requests.get(url)
+        response = requests.get(url, timeout=10)
         if response.status_code != 200:
             raise HTTPException(status_code=500, detail="微信接口调用失败")
 
@@ -169,19 +152,6 @@ class WechatService:
 
         return openid, session_key
 
-    @staticmethod
-    def generate_token(user_id: int) -> str:
-        """生成JWT token"""
-        # 确保 payload 中不包含 Decimal 或其他不可序列化对象
-        uid = int(user_id)
-        exp_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
-        exp_ts = int(exp_dt.timestamp())
-        payload = {
-            "user_id": uid,
-            "exp": exp_ts
-        }
-        token = jwt.encode(payload, "your_secret_key", algorithm="HS256")
-        return token
 
     @staticmethod
     def generate_wxacode(scene: str, page: str = "pages/index/index") -> Optional[bytes]:
@@ -201,7 +171,7 @@ class WechatService:
 
             access_token = resp.get("access_token")
             if not access_token:
-                logger.error(f"获取 access_token 失败: {resp}")
+                logger.error("wechat_operation_failed")
                 return None
 
             # 调用微信生成小程序码接口
@@ -222,11 +192,11 @@ class WechatService:
             if "image" in content_type:
                 return resp.content
             else:
-                logger.error(f"生成小程序码失败: {resp.text}")
+                logger.error("wechat_operation_failed")
                 return None
 
         except Exception as e:
-            logger.exception(f"生成小程序码异常: {e}")
+            logger.error("wechat_operation_failed")
             return None
 
     @staticmethod
@@ -264,7 +234,7 @@ class WechatService:
             return result['phoneNumber']
 
         except Exception as e:
-            logger.error(f"解密失败: {e}")
+            logger.error("wechat_operation_failed")
             raise ValueError("手机号解密失败，请检查参数是否正确")
 
     @staticmethod
@@ -284,7 +254,7 @@ class WechatService:
             return resp["phone_info"]["phoneNumber"]
 
         except Exception as e:
-            logger.error(f"获取手机号失败: {e}")
+            logger.error("wechat_operation_failed")
             raise
 
     @staticmethod

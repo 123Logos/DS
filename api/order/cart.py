@@ -1,5 +1,6 @@
-from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, PositiveInt
+from fastapi import APIRouter, HTTPException, Query, Depends
+from pydantic import BaseModel, StrictInt, Field
+from core.auth import get_current_user
 from core.database import get_conn
 from typing import List, Dict, Any, Optional
 import json
@@ -137,19 +138,21 @@ class CartManager:
 class CartAdd(BaseModel):
     user_id: int
     product_id: int
-    quantity: PositiveInt = 1
+    quantity: StrictInt = Field(1, gt=0)
     specifications: Optional[Dict[str, Any]] = None
 
 class CartDecrease(BaseModel):
     user_id: int
     product_id: int
-    quantity: PositiveInt = 1
+    quantity: StrictInt = Field(1, gt=0)
     specifications: Optional[Dict[str, Any]] = None
 
 
 # ----------- 路由 -----------
 @router.post("/add", summary="添加商品到购物车")
-def cart_add(body: CartAdd):
+def cart_add(body: CartAdd, current_user: dict = Depends(get_current_user)):
+    if body.user_id != int(current_user['id']):
+        raise HTTPException(403, '只能操作本人购物车')
     return {"ok": CartManager.add(body.user_id,
                                   body.product_id,
                                   body.quantity,
@@ -157,17 +160,23 @@ def cart_add(body: CartAdd):
 
 
 @router.get("/{user_id}", summary="获取购物车列表")
-def get_cart(user_id: int):
+def get_cart(user_id: int, current_user: dict = Depends(get_current_user)):
+    if user_id != int(current_user['id']):
+        raise HTTPException(403, '只能查看本人购物车')
     # 去掉 spec_map_str 参数，只读库
     return CartManager.list_items(user_id)
 
 
 @router.delete("/{user_id}/{product_id}", summary="从购物车移除商品")
-def cart_remove(user_id: int, product_id: int):
+def cart_remove(user_id: int, product_id: int, current_user: dict = Depends(get_current_user)):
+    if user_id != int(current_user['id']):
+        raise HTTPException(403, '只能操作本人购物车')
     return {"ok": CartManager.remove(user_id, product_id)}
 
 @router.post("/decrease", summary="按规格扣减/移除购物车商品")
-def cart_decrease(body: CartDecrease):
+def cart_decrease(body: CartDecrease, current_user: dict = Depends(get_current_user)):
+    if body.user_id != int(current_user['id']):
+        raise HTTPException(403, '只能操作本人购物车')
     ok = CartManager.decrease(
         body.user_id,
         body.product_id,

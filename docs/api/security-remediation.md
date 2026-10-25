@@ -14,11 +14,11 @@
 
 退款、确认收货、发货等状态更新必须在同一事务内锁定订单或使用预期旧状态条件更新，并检查影响行数。一次退款请求必须持久化稳定请求号；微信超时或本地提交失败时，后续重试复用该请求号并查询结果，不生成第二笔逻辑退款。
 
-找回密码流程为：发送接口生成随机六位码 -> 仅保存 HMAC 摘要和用途/手机号/过期时间 -> 调用短信适配器发送 -> 核销时行锁校验并累计失败次数 -> 成功后原子改密并撤销所有可撤销会话。短信供应商通过配置适配器接入；未配置供应商时返回明确错误，不允许固定验证码或手工插表作为生产流程。
+Password recovery is documented in the canonical [authentication contract](security-auth.md#send-password-reset-sms): call `POST /user/reset-password/sms` to create a provider-bound challenge, then redeem it through `POST /user/reset-password`. Challenges are HMAC-bound with `SMS_CODE_SECRET`, not `JWT_SECRET_KEY`; they must never be inserted manually. Missing provider configuration or uncertain provider acceptance returns an error, not a usable code.
 
 微信支付/退款回调只有在本地订单、资金拆分、积分和优惠券回退事务成功提交后才返回成功；数据库异常或结算异常必须返回微信可识别的失败响应，使通知重试。重复通知依赖订单状态、通知事件唯一键和幂等更新，只允许结算一次。
 
-当前环境没有可用隔离 MySQL，因此双连接库存/余额竞争、真实短信、真实微信支付/退款回调属于未验证外部边界；测试不得以 SQLite 或手工验证码替代这些证据。
+The coordinator has provisioned isolated WSL and server MySQL/Redis infrastructure (see [verification report](../PR218-security-verification-20261025.md)). Four baseline probes record pre-remediation failures. Candidate verification is still pending coordinator-run results; real SMS, WeChat payment/refund, and other external provider outcomes remain unverified and must not be represented by controlled-boundary tests.
 
 ### 第三批：审计、内容、日志和证据
 
@@ -26,6 +26,10 @@
 
 日志允许记录内部 ID、订单号、事件类型、错误类别和脱敏后的有限标识；禁止原始 Token、手机号、access token、支付请求体、回调 Headers、短信验证码和完整个人资料。异常日志同样适用白名单。
 
+
+## Canonical contracts and verification
+
+This file is a historical remediation overview. Current endpoint details are maintained in the linked per-slice contracts above; where this summary differs, follow those contracts. The current candidate verification status and independently recorded baseline evidence are in [PR218 verification report](../PR218-security-verification-20261025.md).
 ## 接口变更记录
 
 | 版本 | 变更 | 兼容性与迁移 |
@@ -36,7 +40,7 @@
 
 ## 回归证据矩阵
 
-必须覆盖匿名/普通用户/本人/跨用户/所属商家/其他商家/管理员；价格篡改、非法数量、退款查询本人/他人、验证码错误计数/并发核销/过期、状态竞态、稳定退款号、失败回调重放、逐项内容审核和日志白名单。当前可执行命令为 `uv run --extra dev pytest -q tests`、`python -m compileall -q core api services models` 和 `git diff --check`；真实短信、微信和双连接 MySQL 需在隔离环境补充验收。
+Canonical API and implementation contracts: [authentication and user privacy](security-auth.md), [orders and payments](security-payments.md), [finance](security-finance.md), [content review](msg-sec-check.md), and [isolated verification harness](security-harness.md). These are implementation contracts, not test-pass claims. See [PR218 verification report](../PR218-security-verification-20261025.md) for observed baseline evidence, infrastructure evidence, and candidate verification status.
 
 ## 订单
 
@@ -77,15 +81,8 @@
 
 ### `POST /user/reset-password`
 
-请求字段保持 `mobile`、`sms_code`、`new_password`。固定验证码不再有效。短信服务须预先写入 `password_reset_codes`：
-
-- `mobile`：手机号；
-- `code_hash`：`HMAC-SHA256(JWT_SECRET_KEY, mobile + ":" + sms_code)`；
-- `expires_at`：有效期；
-- `consumed_at`：核销时间；
-- `failed_attempts`：失败次数，最多 5 次。
-
-验证码在行锁内校验并原子核销；成功改密会撤销该用户已有会话。无有效挑战时返回 `400`。
+Password-reset challenges are bound to the account identity resolved under a user-row lock when issued, not only to a mobile string. Unknown mobiles receive the same issuance response but no redeemable account-bound challenge. Redemption resolves and locks the current mobile owner and checks that it matches the stored account ID; changing a mobile invalidates outstanding challenges for that account. Concurrent password/mobile changes are rechecked under the session-creation lock so stale credentials cannot mint a session. Full flow and request contract remain in [security-auth.md](security-auth.md).
+This endpoint has not been validated in this legacy summary. The current request flow, rate limits, challenge lifecycle, provider configuration, and errors are defined only by the canonical [authentication contract](security-auth.md#redeem-password-reset). Do not manually insert reset codes or derive hashes from the JWT signing secret. SMS credentials/delivery and candidate acceptance remain unverified until explicitly evidenced.
 
 ## 商品公开文本
 

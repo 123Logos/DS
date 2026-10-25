@@ -41,16 +41,6 @@ def add_points(
             cur.execute(select_sql, (user_id,))
             row = cur.fetchone()
             balance_after = Decimal(str(row.get(points_field, 0) or 0))
-            cur.execute("SHOW COLUMNS FROM points_log")
-            columns = {r["Field"] for r in cur.fetchall()}
-            for name, definition in (
-                ("operator_id", "BIGINT NULL"),
-                ("balance_before", "DECIMAL(18,6) NULL"),
-                ("event_id", "VARCHAR(128) NULL"),
-                ("source", "VARCHAR(32) NOT NULL DEFAULT 'automatic'"),
-            ):
-                if name not in columns:
-                    cur.execute(f"ALTER TABLE points_log ADD COLUMN {name} {definition}")
             balance_before = balance_after - Decimal(str(amount))
             cur.execute(
                 "INSERT INTO points_log(user_id, type, change_amount, balance_after, "
@@ -59,4 +49,9 @@ def add_points(
                 (user_id, type, amount, balance_after, balance_before, reason,
                  operator_id, event_id, source),
             )
+            if operator_id is not None:
+                from services.auth_security_service import audit
+                audit(cur, operator_id, user_id, "points_adjustment",
+                      {"type": type, "balance": balance_before},
+                      {"type": type, "balance": balance_after, "event_id": event_id}, reason)
             conn.commit()

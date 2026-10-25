@@ -8,13 +8,12 @@ from typing import List, Optional
 from datetime import datetime
 from typing import Union
 from core.database import get_conn
-from core.auth import get_current_user          # 如需登录鉴权
+from core.auth import get_current_user, is_platform_admin, require_platform_admin
 from core.logging import get_logger
 from core.config import settings
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from services.offline_service import OfflineService   # 业务逻辑层（稍后实现）
 import xmltodict
-from services.notify_service import handle_pay_notify
 from decimal import Decimal, ROUND_HALF_UP
 from services.finance_service import FinanceService
 from core.rate_limiter import pay_bridge_ip_limiter
@@ -79,7 +78,7 @@ class RefundReq(BaseModel):
 # ------------------ 0. 微信支付配置检查 ------------------
 @router.get("/zhifu/config-check", summary="检查微信支付配置状态")
 async def check_wechat_pay_config(
-        current_user: dict = Depends(get_current_user)
+        current_user: dict = Depends(require_platform_admin)
 ):
     """
     检查当前微信支付配置状态，用于排查支付问题
@@ -167,7 +166,7 @@ async def create_offline_order(
     except ValueError as e:   # 业务校验错误
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"创建离线订单失败: {e}", exc_info=True)
+        logger.error('offline_order_create_failed')
         raise HTTPException(status_code=400, detail=str(e))
 
 # ==================== 新增：生成永久收款码 ====================
@@ -193,7 +192,7 @@ async def generate_permanent_qrcode(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"生成永久收款码失败: {e}", exc_info=True)
+        logger.error('offline_qrcode_create_failed')
         raise HTTPException(status_code=500, detail=str(e))
 # ==============================================================
 
@@ -232,7 +231,7 @@ async def create_order_for_user(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"创建订单失败: {e}", exc_info=True)
+        logger.error('offline_buyer_order_failed')
         raise HTTPException(status_code=500, detail="服务器内部错误")
 # ==============================================================
 
@@ -254,7 +253,7 @@ async def offline_h5_pay_landing(
 
     ip = _pay_bridge_client_ip(request)
     if not pay_bridge_ip_limiter.allow(ip):
-        logger.warning("[offline-pay] 限流 ip=%s id=%s", ip, pay_id)
+        logger.warning('offline_bridge_rate_limited')
         return HTMLResponse(
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\"/><title>访问过快</title></head>"
             "<body><p>访问过于频繁，请稍后再试。</p></body></html>",
@@ -294,23 +293,13 @@ async def offline_h5_pay_landing(
             )
             return HTMLResponse(html)
         except Exception as e:
-            logger.warning(
-                "[offline-pay] scheme 拉起失败，改试 url_link id=%s: %s",
-                pay_id,
-                e,
-                exc_info=True,
-            )
+            logger.warning('offline_scheme_unavailable')
 
     try:
         link = await get_or_create_permanent_pay_urllink(pay_id)
         return RedirectResponse(link, status_code=302)
     except Exception as e:
-        logger.warning(
-            "[offline-pay] url_link 失败，回退 servicewechat id=%s: %s",
-            pay_id,
-            e,
-            exc_info=True,
-        )
+        logger.warning('offline_url_link_unavailable')
         return RedirectResponse(fallback, status_code=302)
 
 
@@ -354,7 +343,7 @@ async def list_available_coupons(
         coupons = svc.list_available(user_id=current_user["id"], amount=amount or 0)
         return {"code": 0, "message": "查询成功", "data": coupons}
     except Exception as e:
-        logger.error(f"查询优惠券失败: {e}", exc_info=True)
+        logger.error('offline_coupon_query_failed')
         raise HTTPException(status_code=500, detail="查询失败")
 # ==============================================================
 
@@ -371,7 +360,7 @@ async def refresh_qrcode(
         )
         return {"code": 0, "message": "刷新成功", "data": result}
     except Exception as e:
-        logger.error(f"刷新收款码失败: {e}")
+        logger.error('offline_qrcode_refresh_failed')
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -389,7 +378,7 @@ async def get_order_detail(
         )
         return {"code": 0, "message": "查询成功", "data": result}
     except Exception as e:
-        logger.error(f"查询订单详情失败: {e}")
+        logger.error('offline_order_query_failed')
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -412,8 +401,8 @@ async def unified_order(
     body: Optional[UnifiedOrderBody] = Body(None),
 ):
     openid = current_user.get("openid")
-    if not openid and body and body.openid:
-        openid = body.openid
+    if body and body.openid and body.openid != openid:
+        raise HTTPException(403, '支付身份不匹配')
     if not openid:
         logger.error(f"用户 {current_user['id']} 未绑定微信 openid")
         raise HTTPException(status_code=400, detail="用户未绑定微信，无法支付")
@@ -473,7 +462,7 @@ async def unified_order(
         # 检查返回的支付参数
         pay_params = result.get("pay_params", {})
         if not pay_params.get("paySign"):
-            logger.error(f"[unified_order] 支付参数缺少 paySign: {pay_params}")
+            logger.error('offline_payment_missing_signature')
             raise HTTPException(status_code=500, detail="支付参数生成失败，缺少签名")
 
         # 如果是 Mock 模式，添加警告信息
@@ -507,17 +496,15 @@ async def unified_order(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"统一下单失败: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error('offline_payment_failed')
+        raise HTTPException(503, '支付暂时不可用') from None
 
 
 # ------------------ 5. 支付回调 ------------------
-@router.post("/zhifu/notify", summary="微信回调")
+@offline_public_router.post('/zhifu/notify', summary='微信回调')
 async def pay_notify(request: Request):
-    raw_body = await request.body()
-    # 唯一变动：把原来 OfflineService.handle_notify 换成新的 handle_pay_notify
-    result = await handle_pay_notify(raw_body)
-    return Response(content=result, media_type="application/xml")
+    from api.wechat_pay.routes import wechat_pay_notify
+    return await wechat_pay_notify(request)
 
 
 # ------------------ 6. 订单列表 ------------------
@@ -534,6 +521,9 @@ async def list_orders(
         raise HTTPException(status_code=400, detail="请传入 merchant_id 或 user_id 其中一个参数")
     if merchant_id and user_id:
         raise HTTPException(status_code=400, detail="merchant_id 和 user_id 不能同时传入")
+    target_id = merchant_id if merchant_id is not None else user_id
+    if not is_platform_admin(current_user) and int(target_id) != int(current_user['id']):
+        raise HTTPException(403, '无权查询其他账号订单')
 
     try:
         result = await OfflineService.list_orders(
@@ -546,7 +536,7 @@ async def list_orders(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"订单列表查询失败: {e}")
+        logger.error('offline_order_list_failed')
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -563,9 +553,11 @@ async def refund(
             user_id=current_user["id"]
         )
         return {"code": 0, "message": "退款受理成功", "data": result}
-    except Exception as e:
-        logger.error(f"退款失败: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.error('offline_refund_failed')
+        raise HTTPException(503, '退款未完成，请使用原退款号恢复') from None
 
 
 # ------------------ 8. 收款码状态 ------------------
@@ -581,7 +573,7 @@ async def qrcode_status(
         )
         return {"code": 0, "message": "查询成功", "data": result}
     except Exception as e:
-        logger.error(f"收款码状态查询失败: {e}")
+        logger.error('offline_qrcode_status_failed')
         raise HTTPException(status_code=400, detail=str(e))
 
 

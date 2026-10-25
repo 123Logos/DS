@@ -91,8 +91,8 @@ class AvatarModerationService:
             seen.add(path)
             try:
                 path.unlink(missing_ok=True)
-            except OSError:
-                logger.warning("Unable to remove avatar file: %s", path)
+            except OSError as exc:
+                logger.warning("Unable to remove avatar file: error_type=%s", type(exc).__name__)
 
     @staticmethod
     def _avatar_paths(value: Any) -> list[Path]:
@@ -168,7 +168,7 @@ class AvatarModerationService:
             raise
         except Exception as exc:
             cls._cleanup_paths(created_files)
-            logger.error("Unable to create avatar review records: %s", exc, exc_info=True)
+            logger.error("Unable to create avatar review records: error_type=%s", type(exc).__name__)
             raise HTTPException(status_code=502, detail="Avatar review is temporarily unavailable") from exc
 
         try:
@@ -196,7 +196,7 @@ class AvatarModerationService:
             raise
         except Exception as exc:
             cls._fail_batch(batch_id)
-            logger.error("Unable to submit avatar review: %s", exc, exc_info=True)
+            logger.error("Unable to submit avatar review: error_type=%s", type(exc).__name__)
             raise HTTPException(status_code=502, detail="Avatar review is temporarily unavailable") from exc
 
         return {
@@ -324,7 +324,7 @@ class AvatarModerationService:
             None,
         )
         if type(errcode_value) is not int:
-            logger.warning("Avatar review callback has invalid errcode: trace_id=%s", trace_id)
+            logger.warning("Avatar review callback has invalid errcode")
             errcode = -1
         else:
             errcode = errcode_value
@@ -334,7 +334,7 @@ class AvatarModerationService:
         elif suggest in {"pass", "risky", "review"}:
             status = suggest
         else:
-            logger.warning("Unknown avatar review callback result: trace_id=%s", trace_id)
+            logger.warning("Unknown avatar review callback result")
             return
 
         old_files: list[Path] = []
@@ -428,9 +428,9 @@ class AvatarModerationService:
                 try:
                     if target.exists() and not source.exists():
                         shutil.move(str(target), str(source))
-                except OSError:
-                    logger.exception("Unable to roll back avatar file move: %s", target)
-            logger.exception("Unable to process avatar review callback: trace_id=%s", trace_id)
+                except OSError as exc:
+                    logger.error("Unable to roll back avatar file move: error_type=%s", type(exc).__name__)
+            logger.error("Unable to process avatar review callback")
             return
 
         cls._cleanup_paths(pending_files + old_files)

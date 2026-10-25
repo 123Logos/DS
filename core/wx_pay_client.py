@@ -810,123 +810,23 @@ class WeChatPayClient:
         }
 
     def verify_signature(self, signature: str, timestamp: str, nonce: str, body: str) -> bool:
-        """验证回调签名（支持动态加载证书）"""
-        if self.mock_mode:
-            logger.info("【MOCK】跳过签名验证")
-            return True
-
         try:
-            # 如果公钥未加载，尝试重新获取
-            if not self.wechat_public_key:
-                logger.warning("平台公钥未加载，尝试重新获取...")
-                self.wechat_public_key = self._load_wechat_public_key_from_file()
-            # 防御性处理：去除可能的首尾空白，并尝试 URL 解码（有时回调头被转义）
-            raw_sig = signature
-            try:
-                sig = (signature or '').strip()
-            except Exception:
-                sig = signature
-
-            # 先尝试直接解码；若失败，尝试 URL 解码后再解码
-            try:
-                signature_bytes = base64.b64decode(sig)
-            except Exception as e1:
-                try:
-                    from urllib.parse import unquote
-
-                    sig_unquoted = unquote(sig).strip()
-                    signature_bytes = base64.b64decode(sig_unquoted)
-                    sig = sig_unquoted
-                except Exception as e2:
-                    logger.error(f"签名 base64 解码失败: raw_sig=%s, err1=%s, err2=%s", raw_sig, e1, e2)
-                    return False
-
-            message = f"{timestamp}\n{nonce}\n{body}\n"
-
+            if abs(time.time() - int(timestamp)) > 300 or not self.wechat_public_key:
+                return False
             self.wechat_public_key.verify(
-                signature_bytes,
-                message.encode('utf-8'),
-                padding.PKCS1v15(),
-                hashes.SHA256()
-            )
+                base64.b64decode(signature, validate=True),
+                f"{timestamp}\n{nonce}\n{body}\n".encode(),
+                padding.PKCS1v15(), hashes.SHA256())
             return True
-        except Exception as e:
-            logger.error(f"签名验证失败: {str(e)}")
+        except Exception:
+            logger.warning("payment_signature_rejected")
             return False
 
     def decrypt_callback_data(self, resource: dict) -> dict:
-        """解密回调数据（AES-256-GCM）"""
-        if self.mock_mode:
-            logger.info("【MOCK】模拟解密回调数据")
-            return {
-                "event_type": "APPLYMENT_STATE_FINISHED",
-                "applyment_id": 123456,
-                "sub_mchid": "MOCK_SUB_MCHID_123"
-            }
-
-        try:
-            cipher_text = resource.get("ciphertext", "")
-            nonce = resource.get("nonce", "")
-            associated_data = resource.get("associated_data", "")
-
-            # 记录密文/随机串长度与前后片段，便于排查是否被截断或改写
-            try:
-                def _preview(val: str) -> str:
-                    if not isinstance(val, str):
-                        return str(type(val))
-                    if len(val) <= 80:
-                        return val
-                    return f"{val[:30]}...{val[-30:]}"
-
-                logger.info(
-                    "解密前检查: ct_len=%s, nonce_len=%s, ad_len=%s, ct_preview=%s",
-                    len(cipher_text) if isinstance(cipher_text, str) else None,
-                    len(nonce) if isinstance(nonce, str) else None,
-                    len(associated_data) if isinstance(associated_data, str) else None,
-                    _preview(cipher_text),
-                )
-            except Exception:
-                logger.debug("记录解密前检查失败", exc_info=True)
-
-            # 若收到非微信格式的测试回调（无密文或 nonce 长度异常），直接记录并返回空，避免报错刷屏
-            if not cipher_text or not nonce:
-                logger.warning("回调 resource 缺少 ciphertext/nonce，跳过解密")
-                return {}
-            if not (8 <= len(nonce) <= 128):
-                logger.warning("回调 nonce 长度异常(%s)，跳过解密", len(nonce))
-                return {}
-
-            key = self.apiv3_key
-            if not key:
-                raise Exception("API v3 key 未配置")
-            if len(key) not in (16, 24, 32):
-                raise Exception("API v3 key 长度无效，必须为 16/24/32 字节")
-
-            aesgcm = AESGCM(key)
-
-            # ✅ 修复：nonce 是明文字符串，直接编码
-            nonce_bytes = nonce.encode('utf-8')
-
-            associated_bytes = associated_data.encode('utf-8') if associated_data else None
-
-            decrypted = aesgcm.decrypt(
-                nonce_bytes,
-                base64.b64decode(cipher_text),
-                associated_bytes
-            )
-            return json.loads(decrypted.decode('utf-8'))
-        except Exception as e:
-            import traceback
-            tb = traceback.format_exc()
-            logger.error(
-                "解密失败: %s\n堆栈跟踪:\n%s\nct_len=%s, nonce_len=%s, ad_len=%s, ct_preview=%s",
-                str(e), tb,
-                len(cipher_text) if isinstance(cipher_text, str) else None,
-                len(nonce) if isinstance(nonce, str) else None,
-                len(associated_data) if isinstance(associated_data, str) else None,
-                cipher_text[:30] + "..." + cipher_text[-30:] if isinstance(cipher_text, str) and len(cipher_text) > 80 else cipher_text,
-            )
-            return {}
+        plaintext = AESGCM(self.apiv3_key).decrypt(
+            resource["nonce"].encode(), base64.b64decode(resource["ciphertext"], validate=True),
+            resource.get("associated_data", "").encode() or None)
+        return json.loads(plaintext)
 
     # ==================== 结算账户相关API ====================
 
@@ -1089,10 +989,7 @@ class WeChatPayClient:
 
         body_str = json.dumps(body, ensure_ascii=False)
         
-        # 🔍 添加详细请求日志
-        logger.info(f"【微信退款】请求URL: {full_url}")
-        logger.info(f"【微信退款】请求体: {body_str}")
-        logger.info(f"【微信退款】transaction_id: {transaction_id}, total_fee: {total_fee}, refund_fee: {refund_fee}")
+        logger.info("refund_provider_request")
         
         headers = {
             'Authorization': self._build_auth_header('POST', url_path, body_str),
@@ -1104,25 +1001,36 @@ class WeChatPayClient:
         try:
             response = self.session.post(full_url, data=body_str.encode('utf-8'), headers=headers, timeout=15)
             
-            # 🔍 记录响应详情
-            logger.info(f"【微信退款】响应状态码: {response.status_code}")
-            logger.info(f"【微信退款】响应内容: {response.text[:500]}")  # 限制长度避免日志过大
+            logger.info("refund_provider_response status=%s", response.status_code)
             
             response.raise_for_status()
             return response.json()
-        except requests.exceptions.HTTPError as e:
-            # 🔍 详细记录 HTTP 错误
-            logger.error(f"【微信退款】HTTP错误: {e}")
-            logger.error(f"【微信退款】错误响应状态: {e.response.status_code}")
-            logger.error(f"【微信退款】错误响应内容: {e.response.text}")
-            
-            try:
-                error_data = e.response.json()
-                logger.error(f"【微信退款】微信错误详情: {error_data}")
-            except:
-                logger.error(f"【微信退款】无法解析错误响应为JSON")
-            
+        except requests.exceptions.HTTPError:
+            logger.warning("refund_provider_http_error")
             raise
+
+    def query_refund(self, out_refund_no: str, sub_mchid: Optional[str] = None):
+        from urllib.parse import quote, urlencode
+        path = '/v3/refund/domestic/refunds/' + quote(out_refund_no, safe='')
+        if sub_mchid:
+            path += '?' + urlencode({'sub_mchid': sub_mchid})
+        response = self.session.get(self.BASE_URL + path,
+            headers={'Authorization': self._build_auth_header('GET', path), 'Accept': 'application/json'}, timeout=15)
+        if response.status_code == 404:
+            data = response.json()
+            if data.get('code') == 'RESOURCE_NOT_EXISTS':
+                return None
+        response.raise_for_status()
+        return response.json()
+
+    def query_transaction(self, out_trade_no: str):
+        from urllib.parse import quote, urlencode
+        path = '/v3/pay/transactions/out-trade-no/' + quote(out_trade_no, safe='')
+        path += '?' + urlencode({'mchid': self.mchid})
+        response = self.session.get(self.BASE_URL + path,
+            headers={'Authorization': self._build_auth_header('GET', path), 'Accept': 'application/json'}, timeout=15)
+        response.raise_for_status()
+        return response.json()
 
 
     # ==================== 本地加密解密工具 ====================

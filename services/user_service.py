@@ -81,7 +81,7 @@ class UserService:
                         raise ValueError(f"推荐人 {ref['mobile']} 星级不足，无法绑定")
 
                     referrer_id = ref["id"]
-                    logger.info(f"注册绑定推荐人: 推荐人ID={referrer_id}, 被推荐人手机={mobile}")
+                    logger.info("security_operation_event")
 
                 # ========== 3. 密码处理 ==========
                 pwd_hash = hash_pwd(pwd)
@@ -165,7 +165,7 @@ class UserService:
                         )
                     cur.execute("UPDATE users SET referral_id=%s WHERE id=%s", (referrer_id, uid))
 
-                    logger.info(f"✅ 注册成功并绑定推荐人: 新用户ID={uid}, 推荐人ID={referrer_id}")
+                    logger.info("security_operation_event")
 
                 conn.commit()
                 return uid
@@ -215,7 +215,8 @@ class UserService:
                     raise ValueError("账号已被冻结，请联系客服")
                 if status == UserStatus.DELETED:
                     raise ValueError("账号已注销")
-                token = str(uuid.uuid4())
+                from core.auth import create_access_token
+                token = create_access_token(row["id"], "jwt", expected_password_hash=row["password_hash"])
                 return {"uid": row["id"], "level": row["member_level"], "token": token}
 
     @staticmethod
@@ -461,7 +462,7 @@ class UserService:
                 direct_6star_count = len(lines)
 
                 if direct_6star_count < 7:
-                    logger.warning(f"B条件不足: 只有{direct_6star_count}个可用直推六星")
+                    logger.warning("security_operation_warning")
                     return 0
 
                 # 取前7条（如果有8条，弃用第8条）
@@ -510,8 +511,7 @@ class UserService:
                 total_6star_count = cur.fetchone()['total_6stars'] or 0
 
                 # 日志
-                logger.info(f"联创计算 - 直推六星:{direct_6star_count}, 有效线:{valid_lines}, "
-                            f"各线六星:{lines_6star_counts}, 团队总六星:{total_6star_count}")
+                logger.info("security_operation_event")
 
                 # 判断（使用过滤后的数据）
                 if direct_6star_count >= 7 and valid_lines >= 7 and \
@@ -988,30 +988,17 @@ class UserService:
                 }
 
     @staticmethod
-    def set_unilevel(user_id: int, level: int) -> Dict[str, Any]:
+    def set_unilevel(user_id: int, level: int, operator_id: int | None = None) -> Dict[str, Any]:
         """
         后台设置用户的联创星级（不包含updated_at字段）
         """
         with get_conn() as conn:
             with conn.cursor() as cur:
                 # 1. 检查用户是否存在
-                cur.execute("SELECT 1 FROM users WHERE id = %s", (user_id,))
+                cur.execute("SELECT id FROM users WHERE id = %s FOR UPDATE", (user_id,))
                 if not cur.fetchone():
                     raise ValueError("用户不存在")
 
-                # 2. 检查表是否存在，不存在则创建（简化结构）
-                cur.execute("SHOW TABLES LIKE 'user_unilevel'")
-                if not cur.fetchone():
-                    cur.execute("""
-                        CREATE TABLE user_unilevel (
-                            id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-                            user_id BIGINT UNSIGNED NOT NULL UNIQUE,
-                            level TINYINT NOT NULL DEFAULT 0,
-                            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                            KEY idx_user_id (user_id)
-                        )
-                    """)
-                    conn.commit()
 
                 # 3. 获取旧等级
                 cur.execute("SELECT level FROM user_unilevel WHERE user_id = %s", (user_id,))
@@ -1038,6 +1025,8 @@ class UserService:
                     (user_id, level, level)
                 )
 
+                from services.auth_security_service import audit
+                audit(cur, operator_id, user_id, "set_unilevel", {"level": old_level}, {"level": level}, "后台设置联创星级")
                 conn.commit()
 
                 return {
@@ -1087,7 +1076,7 @@ class UserService:
                 )
                 conn.commit()
 
-                logger.info(f"为用户 {user_id} 生成推荐码: {new_code}")
+                logger.info("security_operation_event")
                 return new_code
 
     @staticmethod
@@ -1104,13 +1093,13 @@ class UserService:
             # 1. 获取推荐码
             referral_code = UserService.get_user_referral_code(user_id)
             if not referral_code:
-                logger.warning(f"用户 {user_id} 无法获取推荐码")
+                logger.warning("security_operation_warning")
                 return None
 
             # 2. 生成小程序码
             qr_data = WechatService.generate_wxacode(referral_code)
             if not qr_data:
-                logger.error(f"用户 {user_id} 生成小程序码失败")
+                logger.error("security_operation_failed")
                 return None
 
             # 3. 保存图片
@@ -1141,11 +1130,11 @@ class UserService:
                         )
                         conn.commit()
 
-            logger.info(f"用户 {user_id} 推荐码二维码生成成功: {qr_url}")
+            logger.info("security_operation_event")
             return qr_url
 
         except Exception as e:
-            logger.exception(f"生成推荐码二维码异常: {e}")
+            logger.error("security_operation_failed")
             return None
 
     @staticmethod

@@ -21,12 +21,3 @@ def register_routes(app: "FastAPI"):
     app.include_router(refund_router, prefix="/refund", tags=["订单系统"])
     app.include_router(merchant_router, prefix="/merchant", tags=["订单系统"])
     register_logistics_routes(app)
-
-    # ==================== 新增：启动后台任务（确保只执行一次） ====================
-    # 注意：这些函数内部使用了 daemon thread，多次调用不会重复启动
-    try:
-        start_order_expire_task()
-    except Exception as e:
-        # 如果已经启动会抛出异常，忽略
-        import logging
-        logging.getLogger(__name__).debug(f"后台任务启动检查: {e}")

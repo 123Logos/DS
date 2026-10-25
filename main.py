@@ -82,12 +82,35 @@ app = FastAPI(
 register_exception_handlers(app)
 
 
+def validate_isolation_lifecycle():
+    """Refuse an isolation app configured against shared resources."""
+    run_id = settings.SECURITY_ISOLATION_RUN_ID
+    if not run_id:
+        return
+    import os
+
+    if (
+        not re.fullmatch(r"dsiso_[a-f0-9]{16}", run_id)
+        or settings.MYSQL_DATABASE != run_id
+        or settings.ENVIRONMENT != "test"
+        or settings.REDIS_DB < 1
+        or not settings.REDIS_ENABLED
+        or settings.ENABLE_BACKGROUND_TASKS
+        or not settings.SKIP_STARTUP_DDL
+        or settings.RUN_MIGRATE_ON_STARTUP
+        or os.environ.get("SECURITY_ISOLATION_ACK") != "dedicated-services-no-production"
+    ):
+        raise RuntimeError("Unsafe security isolation lifecycle configuration")
+
+validate_isolation_lifecycle()
+
 # 在每次应用启动时初始化数据库表结构（幂等）
 @app.on_event("startup")
 def on_startup():
     logger.info("=" * 50)
     logger.info("应用启动：检查并初始化数据库表结构与后台任务")
     try:
+        validate_isolation_lifecycle()
         validate_production_safety()
     except RuntimeError as e:
         logger.critical("启动配置校验失败: %s", e)
@@ -111,12 +134,9 @@ def on_startup():
     else:
         logger.info("SKIP_STARTUP_DDL=1，跳过 on_startup 表结构初始化")
 
-    try:
-        from core.auth import refresh_sessions_table_cache
-
-        refresh_sessions_table_cache()
-    except Exception as e:
-        logger.warning("刷新 sessions 表缓存失败: %s", e)
+    if not settings.ENABLE_BACKGROUND_TASKS:
+        logger.info("Background tasks disabled by lifecycle configuration")
+        return
 
     try:
         from api.order.order import start_order_expire_task
@@ -373,12 +393,6 @@ async def openapi_json():
 
 if __name__ == "__main__":
     post = UVICORN_PORT
-    # 初始化数据库表结构
-    print("正在初始化数据库...")
-    initialize_database()
-
-    # 确保数据库存在
-    ensure_database()
 
     print("启动综合管理系统 API...")
     print(f"财务管理系统 API 文档: http://127.0.0.1:{post}/docs")

@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sys
+import traceback
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -17,15 +18,41 @@ LOG_FILE_ABS = LOG_FILE.resolve() if not LOG_FILE.is_absolute() else LOG_FILE
 
 
 class RequestIdFilter(logging.Filter):
+    _SENSITIVE = re.compile(
+        r"(?i)(?P<key>authorization|cookie|set-cookie|access_token|refresh_token|session_key|secret|password|openid|unionid|phone|mobile|appid|reason|contact|account)[\"']?\s*[:=]\s*(?P<value>\"[^\"]*\"|'[^']*'|Bearer\s+[^\s,;&}]+|[^\s,;&}]+)"
+    )
+
+    @staticmethod
+    def _safe_exception(exc_info) -> str:
+        exc_type, exc, tb = exc_info
+        parts = []
+        seen = set()
+        current = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            frames = traceback.extract_tb(current.__traceback__)
+            parts.extend(
+                f"  File {frame.filename!r}, line {frame.lineno}, in {frame.name}\n"
+                for frame in frames
+            )
+            parts.append(f"{type(current).__name__}: [REDACTED]")
+            current = current.__cause__ or current.__context__
+        return "\n".join(parts)
+
     def filter(self, record: logging.LogRecord) -> bool:
-        rid = get_request_id()
-        # httpx 的 INFO 请求日志和 HTTPError 都可能带微信 access_token。
-        message = record.getMessage()
-        redacted = re.sub(r"([?&]access_token=)[^\s&\"'<>]+", r"\1[REDACTED]", message)
-        if redacted != message:
+        original = record.getMessage()
+        redacted = self._SENSITIVE.sub(lambda match: f"{match.group('key')}=[REDACTED]", original)
+        if redacted != original:
             record.msg = redacted
             record.args = ()
-        record.request_id = rid if rid else "-"
+        if record.exc_info:
+            record.exc_text = self._safe_exception(record.exc_info)
+            record.exc_info = None
+        elif record.exc_text:
+            record.exc_text = self._SENSITIVE.sub(
+                lambda match: f"{match.group('key')}=[REDACTED]", record.exc_text
+            )
+        record.request_id = get_request_id() or "-"
         return True
 
 

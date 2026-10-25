@@ -7,13 +7,11 @@ import json
 import os
 import hashlib
 import re
-import uuid
 import base64
 from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime, timedelta
-import random
-import string
 from fastapi import HTTPException
+from starlette.concurrency import run_in_threadpool
 
 from core.database import get_conn
 from core.logging import get_logger
@@ -99,7 +97,7 @@ class BankcardService:
                     raise Exception(f"F003: 微信进件状态异常: {record['applyment_state']}")
 
                 sub_mchid = record['sub_mchid']
-                logger.info(f"查询微信结算账户: user_id={user_id}, sub_mchid={sub_mchid}")
+                logger.info("security_operation_event")
 
                 wechat_data = wxpay_client.query_settlement_account(sub_mchid)
                 if not wechat_data or not wechat_data.get('account_number'):
@@ -109,7 +107,7 @@ class BankcardService:
                 required_fields = ['account_type', 'account_bank', 'verify_result']
                 for field in required_fields:
                     if field not in wechat_data:
-                        logger.warning(f"微信返回数据缺少字段: {field}")
+                        logger.warning("security_operation_warning")
 
                 return sub_mchid, wechat_data
 
@@ -164,7 +162,7 @@ class BankcardService:
                     return False, f"微信卡号格式解析失败: {str(e)}"
             else:
                 # 非掩码格式（测试环境）
-                logger.warning("微信返回非掩码卡号，测试环境特征")
+                logger.warning("security_operation_warning")
                 if wechat_masked.replace(' ', '') != local_number.replace(' ', ''):
                     return False, "卡号不匹配"
 
@@ -178,11 +176,11 @@ class BankcardService:
             # 第四步：验证账户类型
             wechat_account_type = wechat_data.get('account_type')
             if wechat_account_type not in ['ACCOUNT_TYPE_PRIVATE', 'ACCOUNT_TYPE_BUSINESS']:
-                logger.warning(f"未知的账户类型: {wechat_account_type}")
+                logger.warning("security_operation_warning")
 
             return True, "验证通过"
         except Exception as e:
-            logger.error(f"验证过程异常: {str(e)}")
+            logger.error("security_operation_failed")
             return False, f"验证异常: {str(e)}"
 
     @staticmethod
@@ -220,10 +218,7 @@ class BankcardService:
                 )
                 existing = cur.fetchone()
                 if existing:
-                    logger.warning(
-                        f"卡哈希冲突检测: user_id={user_id} 尝试绑定已被 "
-                        f"user_id={existing['user_id']} 占用的卡"
-                    )
+                    logger.warning("security_operation_warning")
                     return False, existing['user_id']
         return True, None
 
@@ -259,7 +254,7 @@ class BankcardService:
             ip_address: Optional[str] = None
     ) -> Dict[str, Any]:
         """绑定银行卡（幂等，防跨用户重复绑定，需验证码验证）"""
-        logger.info(f"【绑定开始】user_id={user_id}, bank_name={bank_name}")
+        logger.info("security_operation_event")
 
         bank_name = bank_name.strip()
         bank_account = bank_account.strip().replace(' ', '')
@@ -268,11 +263,7 @@ class BankcardService:
         if not sms_code or not session_id:
             raise Exception("F022: 验证码和会话ID不能为空")
 
-        is_code_valid = BankcardService.verify_sms_code(user_id, bank_account, session_id, sms_code)
-        if not is_code_valid:
-            raise Exception("F023: 验证码错误或已过期，请重新获取")
-
-        logger.info(f"验证码验证通过: user_id={user_id}")
+        # Verification and consumption occur with the local binding mutation below.
 
         try:
             sub_mchid, wechat_data = BankcardService._get_wechat_settlement_info_from_api(user_id)
@@ -299,6 +290,12 @@ class BankcardService:
 
             with get_conn() as conn:
                 with conn.cursor() as cur:
+                    from services.auth_security_service import consume_sms, audit
+                    cur.execute("SELECT mobile FROM users WHERE id=%s FOR UPDATE", (user_id,))
+                    mobile = cur.fetchone()["mobile"]
+                    if not consume_sms(cur, mobile, "bankcard_bind", str(user_id)+":"+bank_account, sms_code, session_id):
+                        conn.commit()
+                        raise Exception("F023: 验证码错误或已过期")
                     # 6. 当前用户内幂等检查
                     cur.execute("""
                         SELECT id, account_number_encrypted 
@@ -315,7 +312,8 @@ class BankcardService:
                                 existing['account_number_encrypted']
                             )
                             if existing_number == bank_account:
-                                logger.info(f"银行卡已绑定，直接返回: user_id={user_id}, account_id={existing['id']}")
+                                conn.commit()
+                                logger.info("security_operation_event")
                                 return {
                                     'msg': 'ok',
                                     'account_id': existing['id'],
@@ -324,7 +322,7 @@ class BankcardService:
                                     'verify_status': 'success'
                                 }
                         except Exception as e:
-                            logger.warning(f"解密已有卡号失败: {e}")
+                            logger.warning("security_operation_warning")
                             existing_number = None
 
                     # 7. 获取现有记录（用于更新或插入）
@@ -385,6 +383,7 @@ class BankcardService:
                         ON DUPLICATE KEY UPDATE bank_account = VALUES(bank_account)
                     """, (user_id, bank_name, bank_account))
 
+                    audit(cur, user_id, user_id, "bankcard_bind", {}, {"account_id":account_id,"action":action}, "本人绑定银行卡")
                     conn.commit()
 
                     # 异步记录审计日志
@@ -392,7 +391,7 @@ class BankcardService:
                         user_id, 'bind', account_id, old_data, new_data, admin_key, ip_address
                     )
 
-                    logger.info(f"【绑定成功】user_id={user_id}, account_id={account_id}, action={action}")
+                    logger.info("security_operation_event")
                     return {
                         'msg': 'ok',
                         'account_id': account_id,
@@ -401,100 +400,38 @@ class BankcardService:
                         'verify_status': 'success'
                     }
         except pymysql.MySQLError as e:
-            logger.error(f"数据库操作失败: {e}")
+            logger.error("security_operation_failed")
             raise Exception(f"F006: 数据库操作失败 - {e}")
         except Exception as e:
-            logger.error(f"绑定失败: {e}")
+            logger.error("security_operation_failed")
             raise
 
     @staticmethod
-    def _generate_verify_code(length: int = 6) -> str:
-        """生成数字验证码"""
-        return ''.join(random.choices(string.digits, k=length))
+    async def send_sms_code(user_id: int, account_number: str, purpose: str = "bankcard_bind", ip: str = "unknown", device: str = "unknown") -> Dict[str, Any]:
+        return await run_in_threadpool(BankcardService._send_sms_code, user_id, account_number, purpose, ip, device)
 
     @staticmethod
-    def _generate_session_id() -> str:
-        """生成会话ID"""
-        return str(uuid.uuid4()).replace('-', '')
-
-    @staticmethod
-    def _hash_account_number(account_number: str) -> str:
-        """生成银行卡号哈希（用于验证码匹配）"""
-        salt = os.getenv('CARD_SALT', 'default_salt')
-        return hashlib.sha256(f"{account_number}_{salt}".encode()).hexdigest()
-
-    @staticmethod
-    async def send_sms_code(user_id: int, account_number: str) -> Dict[str, Any]:
-        """发送短信验证码（生产级实现）"""
-        logger.info(f"【短信验证码】user_id={user_id}, 卡号={account_number[-4:]}")
-
-        account_number = account_number.strip().replace(' ', '')
-        verify_code = BankcardService._generate_verify_code(6)
-        session_id = BankcardService._generate_session_id()
-        account_hash = BankcardService._hash_account_number(account_number)
-        expired_at = datetime.now() + timedelta(minutes=5)
-
-        try:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        UPDATE bankcard_verify_codes 
-                        SET status = 2 
-                        WHERE user_id = %s AND account_number_hash = %s AND status = 0
-                    """, (user_id, account_hash))
-
-                    cur.execute("""
-                        INSERT INTO bankcard_verify_codes 
-                        (user_id, account_number_hash, verify_code, session_id, expired_at)
-                        VALUES (%s, %s, %s, %s, %s)
-                    """, (user_id, account_hash, verify_code, session_id, expired_at))
-
-                    conn.commit()
-
-            logger.info(f"验证码已生成: user_id={user_id}, session_id={session_id}")
-
-            return {
-                "session_id": session_id,
-                "expired_in": 300,
-                "mock_code": verify_code if os.getenv('SMS_MOCK_MODE', 'true').lower() == 'true' else None
-            }
-        except Exception as e:
-            logger.error(f"生成验证码失败: {e}")
-            raise Exception("验证码生成失败，请稍后重试")
-
-    @staticmethod
-    def verify_sms_code(user_id: int, account_number: str, session_id: str, verify_code: str) -> bool:
-        """验证短信验证码"""
-        account_hash = BankcardService._hash_account_number(account_number)
-
+    def _send_sms_code(user_id: int, account_number: str, purpose: str, ip: str, device: str) -> Dict[str, Any]:
+        from services.auth_security_service import issue_sms
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT id, verify_code, expired_at 
-                    FROM bankcard_verify_codes 
-                    WHERE user_id = %s 
-                    AND account_number_hash = %s 
-                    AND session_id = %s
-                    AND status = 0
-                    AND expired_at > NOW()
-                    LIMIT 1
-                """, (user_id, account_hash, session_id))
+                cur.execute("SELECT mobile FROM users WHERE id=%s AND status=0", (user_id,))
+                user = cur.fetchone()
+        if not user or not user["mobile"]:
+            from fastapi import HTTPException
+            raise HTTPException(400, "请先绑定手机号")
+        return issue_sms(user["mobile"], purpose, str(user_id)+":"+account_number, ip, device, user_id)
 
-                record = cur.fetchone()
-                if not record:
-                    return False
-
-                if record['verify_code'] != verify_code:
-                    return False
-
-                cur.execute("""
-                    UPDATE bankcard_verify_codes 
-                    SET status = 1, used_at = NOW() 
-                    WHERE id = %s
-                """, (record['id'],))
-
+    @staticmethod
+    def verify_sms_code(user_id: int, account_number: str, session_id: str, verify_code: str, purpose: str = "bankcard_bind") -> bool:
+        from services.auth_security_service import consume_sms
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT mobile FROM users WHERE id=%s FOR UPDATE", (user_id,))
+                user = cur.fetchone()
+                valid = bool(user) and consume_sms(cur, user["mobile"], purpose, str(user_id)+":"+account_number, verify_code, session_id)
                 conn.commit()
-                return True
+                return valid
 
     @staticmethod
     def list_bankcards(user_id: int) -> List[Dict[str, Any]]:
@@ -527,7 +464,7 @@ class BankcardService:
                         else:
                             masked_number = f"{'*' * (len(full_number) - 4)}{tail4}"
                     except Exception as e:
-                        logger.error(f"解密失败 account_id={account['id']}: {e}")
+                        logger.error("security_operation_failed")
                         tail4 = '****'
                         masked_number = '****************'
 
@@ -570,18 +507,20 @@ class BankcardService:
                 if cur.rowcount == 0:
                     raise HTTPException(status_code=500, detail="设置失败")
 
+                from services.auth_security_service import audit
+                audit(cur, user_id, user_id, "bankcard_default", {}, {"account_id":account_id}, "本人设置默认银行卡")
                 conn.commit()
-                logger.info(f"设置默认银行卡: user_id={user_id}, account_id={account_id}")
+                logger.info("security_operation_event")
                 return {"account_id": account_id, "is_default": 1, "msg": "设置成功"}
 
     @staticmethod
     async def modify_bankcard(
             user_id: int, new_bank_name: str, new_bank_account: str, new_account_name: str,
             bank_branch_id: Optional[str], bank_address_code: Optional[str],
-            admin_key: Optional[str], ip_address: Optional[str]
+            admin_key: Optional[str], ip_address: Optional[str], sms_code: str, session_id: str
     ) -> Dict[str, Any]:
         """申请改绑银行卡（防跨用户重复绑定）"""
-        logger.info(f"【改绑申请】user_id={user_id}, new_bank_name={new_bank_name}")
+        logger.info("security_operation_event")
 
         # 参数标准化
         new_bank_name = new_bank_name.strip()
@@ -589,6 +528,8 @@ class BankcardService:
         new_account_name = new_account_name.strip()
         bank_branch_id = (bank_branch_id or '').strip() or None
         bank_address_code = (bank_address_code or '').strip() or None
+        if not BankcardService.verify_sms_code(user_id, new_bank_account, session_id, sms_code, "bankcard_modify"):
+            raise Exception("F023: 验证码错误或已过期")
 
         # 步骤1-4：查询与验证（在事务外）
         with get_conn() as conn:
@@ -609,7 +550,7 @@ class BankcardService:
 
                 # 检查进行中的改绑（严格检查）
                 if old.get('modify_application_no') and old.get('verify_result') == 'VERIFYING':
-                    logger.warning(f"存在进行中的改绑申请: application_no={old['modify_application_no']}")
+                    logger.warning("security_operation_warning")
 
                     # 查询微信确认真实状态（最多等待30秒）
                     try:
@@ -637,7 +578,7 @@ class BankcardService:
                                     old['id']
                                 ))
                                 conn.commit()
-                                logger.info(f"清理已完成的改绑申请: application_no={old['modify_application_no']}")
+                                logger.info("security_operation_event")
                                 break
                             else:
                                 # 等待5秒后重试
@@ -648,7 +589,7 @@ class BankcardService:
                     except Exception as e:
                         if "F017" in str(e):
                             raise
-                        logger.error(f"查询改绑状态失败: {e}")
+                        logger.error("security_operation_failed")
                         raise Exception("F012: 存在改绑申请记录，请稍后再试")
 
                 # 校验新卡是否与旧卡相同
@@ -659,7 +600,7 @@ class BankcardService:
                 except Exception as e:
                     if "F018" in str(e):
                         raise
-                    logger.error(f"解密旧卡号失败: {e}")
+                    logger.error("security_operation_failed")
 
         # 步骤5：校验新卡是否被其他用户绑定
         new_card_hash = BankcardService._generate_card_hash(new_bank_account)
@@ -686,7 +627,7 @@ class BankcardService:
 
         # 调用微信接口
         sub_mchid = old["sub_mchid"]
-        logger.info(f"调用微信改绑接口: sub_mchid={sub_mchid}")
+        logger.info("security_operation_event")
 
         wx_resp = wxpay_client.modify_settlement_account(sub_mchid, {
             "account_type": old["account_type"],
@@ -700,7 +641,7 @@ class BankcardService:
 
         application_no = wx_resp.get("application_no")
         if not application_no:
-            logger.error(f"微信接口未返回申请单号: {wx_resp}")
+            logger.error("security_operation_failed")
             raise Exception("F009: 微信接口未返回申请单号")
 
         # ===== 事务边界：微信成功后写入本地 =====
@@ -729,11 +670,13 @@ class BankcardService:
                     ))
 
                     if cur.rowcount == 0:
-                        logger.critical(f"更新记录失败: id={old['id']}, user_id={user_id}")
+                        logger.critical("bankcard_operation_requires_reconciliation")
                         raise Exception("F010: 记录已被修改，操作失败")
 
+                    from services.auth_security_service import audit
+                    audit(cur, user_id, user_id, "bankcard_modify", {"account_id":old["id"]}, {"application_no":application_no}, "本人改绑申请")
                     conn.commit()
-                    logger.info(f"改绑申请已提交: user_id={user_id}, application_no={application_no}")
+                    logger.info("security_operation_event")
 
                     # 异步记录审计日志
                     BankcardService._log_operation_async(
@@ -751,25 +694,23 @@ class BankcardService:
                     }
                 except pymysql.MySQLError as e:
                     conn.rollback()
-                    logger.critical(
-                        f"CRITICAL: 微信已受理但本地写入失败: user_id={user_id}, app_no={application_no}, error={e}"
-                    )
+                    logger.critical("bankcard_operation_requires_reconciliation")
                     raise Exception("F011: 系统异常，请保留申请单号并联系客服")
                 except Exception as e:
                     conn.rollback()
-                    logger.critical(f"CRITICAL: 未知异常: {e}")
+                    logger.critical("bankcard_operation_requires_reconciliation")
                     raise
 
     @staticmethod
     def poll_modify_status(user_id: int, application_no: str) -> Dict[str, Any]:
         """轮询改绑审核状态（带最终冲突检测和旧卡恢复）"""
-        logger.info(f"【轮询改绑状态】user_id={user_id}, application_no={application_no}")
+        logger.info("security_operation_event")
 
         # 1. 先查询本地状态
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT id, sub_mchid, new_bank_name,
+                    SELECT id, user_id, sub_mchid, new_bank_name, modify_fail_reason,
                            new_account_name_encrypted, new_account_number_encrypted,
                            old_account_backup, verify_result
                     FROM merchant_settlement_accounts
@@ -782,7 +723,7 @@ class BankcardService:
 
         # 2. 如果本地已经是终态，直接返回（不调用微信）
         if record['verify_result'] in ['VERIFY_SUCCESS', 'VERIFY_FAIL']:
-            logger.info(f"本地已为终态: verify_result={record['verify_result']}")
+            logger.info("security_operation_event")
             return {
                 "msg": "ok",
                 "application_no": application_no,
@@ -794,9 +735,9 @@ class BankcardService:
         # 3. 异步查询微信状态
         try:
             wx_resp = wxpay_client.query_application_status(record["sub_mchid"], application_no)
-            logger.info(f"微信返回状态: {wx_resp.get('applyment_state')}")
+            logger.info("security_operation_event")
         except Exception as e:
-            logger.error(f"微信查询失败: {e}")
+            logger.error("security_operation_failed")
             # 返回本地状态
             return {
                 "msg": "ok",
@@ -804,7 +745,7 @@ class BankcardService:
                 "status": "VERIFYING",
                 "detail": "查询中，请稍后重试",
                 "is_completed": False,
-                "wx_error": str(e)
+                "wx_error": "provider_unavailable"
             }
 
         # 4. 状态转换
@@ -824,10 +765,7 @@ class BankcardService:
 
                     is_unique, bound_user_id = BankcardService._check_card_uniqueness(record['user_id'], new_card_hash)
                     if not is_unique:
-                        logger.critical(
-                            f"CRITICAL: 审核期间卡被抢占! user_id={record['user_id']}, "
-                            f"bound_user_id={bound_user_id}, application_no={application_no}"
-                        )
+                        logger.critical("bankcard_operation_requires_reconciliation")
 
                         # 记录审计日志
                         BankcardService._log_operation_async(
@@ -893,7 +831,7 @@ class BankcardService:
                                     WHERE id = %s
                                 """, (record["id"],))
                         except Exception as e:
-                            logger.error(f"恢复旧卡失败: {e}")
+                            logger.error("security_operation_failed")
                             # 最坏情况：清理改绑数据
                             cur.execute("""
                                 UPDATE merchant_settlement_accounts
@@ -944,7 +882,7 @@ class BankcardService:
                         WHERE user_id = %s
                     """, (record["new_bank_name"], new_plain_number, user_id))
 
-                    logger.info(f"改绑成功: user_id={user_id}, new_bank_name={record['new_bank_name']}")
+                    logger.info("security_operation_event")
                 else:
                     # 失败：清理临时数据，恢复旧状态
                     cur.execute("""
@@ -960,7 +898,7 @@ class BankcardService:
                         WHERE id = %s
                     """, (new_status, fail_reason, record["id"]))
 
-                    logger.info(f"改绑失败: user_id={user_id}, reason={fail_reason}")
+                    logger.info("security_operation_event")
 
                 # 异步记录审计日志
                 BankcardService._log_operation_async(
@@ -990,7 +928,7 @@ class BankcardService:
             with conn.cursor() as cur:
                 # 查询本地记录
                 cur.execute("""
-                    SELECT id, status, verify_result, bind_at, sub_mchid 
+                    SELECT id, status, verify_result, bind_at, sub_mchid, modify_application_no, modify_fail_reason
                     FROM merchant_settlement_accounts 
                     WHERE user_id = %s AND status = 1 LIMIT 1
                 """, (user_id,))
@@ -1011,9 +949,12 @@ class BankcardService:
                 if local_record.get('sub_mchid'):
                     try:
                         wechat_display = wxpay_client.query_settlement_account(local_record['sub_mchid'])
-                        result['wechat_display_info'] = wechat_display
+                        result['wechat_display_info'] = {
+                            key: wechat_display[key] for key in ("account_type", "account_bank", "verify_result")
+                            if key in wechat_display
+                        }
                     except Exception as e:
-                        logger.warning(f"微信查询失败: {e}")
+                        logger.warning("security_operation_warning")
                         result['wechat_display_info'] = {}
 
                 # 检查改绑状态
@@ -1039,7 +980,7 @@ class BankcardService:
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT id, operation_type, target_id, old_val, new_val, 
-                           admin_key, ip_address, created_at
+                           created_at
                     FROM user_bankcard_operations 
                     WHERE user_id = %s ORDER BY created_at DESC LIMIT %s
                 """, (user_id, limit))
@@ -1062,8 +1003,6 @@ class BankcardService:
                         'target_id': log['target_id'],
                         'old_val': old_val,
                         'new_val': new_val,
-                        'admin_key': log['admin_key'],
-                        'ip_address': log['ip_address'],
                         'created_at': log['created_at'].strftime('%Y-%m-%d %H:%M:%S')
                     })
 
@@ -1072,7 +1011,7 @@ class BankcardService:
     @staticmethod
     def query_my_bankcard(user_id: int) -> Dict[str, Any]:
         """查询我的银行卡（仅返回验证成功的卡，脱敏展示）"""
-        logger.info(f"【查询我的银行卡】user_id={user_id}")
+        logger.info("security_operation_event")
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -1102,7 +1041,7 @@ class BankcardService:
                         "account_bank": record['account_bank'],
                         "account_number_masked": masked_account,
                         "account_number_tail": full_account[-4:],
-                        "account_name": full_name,
+                        "account_name": (full_name[:1] + "*" * max(1, len(full_name)-1)),
                         "verify_result": record['verify_result'],
                         "bind_at": record['bind_at'].strftime('%Y-%m-%d %H:%M:%S') if record['bind_at'] else None
                     }
@@ -1122,7 +1061,7 @@ class BankcardService:
 
                     return result
                 except Exception as e:
-                    logger.error(f"解密失败: {e}")
+                    logger.error("security_operation_failed")
                     return {"has_bankcard": True, "account_id": record['id'], "error": "F015: 解密失败"}
 
     # ========================================
@@ -1155,7 +1094,7 @@ class BankcardService:
                     ))
                 conn.commit()
         except Exception as e:
-            logger.error(f"审计日志写入失败[非阻断]: {e}")
+            logger.error("security_operation_failed")
 
     @staticmethod
     def _log_operation_async(
@@ -1173,7 +1112,7 @@ class BankcardService:
 
             threading.Thread(target=_write_log, daemon=True).start()
         except Exception as e:
-            logger.error(f"异步日志写入失败: {e}")
+            logger.error("security_operation_failed")
 
     @staticmethod
     def _encrypt_sensitive(plaintext: str) -> str:
@@ -1204,13 +1143,6 @@ class BankcardService:
         # 使用SHA256加盐哈希
         return hashlib.sha256(f"{bank_account}_{salt}".encode()).hexdigest()
 
-    @staticmethod
-    def _verify_pay_password(user_id: int, pay_password: str) -> bool:
-        """验证支付密码（Mock实现）"""
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT id FROM users WHERE id = %s AND status = 0", (user_id,))
-                return cur.fetchone() is not None
 
     @staticmethod
     def clean_expired_codes():
@@ -1219,14 +1151,13 @@ class BankcardService:
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute("""
-                        DELETE FROM bankcard_verify_codes 
-                        WHERE expired_at < DATE_SUB(NOW(), INTERVAL 1 DAY)
-                        OR (status = 0 AND expired_at < NOW())
+                        DELETE FROM auth_sms_challenges
+                        WHERE expires_at < DATE_SUB(NOW(), INTERVAL 1 DAY)
                     """)
                     deleted = cur.rowcount
                     conn.commit()
-                    logger.info(f"清理过期验证码: {deleted}条")
+                    logger.info("security_operation_event")
                     return deleted
         except Exception as e:
-            logger.error(f"清理过期验证码失败: {e}")
+            logger.error("security_operation_failed")
             return 0

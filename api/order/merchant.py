@@ -7,7 +7,7 @@ from services.finance_service import get_balance, withdraw
 from decimal import Decimal
 from .refund import RefundManager
 from core.logging import get_logger
-from core.auth import get_current_user, require_platform_admin
+from core.auth import get_current_user, require_platform_admin, is_platform_admin, require_admin_or_merchant
 
 router = APIRouter()
 logger = get_logger(__name__)
@@ -59,7 +59,7 @@ class MerchantManager:
             tracking_number: Optional[str] = None,
             express_company: Optional[str] = None,
             logistics_type: Optional[int] = None,
-            item_desc: Optional[str] = None
+            item_desc: Optional[str] = None, current_user=None
     ) -> Dict[str, Any]:
         result = {"ok": False, "local_updated": False, "message": ""}
 
@@ -70,7 +70,7 @@ class MerchantManager:
                               o.delivery_way, o.transaction_id, o.consignee_phone
                        FROM orders o 
                        JOIN users u ON o.user_id = u.id 
-                       WHERE o.order_number=%s""",
+                       WHERE o.order_number=%s FOR UPDATE""",
                     (order_number,)
                 )
                 order_info = cur.fetchone()
@@ -78,6 +78,8 @@ class MerchantManager:
                 if not order_info:
                     result["message"] = "订单不存在"
                     return result
+                if current_user is None or (not is_platform_admin(current_user) and int(order_info.get('merchant_id') or 0) != int(current_user['id'])):
+                    raise HTTPException(403, '无权操作该订单')
 
                 if order_info["status"] != "pending_ship":
                     result["message"] = f"订单状态不正确，当前状态：{order_info['status']}"
@@ -153,7 +155,7 @@ class MerchantManager:
                                 """, (order_info['id'],))
                                 products = inner_cur.fetchall()
 
-                        logger.info(f"订单 {order_number} 商品名称: {[p['name'] for p in products]}")
+                        logger.info('shipping_items_loaded')
 
                         # 清理特殊字符并拼接商品名
                         import re
@@ -197,11 +199,11 @@ class MerchantManager:
                         if wx_result.get("errcode") == 0:
                             logger.info(f"订单 {order_number} 发货信息同步微信成功")
                         else:
-                            logger.error(f"订单 {order_number} 发货信息同步微信失败: {wx_result}")
+                            logger.error('shipping_provider_rejected')
                     else:
                         logger.warning(f"订单 {order_number} 缺少 transaction_id 或 openid，无法同步微信发货")
                 except Exception as e:
-                    logger.error(f"订单 {order_number} 调用微信发货接口异常: {e}", exc_info=True)
+                    logger.error('shipping_provider_failed')
                 # ===================================
 
                 return result
@@ -270,8 +272,8 @@ class MerchantManager:
         return {"ok": False, "message": r.get("errmsg") or str(r), "wechat": r}
 
     @staticmethod
-    def approve_refund(order_number: str, approve: bool = True, reject_reason: Optional[str] = None):
-        RefundManager.audit(order_number, approve, reject_reason)
+    def approve_refund(order_number: str, approve: bool = True, reject_reason=None, current_user=None, merchant_address=None):
+        return RefundManager.audit(order_number, approve, reject_reason, merchant_address, current_user=current_user)
 
 
 class MShip(BaseModel):
@@ -292,6 +294,7 @@ class MRefundAudit(BaseModel):
     order_number: str
     approve: bool
     reject_reason: Optional[str] = None
+    merchant_address: Optional[str] = None
 
 
 class MWxRemindConfirmReceive(BaseModel):
@@ -321,8 +324,8 @@ class MBindBank(BaseModel):
 
 
 @router.get("/orders", summary="查询订单列表")
-def m_orders(status: Optional[str] = None, current_user: dict = Depends(get_current_user)):
-    merchant_id = None if str(current_user.get("id")) in settings.ADMIN_USER_IDS.split(",") else current_user.get("id")
+def m_orders(status: Optional[str] = None, current_user: dict = Depends(require_admin_or_merchant)):
+    merchant_id = None if is_platform_admin(current_user) else int(current_user['id'])
     return MerchantManager.list_orders(status, merchant_id=merchant_id)
 
 
@@ -375,7 +378,7 @@ def m_ship(body: MShip, current_user: dict = Depends(get_current_user)):
         tracking_number=tracking_number,
         express_company=express_company,
         logistics_type=body.logistics_type,
-        item_desc=body.item_desc
+        item_desc=body.item_desc, current_user=current_user
     )
     if not result["ok"]:
         raise HTTPException(status_code=400, detail=result["message"])
@@ -391,12 +394,12 @@ def m_refund_audit(body: MRefundAudit, current_user: dict = Depends(get_current_
                 order = cur.fetchone()
         if not order or order.get("merchant_id") != current_user.get("id"):
             raise HTTPException(status_code=403, detail="无权审核该订单")
-    MerchantManager.approve_refund(body.order_number, body.approve, body.reject_reason)
+    MerchantManager.approve_refund(body.order_number, body.approve, body.reject_reason, current_user=current_user, merchant_address=body.merchant_address)
     return {"ok": True}
 
 
 @router.post("/withdraw", summary="申请提现", operation_id="merchant_withdraw")
-def m_withdraw(body: MWithdraw, _: dict = Depends(get_current_user)):
+def m_withdraw(body: MWithdraw, _: dict = Depends(require_platform_admin)):
     ok = withdraw(Decimal(str(body.amount)))
     if not ok:
         raise HTTPException(status_code=400, detail="余额不足")
