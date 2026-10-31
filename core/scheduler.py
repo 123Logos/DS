@@ -94,14 +94,16 @@ class TaskScheduler:
             coalesce=True,
         )
 
-        # 每天零点自动发放日补贴
+        # 每天零点执行 V1.1 会员权益日结（积分→雨点→券、券过期入池）。
+        # V1.1 采用日结，旧的"日补贴 @00:00"与"月度雨点转券 @每月1日"已停用（Q1/Q2 改为日结，废弃月结），
+        # 旧方法保留但不再调度，避免同一积分被两套结算同时处理。
         self.scheduler.add_job(
-            self.auto_distribute_daily_subsidy,
-            CronTrigger(hour=0, minute=0),  # 请根据实际需要调整时间
-            id="daily_subsidy_auto",
+            self.settle_v1_daily_rights,
+            CronTrigger(hour=0, minute=0),
+            id="v1_daily_rights_settlement",
             replace_existing=True,
             misfire_grace_time=3600,
-            coalesce=True  # 新增：合并错过的执行
+            coalesce=True,
         )
 
         # 每月1日零点自动发放联创分红
@@ -113,14 +115,15 @@ class TaskScheduler:
             misfire_grace_time=3600
         )
 
-        self.scheduler.add_job(
-            self.settle_monthly_rain_points,
-            CronTrigger(day=1, hour=0, minute=5),
-            id="monthly_rain_point_coupon",
-            replace_existing=True,
-            misfire_grace_time=3600,
-            coalesce=True,
-        )
+        # 旧月度雨点转券（每月1日 00:05）已由 V1.1 日结替代，停止调度。
+        # self.scheduler.add_job(
+        #     self.settle_monthly_rain_points,
+        #     CronTrigger(day=1, hour=0, minute=5),
+        #     id="monthly_rain_point_coupon",
+        #     replace_existing=True,
+        #     misfire_grace_time=3600,
+        #     coalesce=True,
+        # )
 
         # 每小时清理过期银行卡验证码
         self.scheduler.add_job(
@@ -157,7 +160,22 @@ class TaskScheduler:
         except Exception as e:
             logger.error('scheduled_coupon_expiry_failed')
 
-    # ==================== 日补贴发放 ====================
+    # ==================== V1.1 会员权益日结 ====================
+    def settle_v1_daily_rights(self):
+        """V1.1 每日结算：过期券入补贴池+1:1 回补积分 → 积分产雨点 → 雨点 1:1 转 30 天券。
+
+        Q12（补贴池 12%/8% 下发）未确认，本任务不包含任何补贴池出池逻辑。
+        """
+        try:
+            from services.settlement_service import SettlementService
+
+            logger.info("[定时任务] 开始 V1.1 会员权益日结")
+            summary = SettlementService().run_daily_settlement()
+            logger.info("[定时任务] V1.1 会员权益日结完成: %s", summary)
+        except Exception as e:
+            logger.error("scheduled_v1_daily_settlement_failed: %s", e)
+
+    # ==================== 日补贴发放（V1.1 已停用） ====================
     def auto_distribute_daily_subsidy(self):
         """每天零点自动发放日补贴"""
         try:
