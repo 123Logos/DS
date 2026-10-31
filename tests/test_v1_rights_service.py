@@ -3,6 +3,7 @@
 覆盖：Q6 咯哒值口径、R3/R4 兑换分流、Q4 加权平均与触发线、Q5 转券数量、
 Q7 兑酒不扣底池、Decimal 精度、Q12 暂缓的源码级约束。
 """
+import re
 from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -209,3 +210,100 @@ def test_rights_service_debits_pool_only_for_conversion():
     source = (ROOT / "services" / "rights_service.py").read_text(encoding="utf-8")
     assert source.count("pool_coupon_balance = pool_coupon_balance -") == 1
     assert '"pool_coupon_debit": format_amount(Decimal("0"))' in source
+
+
+# ==================== 漏洞 1 & 2：积分/雨点的唯一写入点 ====================
+
+_DIRECT_ASSET_WRITE = re.compile(
+    r"(UPDATE\s+user_assets\b.{0,400}?\b(points|rain_balance)\s*="
+    r"|INSERT\s+(?:IGNORE\s+)?INTO\s+user_assets\s*\([^)]*\b(points|rain_balance)\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+#: 只有这两处可以直接写镜像列：桥接（补建缺失行）与历史迁移脚本（建立初始镜像）
+_ASSET_WRITE_ALLOWED = {
+    "services/legacy_assets_bridge.py",
+    "scripts/migrate_legacy_assets.py",
+}
+
+
+def test_mirrored_columns_have_single_writer():
+    """user_assets.points / rain_balance 是 users 的镜像，业务代码不得直接写。
+
+    触发器已经在 users 变化时镜像增量，若业务代码再写一次镜像列，同一笔增量
+    会被记两次，新老账本立刻分叉。这里做源码级封堵，防止后续新增路径重新踩坑。
+    """
+    scanned = list((ROOT / "services").rglob("*.py")) + list((ROOT / "api").rglob("*.py")) + list((ROOT / "scripts").glob("*.py"))
+    assert scanned, "扫描范围为空，检查路径"
+
+    offenders = []
+    for path in scanned:
+        relative = path.relative_to(ROOT).as_posix()
+        if relative in _ASSET_WRITE_ALLOWED:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for match in _DIRECT_ASSET_WRITE.finditer(text):
+            line_no = text.count("\n", 0, match.start()) + 1
+            offenders.append(f"{relative}:{line_no}")
+    assert offenders == [], f"发现直接写镜像列，应改为写 users 由触发器镜像: {offenders}"
+
+
+def test_bridge_module_is_the_only_legacy_writer():
+    """桥接模块必须存在且只写 users 侧积分列，不写镜像列。"""
+    source = (ROOT / "services" / "legacy_assets_bridge.py").read_text(encoding="utf-8")
+    assert "member_points" in source and "true_total_points" in source
+    assert "float(" not in source
+    # 唯一允许直接落镜像的地方是补建缺失行，且带 INSERT IGNORE
+    assert source.count("INSERT IGNORE INTO user_assets") == 1
+
+
+# ==================== 加锁顺序（pools -> users -> user_assets） ====================
+
+def _function_blocks(source: str) -> dict[str, str]:
+    """按 4 空格缩进的 ``def`` 切分模块，返回 {函数名: 函数体文本}。"""
+    blocks: dict[str, str] = {}
+    pattern = re.compile(r"^    def (\w+)", re.MULTILINE)
+    matches = list(pattern.finditer(source))
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(source)
+        blocks[match.group(1)] = source[match.start():end]
+    return blocks
+
+
+def test_asset_writes_lock_users_before_user_assets():
+    """凡是拿 user_assets 行锁的写方法，必须先拿 users 行锁。
+
+    镜像触发器 trg_users_assets_mirror_update 的执行路径是 users → user_assets，
+    旧业务也是这个方向。新代码若只拿 user_assets 而不同时拿 users，
+    一旦后续在事务里回头写 users 就与旧业务形成环路 —— 死锁只会在生产并发下出现，
+    所以在这里做源码级封堵。
+    """
+    source = (ROOT / "services" / "rights_service.py").read_text(encoding="utf-8")
+    blocks = _function_blocks(source)
+    assert "exchange_eggs" in blocks and "maybe_auto_convert" in blocks
+
+    offenders = []
+    checked = 0
+    for name, body in blocks.items():
+        if "lock_user_assets(cur, user_id)" not in body:
+            continue
+        checked += 1
+        asset_lock = body.index("lock_user_assets(cur, user_id)")
+        users_lock = body.find("lock_legacy_user(cur, user_id)")
+        pools_lock = body.find("lock_pools(cur)")
+        if users_lock < 0 or users_lock > asset_lock:
+            offenders.append(f"{name}: 缺少/晚于 user_assets 的 users 行锁")
+        if pools_lock >= 0 and pools_lock > users_lock:
+            offenders.append(f"{name}: system_pools 应在 users 之前加锁")
+    assert checked >= 3, f"应至少检查 3 个写方法，实际 {checked}"
+    assert offenders == [], f"加锁顺序违规: {offenders}"
+
+
+def test_lock_helpers_document_the_order():
+    """三个加锁入口的 docstring 必须写明它在全局顺序中的位置。"""
+    source = (ROOT / "services" / "rights_service.py").read_text(encoding="utf-8")
+    blocks = _function_blocks(source)
+    assert "第 1 步" in blocks["lock_pools"]
+    assert "第 2 步" in blocks["lock_legacy_user"] and "users" in blocks["lock_legacy_user"]
+    assert "第 3 步" in blocks["lock_user_assets"]
+

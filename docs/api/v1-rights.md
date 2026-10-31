@@ -251,15 +251,18 @@ Content-Type: application/json
 | `subsidy_in_quantity` | string | 是 | 入雨点补贴池券（20%） |
 | `egg_quantity` | string | 是 | 本次发放咯哒蛋 = (券×80%) ÷ 入池前咯哒值 |
 | `executed_unit_value` | string | 是 | 成交咯哒值（入池前实时值） |
-| `unit_value_after` | string\|null | 是 | 成交后咯哒值 |
+| `unit_value_after` | string\|null | 是 | 成交后咯哒值；若本次已转券，为转券后的值 |
 | `avg_cost_goda_value` | string | 是 | 更新后的加权平均成本咯哒值（Q4） |
-| `egg_quantity_total` | string | 是 | 成交后累计持有咯哒蛋 |
+| `egg_quantity_after_exchange` | string | 是 | 兑换后、转券前的持仓快照（还原中间态用） |
+| `egg_quantity_total` | string | 是 | 最终持有咯哒蛋；本次已转券则为 `0` |
+| `goda_coupon_balance` | string | 是 | 成交后的咯哒券余额 |
 | `coupon_balance_after` | string | 是 | 成交后券余额 |
-| `valuation_version_before/_after` | integer | 是 | 估值版本变化 |
+| `valuation_version_before/_after` | integer | 是 | 估值版本变化（转券会额外 +1） |
+| `auto_converted` | boolean | 是 | 本次事务内是否已触发并完成自动转券 |
 | `rule_version` | string | 是 | 规则版本 |
 | `created_at` | string | 是 | 成交时间 |
 | `idempotent_replay` | boolean | 是 | `true` 表示命中幂等键、返回首次结果 |
-| `auto_conversion` | object\|null | 否 | 成交后立即达到 Q4 触发线时的转券结果（字段同下：`conversion_id`/`egg_quantity_converted`/`goda_coupon_quantity`/`cost_basis`/`unit_value`/`triggered_at`） |
+| `auto_conversion` | object\|null | 否 | 成交后立即达到 Q4 触发线时的转券结果（字段：`conversion_id`/`egg_quantity_converted`/`goda_coupon_quantity`/`cost_basis`/`unit_value`/`unit_value_after`/`goda_coupon_balance`/`triggered_at`） |
 
 **返回示例**
 
@@ -277,14 +280,45 @@ Content-Type: application/json
     "executed_unit_value": "0.010000",
     "unit_value_after": "0.010002",
     "avg_cost_goda_value": "0.010000",
+    "egg_quantity_after_exchange": "8000.000000",
     "egg_quantity_total": "8000.000000",
+    "goda_coupon_balance": "0.000000",
     "coupon_balance_after": "900.000000",
     "valuation_version_before": 1,
     "valuation_version_after": 2,
+    "auto_converted": false,
     "rule_version": "v1.1-p1",
     "created_at": "2026-10-31T16:00:00",
     "idempotent_replay": false,
     "auto_conversion": null
+  },
+  "request_id": "c3d4e5f607182930"
+}
+```
+
+触发转券时的返回（同一事务内完成，`data` 是最终状态）：
+
+```json
+{
+  "code": "OK",
+  "message": "兑换成功",
+  "data": {
+    "exchange_id": "EXG20261031184500C7D8",
+    "egg_quantity": "80000.000000",
+    "egg_quantity_after_exchange": "80000.000000",
+    "egg_quantity_total": "0.000000",
+    "goda_coupon_balance": "1866.640000",
+    "auto_converted": true,
+    "valuation_version_after": 3,
+    "auto_conversion": {
+      "conversion_id": "CVT20261031184500E9F0",
+      "egg_quantity_converted": "80000.000000",
+      "goda_coupon_quantity": "1866.640000",
+      "cost_basis": "0.010000",
+      "unit_value": "0.023333",
+      "unit_value_after": "0.004667",
+      "goda_coupon_balance": "1866.640000"
+    }
   },
   "request_id": "c3d4e5f607182930"
 }
@@ -295,9 +329,12 @@ Content-Type: application/json
 - 前置条件：登录；券余额 ≥ 提交量；平台咯哒蛋库存 ≥ 本次发放量。
 - 调用顺序：`GET /rights/pool`（展示咯哒值）→ 本接口；如需前端锁价，把当时 `unit_value` 作为 `expected_unit_value` 回传。
 - 幂等：`Idempotency-Key` 与 `user_id + egg_exchange` 唯一；同键同参返回首次结果并置 `idempotent_replay=true`，同键不同参返回 409 `IDEMPOTENCY_CONFLICT`。
-- 事务与加锁：先锁 `system_pools`，再锁 `user_assets`；关键字段用条件 UPDATE（`WHERE platform_egg_balance >= ?`、`WHERE coupon_balance >= ?`）二次兜底，**并发不会超发**（见 `tests/test_v1_rights_mysql.py::test_concurrent_exchange_is_atomic_and_never_oversells`）。
+- 事务与加锁：固定顺序 **`system_pools` → `users` → `user_assets`**（`users` 不可省略，镜像触发器与旧业务都是 users → user_assets，漏掉即与旧业务反向成环）；关键字段用条件 UPDATE（`WHERE platform_egg_balance >= ?`、`WHERE coupon_balance >= ?`）二次兜底，**并发不会超发**（见 `test_concurrent_exchange_is_atomic_and_never_oversells`）。
+- 死锁防护：与旧业务（`UPDATE users` 送/扣积分）在同一会员上并发时不得出现 1213/1205（见 `test_exchange_and_legacy_points_update_never_deadlock`）。
 - 计算口径：兑换数量按**入池前**咯哒值计算（Q6）；80% 入底池，20% 入补贴池；拆分按 6 位舍入，补贴池取差额，保证 `pool_in + subsidy_in` 恒等于提交量。
-- 状态流转：成交后若实时咯哒值 ≥ 成本 × 2，系统立即自动转券（Q4/Q5），结果附在 `auto_conversion`，蛋清零、发咯哒券、底池按发券量扣减、蛋回补平台库存。
+- 状态流转：成交后若实时咯哒值 ≥ 成本 × 2，**在同一事务内**立即转券（Q4/Q5）：蛋清零、发咯哒券、底池按发券量扣减、蛋回补平台库存，结果附在 `auto_conversion` 并置 `auto_converted=true`。转券任何一步失败都会整笔回滚——不会出现「券已扣、蛋已发、券没转成」的中间态（见 `test_exchange_rolls_back_everything_when_conversion_fails`）。
+- 被动持有人：兑换后不再操作的会员，由调度器每分钟扫描一次（`sweep_global_auto_conversions`，游标分页 500/批）补齐转券，不依赖本人再次访问。
+- 幂等与转券：`rights_operations.result` 保存的是**含转券在内的最终状态**，同键重试直接返回该状态，不会二次转券。
 - 风控：账本 `rights_ledger` 只增不改不删（触发器强制），每笔写 2 条流水。
 
 **错误**：`401`、`403`、`409 QUOTE_STALE / IDEMPOTENCY_CONFLICT / STATE_CONFLICT`、`422 INVALID_ARGUMENT / INSUFFICIENT_BALANCE / POOL_INSUFFICIENT`、`503` 池未初始化。

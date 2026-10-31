@@ -23,6 +23,7 @@ class TaskScheduler:
         self._dist_lock = None
         self._payment_cursor = 0
         self._offline_payment_cursor = 0
+        self._v1_swept_version = None
 
     def _acquire_scheduler_lock(self) -> bool:
         if sys.platform != "win32":
@@ -106,6 +107,18 @@ class TaskScheduler:
             coalesce=True,
         )
 
+        # 每分钟扫描被动持有人执行自动转券（Q4）：
+        # 只在"咯哒值版本号"发生变化后才真正扫描——咯哒值不变就不会有新会员跨过
+        # 成本×2 的触发线，避免每分钟对全表做无意义遍历。
+        self.scheduler.add_job(
+            self.sweep_v1_auto_conversions,
+            CronTrigger(minute="*"),
+            id="v1_global_auto_conversion",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+
         # 每月1日零点自动发放联创分红
         self.scheduler.add_job(
             self.auto_distribute_unilevel_dividend,
@@ -126,8 +139,7 @@ class TaskScheduler:
         # )
 
         # 每小时清理过期银行卡验证码
-        self.scheduler.add_job(
-            self.clean_expired_bankcard_codes,
+        self.scheduler.add_job(            self.clean_expired_bankcard_codes,
             CronTrigger(hour="*", minute=30),
             id="clean_expired_bankcard_codes",
             replace_existing=True
@@ -174,6 +186,34 @@ class TaskScheduler:
             logger.info("[定时任务] V1.1 会员权益日结完成: %s", summary)
         except Exception as e:
             logger.error("scheduled_v1_daily_settlement_failed: %s", e)
+
+    # ==================== V1.1 全局自动转券（Q4 被动持有人） ====================
+    def sweep_v1_auto_conversions(self):
+        """扫描持有咯哒蛋的会员，逐个执行 Q4 自动转券。
+
+        被动持有人（兑换后再无操作）若不扫描，会长期错失增值转券，
+        因此由调度器每分钟驱动一次；单会员独立短事务，可随时重入。
+        """
+        try:
+            from services.rights_service import RightsService
+            from core.database import get_conn
+
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT valuation_version FROM system_pools WHERE id = 1")
+                    row = cur.fetchone()
+            if not row:
+                return
+            version = int(row["valuation_version"])
+            if version == self._v1_swept_version:
+                return
+
+            summary = RightsService().sweep_global_auto_conversions()
+            self._v1_swept_version = version
+            if summary["users_converted"] or summary["failures"]:
+                logger.info("[定时任务] V1.1 全局自动转券: %s", summary)
+        except Exception as e:
+            logger.error("scheduled_v1_auto_conversion_failed: %s", e)
 
     # ==================== 日补贴发放（V1.1 已停用） ====================
     def auto_distribute_daily_subsidy(self):

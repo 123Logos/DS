@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 from core.database import get_conn  # noqa: E402
 from core.logging import get_logger  # noqa: E402
+from core.sql_split import split_sql_statements  # noqa: E402
 
 logger = get_logger(__name__)
 
@@ -42,7 +43,9 @@ def _column_exists(cur, table: str, column: str) -> bool:
 
 def run_sql_file(path: Path, dry_run: bool) -> None:
     sql = path.read_text(encoding="utf-8")
-    statements = [s.strip() for s in sql.split(";") if s.strip()]
+    # 用词法切分而非 split(";")：008 的触发器体是 BEGIN...END 复合语句，
+    # 内部含分号，必须先识别 DELIMITER 指令与引号/注释边界。
+    statements = split_sql_statements(sql)
     logger.info("迁移文件: %s (%s 条语句)", path.name, len(statements))
     if dry_run:
         for s in statements:

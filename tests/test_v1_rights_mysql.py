@@ -19,9 +19,11 @@ import pytest
 from services import rights_service, settlement_service
 from services.rights_service import RightsError, RightsService
 from services.settlement_service import SubsidyPayoutDisabled, SettlementService
+from core.sql_split import split_sql_statements
 
 ROOT = Path(__file__).resolve().parent.parent
 MIGRATION = ROOT / "migrations" / "007_v1_rights.sql"
+BRIDGE_MIGRATION = ROOT / "migrations" / "008_legacy_assets_bridge.sql"
 INITIAL_POOL = Decimal("1000000")
 TOTAL_SUPPLY = Decimal("100000000")
 
@@ -43,9 +45,9 @@ def _mysql_kwargs(database: str | None = None) -> dict:
     return kwargs
 
 
-def _migration_statements() -> list[str]:
-    sql = MIGRATION.read_text(encoding="utf-8")
-    return [stmt.strip() for stmt in sql.split(";") if stmt.strip()]
+def _migration_statements(path: Path = MIGRATION) -> list[str]:
+    """按迁移文件的真实语法切分（008 的触发器体是 BEGIN...END 复合语句）。"""
+    return split_sql_statements(path.read_text(encoding="utf-8"))
 
 
 class ScratchDatabase:
@@ -128,7 +130,8 @@ def scratch_db():
                 """CREATE TABLE users (
                        id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
                        member_level TINYINT NOT NULL DEFAULT 0,
-                       member_points DECIMAL(12,6) NOT NULL DEFAULT 0
+                       member_points DECIMAL(12,6) NOT NULL DEFAULT 0,
+                       true_total_points DECIMAL(12,6) NOT NULL DEFAULT 0
                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
             )
             cur.execute(
@@ -140,6 +143,8 @@ def scratch_db():
                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
             )
             for stmt in _migration_statements():
+                cur.execute(stmt)
+            for stmt in _migration_statements(BRIDGE_MIGRATION):
                 cur.execute(stmt)
         conn.commit()
     finally:
@@ -182,7 +187,7 @@ def _race(times: int, action):
 
 def test_concurrent_exchange_is_atomic_and_never_oversells(store):
     store.exec("INSERT INTO users (id) VALUES (1)")
-    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 1000)")
+    store.exec("UPDATE user_assets SET coupon_balance = 1000 WHERE user_id = 1")
 
     results = _race(8, lambda: RightsService().exchange_eggs(1, "100"))
     successes = [r for r in results if isinstance(r, dict)]
@@ -216,7 +221,7 @@ def test_concurrent_exchange_respects_platform_inventory(store):
     """平台库存不足时，并发操作必须整笔失败，不得部分成交或出现负库存。"""
     store.exec("UPDATE system_pools SET pool_coupon_balance = 100, platform_egg_balance = 10000 WHERE id = 1")
     store.exec("INSERT INTO users (id) VALUES (1)")
-    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 10000)")
+    store.exec("UPDATE user_assets SET coupon_balance = 10000 WHERE user_id = 1")
 
     # 价格 0.01 时 1000 券需 80,000 枚，远超 10,000 枚库存
     results = _race(8, lambda: RightsService().exchange_eggs(1, "1000"))
@@ -238,7 +243,7 @@ def test_concurrent_exchange_conserves_egg_supply(store):
     """库存被并发逐步耗尽时，蛋守恒：平台剩余 + 会员持有 = 初始库存。"""
     store.exec("UPDATE system_pools SET pool_coupon_balance = 100, platform_egg_balance = 20000 WHERE id = 1")
     store.exec("INSERT INTO users (id) VALUES (1)")
-    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 10000)")
+    store.exec("UPDATE user_assets SET coupon_balance = 10000 WHERE user_id = 1")
 
     results = _race(8, lambda: RightsService().exchange_eggs(1, "100"))
     successes = [r for r in results if isinstance(r, dict)]
@@ -252,11 +257,77 @@ def test_concurrent_exchange_conserves_egg_supply(store):
     assert Decimal(pools["pool_coupon_balance"]) == Decimal(100) + Decimal(80) * len(successes)
 
 
+# ==================== 加锁顺序：新旧链路并发不死锁 ====================
+
+#: MySQL 错误码：1205 锁等待超时、1213 死锁回滚
+LOCK_CONFLICT_ERRNOS = {1205, 1213}
+
+
+def _is_lock_conflict(exc: BaseException) -> bool:
+    args = getattr(exc, "args", ())
+    return bool(args) and isinstance(args[0], int) and args[0] in LOCK_CONFLICT_ERRNOS
+
+
+def test_exchange_and_legacy_points_update_never_deadlock(store):
+    """新链路（pools → users → user_assets）与旧业务（users → 触发器 → user_assets）
+    在同一会员上并发抢锁，不得出现死锁或锁等待超时。
+
+    旧业务改积分是 `UPDATE users`，镜像触发器随即去拿 `user_assets` 行锁，
+    因此旧业务的固定方向是 users → user_assets。新链路只要**先**把 users 锁住，
+    两边方向一致，就永远不可能互相等成环；这一步漏了，早晚会踩到反向获取。
+    """
+    store.exec("INSERT INTO users (id, member_points) VALUES (1, 0)")
+    store.exec("UPDATE user_assets SET coupon_balance = 100000 WHERE user_id = 1")
+
+    def exchange_worker():
+        errors = []
+        for _ in range(4):
+            try:
+                RightsService().exchange_eggs(1, "10")
+            except Exception as exc:  # noqa: BLE001 - 并发测试需要收集异常
+                errors.append(exc)
+        return errors
+
+    def legacy_worker():
+        errors = []
+        for _ in range(4):
+            try:
+                with store.connect() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE users SET member_points = member_points + 5 WHERE id = 1")
+                    conn.commit()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+        return errors
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = [pool.submit(exchange_worker if index % 2 else legacy_worker) for index in range(6)]
+        batches = [future.result(timeout=120) for future in futures]
+
+    errors = [exc for batch in batches for exc in batch]
+    lock_conflicts = [exc for exc in errors if _is_lock_conflict(exc)]
+    assert lock_conflicts == [], f"并发出现死锁/锁等待超时: {lock_conflicts}"
+    assert errors == [], f"并发执行不应有异常: {errors}"
+
+    # 旧账本 3 线程 × 4 次 × 5 = 60，镜像必须同步到位
+    legacy = store.one("SELECT member_points FROM users WHERE id = 1")
+    assets = store.one("SELECT points, coupon_balance, egg_quantity FROM user_assets WHERE user_id = 1")
+    pools = store.one("SELECT * FROM system_pools WHERE id = 1")
+    assert Decimal(legacy["member_points"]) == Decimal("60")
+    assert Decimal(assets["points"]) == Decimal("60")
+    # 券消耗与流水严格闭合（并发下没有漏记、没有重复记）
+    coupon_delta = store.one(
+        "SELECT COALESCE(SUM(quantity_delta), 0) AS delta FROM rights_ledger WHERE asset_type = 'coupon'"
+    )
+    assert Decimal(coupon_delta["delta"]) == Decimal(assets["coupon_balance"]) - Decimal("100000")
+    assert Decimal(pools["platform_egg_balance"]) + Decimal(assets["egg_quantity"]) == TOTAL_SUPPLY
+
+
 # ==================== 兑换预报价（不扣券） ====================
 
 def test_quote_egg_exchange_preview(store):
     store.exec("INSERT INTO users (id) VALUES (1)")
-    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 100)")
+    store.exec("UPDATE user_assets SET coupon_balance = 100 WHERE user_id = 1")
 
     quote = RightsService().quote_egg_exchange(1, "100")
     assert quote["pool_in_quantity"] == "80.000000"
@@ -272,7 +343,7 @@ def test_quote_egg_exchange_preview(store):
 
 def test_weighted_average_cost_and_auto_conversion_in_db(store):
     store.exec("INSERT INTO users (id) VALUES (1)")
-    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 1000)")
+    store.exec("UPDATE user_assets SET coupon_balance = 1000 WHERE user_id = 1")
     service = RightsService()
 
     first = service.exchange_eggs(1, "100")
@@ -311,7 +382,7 @@ def test_weighted_average_cost_and_auto_conversion_in_db(store):
 
 def test_auto_conversion_not_triggered_below_double(store):
     store.exec("INSERT INTO users (id) VALUES (1)")
-    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 1000)")
+    store.exec("UPDATE user_assets SET coupon_balance = 1000 WHERE user_id = 1")
     service = RightsService()
     service.exchange_eggs(1, "100")
     store.exec("UPDATE system_pools SET pool_coupon_balance = 1980000 WHERE id = 1")
@@ -324,7 +395,7 @@ def test_auto_conversion_not_triggered_below_double(store):
 
 def _seed_wine(store, buyer_goda: str = "5000"):
     store.exec("INSERT INTO users (id, member_level) VALUES (1, 6), (2, 0)")
-    store.exec("INSERT INTO user_assets (user_id, goda_coupon_balance) VALUES (2, %s)", (Decimal(buyer_goda),))
+    store.exec("UPDATE user_assets SET goda_coupon_balance = %s WHERE user_id = 2", (Decimal(buyer_goda),))
     store.exec(
         """INSERT INTO wine_jars (id, contract_no, owner_id, status)
            VALUES (1, 'YZ-HT-0001', 1, 'listed')"""
@@ -387,7 +458,7 @@ def test_wine_redemption_rejects_insufficient_goda_coupons(store):
 
 def test_ledger_rejects_update_and_delete(store):
     store.exec("INSERT INTO users (id) VALUES (1)")
-    store.exec("INSERT INTO user_assets (user_id, egg_quantity, avg_cost_goda_value) VALUES (1, 100, 0.01)")
+    store.exec("UPDATE user_assets SET egg_quantity = 100, avg_cost_goda_value = 0.01 WHERE user_id = 1")
     store.exec(
         """INSERT INTO rights_ledger (user_id, asset_type, event_type, quantity_delta, balance_after)
            VALUES (1, 'egg', 'egg_issued', 100, 100)"""
@@ -411,7 +482,7 @@ def test_total_egg_supply_is_immutable(store):
 
 def test_idempotency_key_replays_same_result(store):
     store.exec("INSERT INTO users (id) VALUES (1)")
-    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 1000)")
+    store.exec("UPDATE user_assets SET coupon_balance = 1000 WHERE user_id = 1")
     service = RightsService()
 
     first = service.exchange_eggs(1, "100", idempotency_key="key-001")
@@ -426,7 +497,7 @@ def test_idempotency_key_replays_same_result(store):
 
 def test_idempotency_key_with_different_amount_conflicts(store):
     store.exec("INSERT INTO users (id) VALUES (1)")
-    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 1000)")
+    store.exec("UPDATE user_assets SET coupon_balance = 1000 WHERE user_id = 1")
     service = RightsService()
     service.exchange_eggs(1, "100", idempotency_key="key-002")
     with pytest.raises(RightsError) as exc:
@@ -436,17 +507,182 @@ def test_idempotency_key_with_different_amount_conflicts(store):
 
 def test_quote_stale_when_unit_value_changed(store):
     store.exec("INSERT INTO users (id) VALUES (1)")
-    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 1000)")
+    store.exec("UPDATE user_assets SET coupon_balance = 1000 WHERE user_id = 1")
     with pytest.raises(RightsError) as exc:
         RightsService().exchange_eggs(1, "100", expected_unit_value="0.02")
     assert exc.value.code == "QUOTE_STALE"
 
 
+# ==================== 漏洞 4：兑换与转券的原子性 ====================
+
+def _seed_trigger_scenario(store):
+    """构造「一次兑换就把咯哒值顶到成本×2」的场景。
+
+    底池 2,000 / 平台库存 200,000 → 咯哒值 0.01；
+    会员兑 1,000 券后：底池 2,800、库存 120,000，咯哒值 0.023333 ≥ 0.01×2，必然触发转券。
+    """
+    store.exec("UPDATE system_pools SET pool_coupon_balance = 2000, platform_egg_balance = 200000 WHERE id = 1")
+    store.exec("INSERT INTO users (id) VALUES (1)")
+    store.exec("UPDATE user_assets SET coupon_balance = 1000 WHERE user_id = 1")
+
+
+def test_exchange_and_auto_conversion_share_one_transaction(store):
+    """兑换把咯哒值顶过触发线时，转券必须在同一次 commit 内完成。"""
+    _seed_trigger_scenario(store)
+
+    result = RightsService().exchange_eggs(1, "1000")
+
+    assert result["auto_converted"] is True
+    assert result["egg_quantity"] == "80000.000000"
+    # 转券前的中间态可追溯
+    assert result["egg_quantity_after_exchange"] == "80000.000000"
+    # 最终持仓：已清零
+    assert result["egg_quantity_total"] == "0.000000"
+    conversion = result["auto_conversion"]
+    assert conversion["egg_quantity_converted"] == "80000.000000"
+    assert conversion["goda_coupon_quantity"] == "1866.640000"
+
+    assets = store.one("SELECT * FROM user_assets WHERE user_id = 1")
+    pools = store.one("SELECT * FROM system_pools WHERE id = 1")
+    assert Decimal(assets["coupon_balance"]) == Decimal("0")
+    assert Decimal(assets["egg_quantity"]) == Decimal("0")
+    assert Decimal(assets["avg_cost_goda_value"]) == Decimal("0")
+    assert Decimal(assets["goda_coupon_balance"]) == Decimal("1866.640000")
+    # 底池 = 2000 + 800（兑换入池） - 1866.64（转券扣底池）
+    assert Decimal(pools["pool_coupon_balance"]) == Decimal("933.360000")
+    assert Decimal(pools["subsidy_coupon_balance"]) == Decimal("200.000000")
+    # 发出去的 80,000 枚在转券时全额回补，平台库存回到原值
+    assert Decimal(pools["platform_egg_balance"]) == Decimal("200000")
+    # 估值版本：兑换 +1、转券 +1
+    assert int(pools["valuation_version"]) == 3
+
+    # 流水闭合：券净流出、蛋净变动为 0、咯哒券与回补各记一笔
+    ledger = store.all("SELECT asset_type, SUM(quantity_delta) AS delta FROM rights_ledger GROUP BY asset_type")
+    deltas = {row["asset_type"]: Decimal(row["delta"]) for row in ledger}
+    assert deltas["coupon"] == Decimal("-1000")
+    assert deltas["egg"] == Decimal("0")
+    assert deltas["platform_egg"] == Decimal("80000")
+    assert deltas["goda_coupon"] == Decimal("1866.640000")
+
+    # 兑换与转券各一条操作记录（转券先写、兑换后写），兑换记录里保存的是最终状态
+    ops = store.all("SELECT operation_type, result FROM rights_operations")
+    assert {row["operation_type"] for row in ops} == {"egg_exchange", "egg_auto_conversion"}
+    exchange_result = next(row["result"] for row in ops if row["operation_type"] == "egg_exchange")
+    if isinstance(exchange_result, (str, bytes)):
+        import json as _json
+
+        exchange_result = _json.loads(exchange_result)
+    assert exchange_result["auto_converted"] is True
+    assert exchange_result["egg_quantity_total"] == "0.000000"
+
+
+def test_exchange_rolls_back_everything_when_conversion_fails(store, monkeypatch):
+    """转券阶段任何异常必须回滚整笔事务：不扣券、不发蛋、不写流水。"""
+    _seed_trigger_scenario(store)
+
+    original = RightsService._write_ledger
+
+    def boom(cur, user_id, asset_type, *args, **kwargs):
+        if asset_type == rights_service.ASSET_POOL_COUPON:
+            raise RuntimeError("模拟转券写流水失败")
+        return original(cur, user_id, asset_type, *args, **kwargs)
+
+    monkeypatch.setattr(RightsService, "_write_ledger", staticmethod(boom))
+
+    with pytest.raises(RuntimeError):
+        RightsService().exchange_eggs(1, "1000")
+
+    assets = store.one("SELECT * FROM user_assets WHERE user_id = 1")
+    pools = store.one("SELECT * FROM system_pools WHERE id = 1")
+    assert Decimal(assets["coupon_balance"]) == Decimal("1000.000000"), "券不得被扣"
+    assert Decimal(assets["egg_quantity"]) == Decimal("0"), "蛋不得被发"
+    assert Decimal(assets["goda_coupon_balance"]) == Decimal("0")
+    assert Decimal(pools["pool_coupon_balance"]) == Decimal("2000.000000")
+    assert Decimal(pools["subsidy_coupon_balance"]) == Decimal("0")
+    assert Decimal(pools["platform_egg_balance"]) == Decimal("200000")
+    assert store.all("SELECT id FROM rights_ledger") == []
+    assert store.all("SELECT id FROM rights_operations") == []
+
+
+def test_replay_returns_final_state_without_reconverting(store):
+    """幂等重放必须原样返回最终状态，且不会二次转券。"""
+    _seed_trigger_scenario(store)
+    service = RightsService()
+
+    first = service.exchange_eggs(1, "1000", idempotency_key="atomic-001")
+    replay = service.exchange_eggs(1, "1000", idempotency_key="atomic-001")
+
+    assert replay["idempotent_replay"] is True
+    assert replay["exchange_id"] == first["exchange_id"]
+    assert replay["auto_converted"] is True
+    assert replay["auto_conversion"]["goda_coupon_quantity"] == "1866.640000"
+    assert replay["egg_quantity_total"] == "0.000000"
+
+    conversions = store.all("SELECT id FROM rights_operations WHERE operation_type = 'egg_auto_conversion'")
+    assert len(conversions) == 1, "重放不得再次转券"
+    assets = store.one("SELECT * FROM user_assets WHERE user_id = 1")
+    assert Decimal(assets["goda_coupon_balance"]) == Decimal("1866.640000")
+    assert Decimal(assets["coupon_balance"]) == Decimal("0")
+
+
+# ==================== 漏洞 3：被动持有人全局转券 ====================
+
+def test_sweep_converts_passive_holders_in_batches(store):
+    """被动持有人（不再操作）也必须被扫描到并完成转券。"""
+    store.exec("UPDATE system_pools SET pool_coupon_balance = 4000, platform_egg_balance = 200000 WHERE id = 1")
+    for user_id in (1, 2, 3, 4):
+        store.exec("INSERT INTO users (id) VALUES (%s)", (user_id,))
+    # 1-3：成本 0.005，咯哒值 0.02 → 触发；4：成本 0.5，永不触发
+    for user_id in (1, 2, 3):
+        store.exec(
+            "UPDATE user_assets SET egg_quantity = 8000, avg_cost_goda_value = 0.005 WHERE user_id = %s",
+            (user_id,),
+        )
+    store.exec(
+        "UPDATE user_assets SET egg_quantity = 8000, avg_cost_goda_value = 0.5 WHERE user_id = 4"
+    )
+
+    summary = RightsService().sweep_global_auto_conversions(batch_size=2)
+
+    assert summary["users_scanned"] == 4
+    assert summary["users_converted"] == 3
+    assert summary["users_deferred"] == 1
+    assert summary["failures"] == []
+    assert summary["batches"] >= 2, "必须分批游标扫描，不能一次吃下全表"
+
+    pools = store.one("SELECT * FROM system_pools WHERE id = 1")
+    # 关闭性：发出的咯哒券总额 == 底池减少额
+    assert Decimal(summary["goda_coupon_issued"]) == Decimal("4000") - Decimal(pools["pool_coupon_balance"])
+    # 清零的蛋全额回补平台库存
+    assert Decimal(pools["platform_egg_balance"]) == Decimal("224000")
+
+    for user_id in (1, 2, 3):
+        assets = store.one("SELECT * FROM user_assets WHERE user_id = %s", (user_id,))
+        assert Decimal(assets["egg_quantity"]) == Decimal("0")
+        assert Decimal(assets["goda_coupon_balance"]) > Decimal("0")
+    untouched = store.one("SELECT * FROM user_assets WHERE user_id = 4")
+    assert Decimal(untouched["egg_quantity"]) == Decimal("8000")
+
+    # 幂等：再扫一轮不会重复转券
+    again = RightsService().sweep_global_auto_conversions(batch_size=2)
+    assert again["users_converted"] == 0
+    assert again["users_deferred"] == 1
+
+
+def test_sweep_skips_users_below_trigger(store):
+    store.exec("INSERT INTO users (id) VALUES (1)")
+    store.exec("UPDATE user_assets SET egg_quantity = 8000, avg_cost_goda_value = 0.01 WHERE user_id = 1")
+    summary = RightsService().sweep_global_auto_conversions()
+    assert summary["users_scanned"] == 1
+    assert summary["users_converted"] == 0
+    assets = store.one("SELECT * FROM user_assets WHERE user_id = 1")
+    assert Decimal(assets["egg_quantity"]) == Decimal("8000")
+
+
 # ==================== 日结：积分→雨点→券→过期入池（Q1/Q2/Q3）+ Q12 暂缓 ====================
 
 def test_daily_settlement_generates_rain_and_coupons(store):
-    store.exec("INSERT INTO users (id) VALUES (1)")
-    store.exec("INSERT INTO user_assets (user_id, points) VALUES (1, 10000)")
+    store.exec("INSERT INTO users (id, member_points) VALUES (1, 10000)")
 
     summary = SettlementService().run_daily_settlement(date(2026, 10, 30), points_value="0.0001")
     assert summary["status"] == "settled"
@@ -475,8 +711,7 @@ def test_daily_settlement_generates_rain_and_coupons(store):
 
 
 def test_expired_coupons_go_to_subsidy_pool_and_backfill_points(store):
-    store.exec("INSERT INTO users (id) VALUES (1)")
-    store.exec("INSERT INTO user_assets (user_id, points) VALUES (1, 10000)")
+    store.exec("INSERT INTO users (id, member_points) VALUES (1, 10000)")
     SettlementService().run_daily_settlement(date(2026, 10, 30), points_value="0.0001")
 
     store.exec("UPDATE rights_coupon_batches SET valid_to = '2026-10-30'")
@@ -495,6 +730,22 @@ def test_expired_coupons_go_to_subsidy_pool_and_backfill_points(store):
     SettlementService().expire_due_coupons(business_date=date(2026, 11, 2))
     pools = store.one("SELECT * FROM system_pools WHERE id = 1")
     assert Decimal(pools["subsidy_coupon_balance"]) == Decimal("1.000000")
+
+
+def test_settlement_skips_orphan_assets_rows(store):
+    """脏数据（有 user_assets 无 users 行）不应让整批日结中断。"""
+    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (999, 5)")
+    store.exec(
+        """INSERT INTO rights_coupon_batches
+               (user_id, quantity, remaining, valid_from, valid_to, status, source_event, business_date)
+           VALUES (999, 5, 5, '2026-01-01', '2026-01-31', 'active', 'rain_to_coupon', '2026-01-01')"""
+    )
+
+    expired = SettlementService().expire_due_coupons(business_date=date(2026, 11, 1))
+
+    assert expired["users"] == 0
+    assert store.one("SELECT status FROM rights_coupon_batches WHERE user_id = 999")["status"] == "active"
+    assert Decimal(store.one("SELECT coupon_balance FROM user_assets WHERE user_id = 999")["coupon_balance"]) == Decimal("5")
 
 
 def test_subsidy_pool_never_pays_out(store):

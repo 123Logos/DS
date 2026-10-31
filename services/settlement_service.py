@@ -29,6 +29,7 @@ from typing import Any, Optional
 from core.config import MAX_POINTS_VALUE
 from core.database import get_conn
 from core.logging import get_logger
+from services import legacy_assets_bridge as bridge
 from services.rights_service import (
     ASSET_COUPON,
     ASSET_POINTS,
@@ -145,11 +146,25 @@ class SettlementService:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 daily_available = self._legacy_daily_available(cur)
-                cur.execute("SELECT COALESCE(SUM(points), 0) AS total FROM user_assets")
+                # 积分基数取旧账本（唯一写入点），镜像侧仅用于展示与对账
+                cur.execute("SELECT COALESCE(SUM(member_points), 0) AS total FROM users")
                 total_points = to_decimal((cur.fetchone() or {}).get("total") or 0)
         return daily_points_value(daily_available, total_points)
 
     # ---------- 主流程 ----------
+
+    @staticmethod
+    def _lock_legacy_or_skip(cur, user_id: int) -> Optional[dict]:
+        """锁旧账本会员行；行缺失时返回 None 并记错误，由调用方跳过该会员。
+
+        日结是批量任务，单个会员数据异常（`user_assets` 有孤儿行）不应该让整批
+        结算中断——但也不能静默：这里记 error，并让该会员停在未结算状态。
+        """
+        try:
+            return bridge.lock_legacy_user(cur, user_id)
+        except bridge.LegacyBridgeError:
+            logger.error("legacy_user_missing user=%s, 跳过该会员结算（可能存在孤儿 user_assets 行）", user_id)
+            return None
 
     def run_daily_settlement(
         self,
@@ -235,12 +250,23 @@ class SettlementService:
         }
 
     def _expire_user_coupons(self, user_id: int, business_date: date) -> Decimal:
-        """单会员过期处理，独立事务；加锁顺序 system_pools → user_assets → 券批次。"""
+        """单会员过期处理，独立事务。
+
+        加锁顺序：system_pools → 券批次 → **users** → user_assets。
+        `users` 必须先于 `user_assets` 取得：镜像触发器是「锁 users 后锁 user_assets」，
+        旧业务路径（下单扣积分等）也是这个方向；一旦本方法反着来，就会与旧业务
+        形成「你等我我等你」的死锁。
+
+        积分回补不再直写 `user_assets.points`，而是写 `users.member_points`，
+        由触发器在同一事务内镜像——保证小程序「我的积分」（读 users）与
+        V1.1 结算口径（读 user_assets）永远是同一个数。
+        """
         service = RightsService()
         with get_conn() as conn:
             with conn.cursor() as cur:
                 pools = service.lock_pools(cur)
-                assets = service.lock_user_assets(cur, user_id)
+
+                # 1. 先锁定并核销到期批次：active → expired 的条件 UPDATE 是幂等闸门
                 cur.execute(
                     """SELECT id, remaining FROM rights_coupon_batches
                        WHERE user_id = %s AND status = 'active' AND valid_to < %s
@@ -269,6 +295,13 @@ class SettlementService:
                     conn.rollback()
                     return Decimal("0")
 
+                # 2. 锁旧账本会员行（必须先于 user_assets）
+                if self._lock_legacy_or_skip(cur, user_id) is None:
+                    conn.rollback()
+                    return Decimal("0")
+
+                # 3. 再锁 user_assets 并校验券余额
+                assets = service.lock_user_assets(cur, user_id)
                 coupon_balance = to_decimal(assets["coupon_balance"])
                 if coupon_balance < total:
                     # 券余额与批次不一致：先按实际余额入池，避免出现负余额，并记录告警
@@ -289,16 +322,18 @@ class SettlementService:
                 cur.execute(
                     """UPDATE user_assets
                        SET coupon_balance = coupon_balance - %s,
-                           points = points + %s,
                            updated_at = NOW()
                        WHERE user_id = %s AND coupon_balance >= %s""",
-                    (total, total, user_id, total),
+                    (total, user_id, total),
                 )
                 if cur.rowcount != 1:
                     raise RuntimeError("券到期回补时资产状态冲突")
+
+                # 4. Q3 的 1:1 积分回补走旧账本（唯一写入点），镜像由触发器完成
+                points_after = bridge.add_points(cur, user_id, total)
+
                 pool_after = to_decimal(pools["subsidy_coupon_balance"]) + total
                 coupon_after = coupon_balance - total
-                points_after = to_decimal(assets["points"]) + total
                 service._write_ledger(cur, user_id, ASSET_COUPON, EV_COUPON_EXPIRED, -total, coupon_after)
                 service._write_ledger(cur, 0, ASSET_SUBSIDY_COUPON, EV_COUPON_EXPIRED, total, pool_after)
                 service._write_ledger(cur, user_id, ASSET_POINTS, EV_POINTS_BACKFILL, total, points_after)
@@ -319,8 +354,8 @@ class SettlementService:
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        """SELECT user_id, points FROM user_assets
-                           WHERE points > 0 AND user_id > %s ORDER BY user_id LIMIT %s""",
+                        """SELECT id AS user_id FROM users
+                           WHERE member_points > 0 AND id > %s ORDER BY id LIMIT %s""",
                         (last_user_id, BATCH_SIZE),
                     )
                     rows = cur.fetchall() or []
@@ -339,11 +374,17 @@ class SettlementService:
         }
 
     def _settle_user_rain(self, user_id: int, business_date: date, points_value: Decimal) -> Decimal:
+        """单会员雨点生成，独立事务；加锁顺序 users → user_assets（与旧业务同向）。"""
         service = RightsService()
         with get_conn() as conn:
             with conn.cursor() as cur:
-                assets = service.lock_user_assets(cur, user_id)
-                points = to_decimal(assets["points"])
+                # 先锁旧账本会员行；积分以 users.member_points 为准（唯一写入点）
+                legacy = self._lock_legacy_or_skip(cur, user_id)
+                if legacy is None:
+                    conn.rollback()
+                    return Decimal("0")
+                service.lock_user_assets(cur, user_id)
+                points = to_decimal(legacy["member_points"] or 0)
                 cur.execute(
                     """INSERT IGNORE INTO rights_daily_settlements
                            (business_date, user_id, status, points_basis, points_value)
@@ -365,16 +406,13 @@ class SettlementService:
                     conn.commit()
                     return Decimal("0")
 
-                cur.execute(
-                    "UPDATE user_assets SET rain_balance = rain_balance + %s, updated_at = NOW() WHERE user_id = %s",
-                    (rain, user_id),
-                )
+                # 雨点增长写入 true_total_points，由触发器镜像到 user_assets.rain_balance
+                rain_after = bridge.add_rain(cur, user_id, rain)
                 cur.execute(
                     """UPDATE rights_daily_settlements SET rain_generated = %s
                        WHERE business_date = %s AND user_id = %s""",
                     (rain, business_date, user_id),
                 )
-                rain_after = to_decimal(assets["rain_balance"]) + rain
                 service._write_ledger(cur, user_id, ASSET_RAIN, EV_RAIN_GENERATED, rain, rain_after)
                 conn.commit()
         return rain
@@ -390,8 +428,8 @@ class SettlementService:
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        """SELECT user_id FROM user_assets
-                           WHERE rain_balance > 0 AND user_id > %s ORDER BY user_id LIMIT %s""",
+                        """SELECT id AS user_id FROM users
+                           WHERE true_total_points > 0 AND id > %s ORDER BY id LIMIT %s""",
                         (last_user_id, BATCH_SIZE),
                     )
                     rows = cur.fetchall() or []
@@ -406,11 +444,17 @@ class SettlementService:
         return {"users": users, "coupons_issued": str(quantize_amount(total_issued))}
 
     def _convert_user_rain(self, user_id: int, business_date: date) -> Decimal:
+        """单会员雨点转券，独立事务；加锁顺序 users → user_assets（与旧业务同向）。"""
         service = RightsService()
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # 雨点余额以 users.true_total_points 为准，user_assets.rain_balance 只是镜像
+                legacy = self._lock_legacy_or_skip(cur, user_id)
+                if legacy is None:
+                    conn.rollback()
+                    return Decimal("0")
                 assets = service.lock_user_assets(cur, user_id)
-                rain = to_decimal(assets["rain_balance"])
+                rain = to_decimal(legacy["true_total_points"] or 0)
                 if rain <= 0:
                     conn.rollback()
                     return Decimal("0")
@@ -421,13 +465,14 @@ class SettlementService:
                        VALUES (%s, %s, %s, %s, %s, 'active', %s, %s)""",
                     (user_id, rain, rain, valid_from, valid_to, EV_RAIN_TO_COUPON, business_date),
                 )
+                # 雨点清零写旧账本，触发器把镜像的 rain_balance 一起归零
+                bridge.add_rain(cur, user_id, -rain)
                 cur.execute(
                     """UPDATE user_assets
-                       SET rain_balance = rain_balance - %s,
-                           coupon_balance = coupon_balance + %s,
+                       SET coupon_balance = coupon_balance + %s,
                            updated_at = NOW()
-                       WHERE user_id = %s AND rain_balance >= %s""",
-                    (rain, rain, user_id, rain),
+                       WHERE user_id = %s""",
+                    (rain, user_id),
                 )
                 if cur.rowcount != 1:
                     raise RuntimeError("雨点转券时资产状态冲突")
