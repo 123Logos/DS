@@ -8,6 +8,8 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
+from models.schemas.rights import EggExchangeRequest
 
 from services.rights_service import (
     GODA_COUPONS_PER_JAR,
@@ -153,6 +155,13 @@ def test_decimal_sum_is_exact_no_binary_float_error():
     total = to_decimal("0.1") + to_decimal("0.2")
     assert total == Decimal("0.3")
     assert quantize_amount(total) == Decimal("0.300000")
+
+@pytest.mark.parametrize("field", ["coupon_quantity", "expected_unit_value"])
+@pytest.mark.parametrize("value", ["1e999999999", "100000000000000"])
+def test_exchange_rejects_values_outside_database_precision(field, value):
+    payload = {"coupon_quantity": "1", field: value}
+    with pytest.raises(ValidationError):
+        EggExchangeRequest(**payload)
 
 
 def test_rights_service_source_has_no_float_arithmetic():

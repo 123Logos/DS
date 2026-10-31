@@ -3,6 +3,7 @@
 > 范围：`migrations/007_v1_rights.sql` + `services/rights_service.py` + `services/settlement_service.py` + `api/v1/`。
 > 业务基线：`docs/问题清单.md` Q1-Q17 为最高优先级；与 `docs/需求文档.md` 冲突时以问题清单为准。
 > **Q12（雨点补贴池 12%/8% 下发）本阶段强制暂缓**：补贴池只入不出，无任何发放明细与下发接口。
+> **上线阻断**：旧积分写入仍使用 `users.member_points`，V1 日结读取一次性复制的 `user_assets.points`；旧雨点也尚未迁入。全链路迁移、对账与切换方案完成前，不应部署本 PR 或启用 V1 日结。被动持有人自动转券及兑换后转券的幂等恢复仍需修复。
 
 ## 0. 公共约定
 
@@ -221,8 +222,8 @@ Authorization: Bearer <token>
 | --- | --- | --- | --- | --- | --- | --- |
 | `Authorization` | header | string | 是 | — | `Bearer <token>` | 认证令牌 |
 | `Idempotency-Key` | header | string | 建议必传 | 无 | 8-96 位字母/数字/`:`/`_`/`-` | 幂等键，同键同参返回首次结果 |
-| `coupon_quantity` | body | string | 是 | — | 十进制字符串；`>0`；≤6 位小数；长度 ≤40 | 提交的优惠券数量 |
-| `expected_unit_value` | body | string\|null | 否 | `null` | 同上去格式校验 | 前端报价咯哒值；传了就必须与实时值一致，否则 409 |
+| `coupon_quantity` | body | string | 是 | — | 十进制字符串；`0 < 值 < 100000000000000`；≤6 位小数；长度 ≤40 | 提交的优惠券数量 |
+| `expected_unit_value` | body | string\|null | 否 | `null` | 非空时同上数值范围及格式 | 前端报价咯哒值；传了就必须与实时值一致，否则 409 |
 
 **请求示例**
 
@@ -239,6 +240,8 @@ Content-Type: application/json
 ```
 
 非法示例：`{"coupon_quantity": "0"}` → `422 INVALID_ARGUMENT`；`{"coupon_quantity": 100}`（数字而非字符串）→ Pydantic 422；`{"coupon_quantity": "1.0000001"}` → 422（超过 6 位小数）。
+
+**变更记录**：数值此前未限制整数位数；现限制为小于 `100000000000000`，以匹配 `DECIMAL(20,6)`，超出范围返回 422。客户端应在提交前校验；原本可提交但无法安全量化或存储的超大值不再接受。
 
 **返回参数**（`data`）
 
@@ -296,9 +299,10 @@ Content-Type: application/json
 - 调用顺序：`GET /rights/pool`（展示咯哒值）→ 本接口；如需前端锁价，把当时 `unit_value` 作为 `expected_unit_value` 回传。
 - 幂等：`Idempotency-Key` 与 `user_id + egg_exchange` 唯一；同键同参返回首次结果并置 `idempotent_replay=true`，同键不同参返回 409 `IDEMPOTENCY_CONFLICT`。
 - 事务与加锁：先锁 `system_pools`，再锁 `user_assets`；关键字段用条件 UPDATE（`WHERE platform_egg_balance >= ?`、`WHERE coupon_balance >= ?`）二次兜底，**并发不会超发**（见 `tests/test_v1_rights_mysql.py::test_concurrent_exchange_is_atomic_and_never_oversells`）。
+- 券批次：仅核销当前有效批次；按到期日、批次 ID 先进先出，并与扣减总余额在同一事务内完成。有效批次不足时，即使总余额足够也返回 `422 INSUFFICIENT_BALANCE`。
 - 计算口径：兑换数量按**入池前**咯哒值计算（Q6）；80% 入底池，20% 入补贴池；拆分按 6 位舍入，补贴池取差额，保证 `pool_in + subsidy_in` 恒等于提交量。
 - 状态流转：成交后若实时咯哒值 ≥ 成本 × 2，系统立即自动转券（Q4/Q5），结果附在 `auto_conversion`，蛋清零、发咯哒券、底池按发券量扣减、蛋回补平台库存。
-- 风控：账本 `rights_ledger` 只增不改不删（触发器强制），每笔写 2 条流水。
+- 风控：账本 `rights_ledger` 只增不改不删（触发器强制）；兑换记录会员扣券、发蛋及三个平台池的变动。
 
 **错误**：`401`、`403`、`409 QUOTE_STALE / IDEMPOTENCY_CONFLICT / STATE_CONFLICT`、`422 INVALID_ARGUMENT / INSUFFICIENT_BALANCE / POOL_INSUFFICIENT`、`503` 池未初始化。
 

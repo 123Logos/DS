@@ -549,6 +549,36 @@ class RightsService:
                 if to_decimal(pools["platform_egg_balance"]) < eggs:
                     raise RightsError(ERR_POOL_INSUFFICIENT, 422, "平台咯哒蛋库存不足")
 
+                # 同一事务按到期日先进先出核销，不能把已用券留在过期批次中。
+                cur.execute(
+                    """SELECT id, remaining FROM rights_coupon_batches
+                       WHERE user_id = %s AND status = 'active'
+                             AND valid_from <= CURDATE() AND valid_to >= CURDATE()
+                       ORDER BY valid_to, id FOR UPDATE""",
+                    (user_id,),
+                )
+                batches = cur.fetchall() or []
+                if sum((to_decimal(batch["remaining"]) for batch in batches), Decimal("0")) < quantity:
+                    raise RightsError(ERR_INSUFFICIENT_BALANCE, 422, "有效优惠券余额不足")
+                remaining = quantity
+                for batch in batches:
+                    used = min(remaining, to_decimal(batch["remaining"]))
+                    if used <= 0:
+                        continue
+                    cur.execute(
+                        """UPDATE rights_coupon_batches
+                           SET remaining = remaining - %s,
+                               status = CASE WHEN remaining = 0 THEN 'consumed' ELSE 'active' END,
+                               updated_at = NOW()
+                           WHERE id = %s AND status = 'active' AND remaining >= %s""",
+                        (used, batch["id"], used),
+                    )
+                    if cur.rowcount != 1:
+                        raise RightsError(ERR_STATE_CONFLICT, 409, "优惠券批次状态冲突")
+                    remaining -= used
+                    if remaining == 0:
+                        break
+
                 operation_no = _new_operation_no("EXG")
                 # 池已加锁，条件 UPDATE 作为超发二次兜底
                 cur.execute(
@@ -587,6 +617,9 @@ class RightsService:
 
                 self._write_ledger(cur, user_id, ASSET_COUPON, EV_COUPON_TO_EGG, -quantity, coupon_after, unit_before, operation_no)
                 self._write_ledger(cur, user_id, ASSET_EGG, EV_EGG_ISSUED, eggs, new_egg_quantity, unit_before, operation_no)
+                self._write_ledger(cur, 0, ASSET_POOL_COUPON, EV_COUPON_TO_EGG, pool_in, pool_after, unit_before, operation_no)
+                self._write_ledger(cur, 0, ASSET_SUBSIDY_COUPON, EV_COUPON_TO_EGG, subsidy_in, to_decimal(pools["subsidy_coupon_balance"]) + subsidy_in, unit_before, operation_no)
+                self._write_ledger(cur, 0, ASSET_PLATFORM_EGG, EV_EGG_ISSUED, -eggs, egg_inventory_after, unit_before, operation_no)
 
                 result = {
                     "exchange_id": operation_no,

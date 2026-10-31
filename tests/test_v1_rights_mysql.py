@@ -9,7 +9,7 @@ import contextlib
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -177,12 +177,21 @@ def _race(times: int, action):
         futures = [pool.submit(invoke) for _ in range(times)]
         return [future.result(timeout=60) for future in futures]
 
+def _seed_coupon_batch(store, quantity):
+    store.exec(
+        """INSERT INTO rights_coupon_batches (user_id, quantity, remaining, valid_from, valid_to, source_event)
+           VALUES (1, %s, %s, CURDATE(), DATE_ADD(CURDATE(), INTERVAL 30 DAY), 'test')""",
+        (quantity, quantity),
+    )
+
+
 
 # ==================== 并发兑换防超发 ====================
 
 def test_concurrent_exchange_is_atomic_and_never_oversells(store):
     store.exec("INSERT INTO users (id) VALUES (1)")
     store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 1000)")
+    _seed_coupon_batch(store, 1000)
 
     results = _race(8, lambda: RightsService().exchange_eggs(1, "100"))
     successes = [r for r in results if isinstance(r, dict)]
@@ -205,11 +214,14 @@ def test_concurrent_exchange_is_atomic_and_never_oversells(store):
     assert Decimal(pools["platform_egg_balance"]) == TOTAL_SUPPLY - total_eggs
     assert Decimal(pools["platform_egg_balance"]) >= 0
 
-    # 每次兑换恰好两条流水，且流水余额与最终资产一致
+    # 会员与平台变动流水均须与资产变化闭合
     ledger = store.all("SELECT asset_type, SUM(quantity_delta) AS delta FROM rights_ledger GROUP BY asset_type")
     deltas = {row["asset_type"]: Decimal(row["delta"]) for row in ledger}
     assert deltas["coupon"] == Decimal("-800.000000")
     assert deltas["egg"] == total_eggs
+    assert deltas["pool_coupon"] == Decimal("640")
+    assert deltas["subsidy_coupon"] == Decimal("160")
+    assert deltas["platform_egg"] == -total_eggs
 
 
 def test_concurrent_exchange_respects_platform_inventory(store):
@@ -217,6 +229,7 @@ def test_concurrent_exchange_respects_platform_inventory(store):
     store.exec("UPDATE system_pools SET pool_coupon_balance = 100, platform_egg_balance = 10000 WHERE id = 1")
     store.exec("INSERT INTO users (id) VALUES (1)")
     store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 10000)")
+    _seed_coupon_batch(store, 10000)
 
     # 价格 0.01 时 1000 券需 80,000 枚，远超 10,000 枚库存
     results = _race(8, lambda: RightsService().exchange_eggs(1, "1000"))
@@ -239,6 +252,7 @@ def test_concurrent_exchange_conserves_egg_supply(store):
     store.exec("UPDATE system_pools SET pool_coupon_balance = 100, platform_egg_balance = 20000 WHERE id = 1")
     store.exec("INSERT INTO users (id) VALUES (1)")
     store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 10000)")
+    _seed_coupon_batch(store, 10000)
 
     results = _race(8, lambda: RightsService().exchange_eggs(1, "100"))
     successes = [r for r in results if isinstance(r, dict)]
@@ -273,6 +287,7 @@ def test_quote_egg_exchange_preview(store):
 def test_weighted_average_cost_and_auto_conversion_in_db(store):
     store.exec("INSERT INTO users (id) VALUES (1)")
     store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 1000)")
+    _seed_coupon_batch(store, 1000)
     service = RightsService()
 
     first = service.exchange_eggs(1, "100")
@@ -312,6 +327,7 @@ def test_weighted_average_cost_and_auto_conversion_in_db(store):
 def test_auto_conversion_not_triggered_below_double(store):
     store.exec("INSERT INTO users (id) VALUES (1)")
     store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 1000)")
+    _seed_coupon_batch(store, 1000)
     service = RightsService()
     service.exchange_eggs(1, "100")
     store.exec("UPDATE system_pools SET pool_coupon_balance = 1980000 WHERE id = 1")
@@ -412,6 +428,7 @@ def test_total_egg_supply_is_immutable(store):
 def test_idempotency_key_replays_same_result(store):
     store.exec("INSERT INTO users (id) VALUES (1)")
     store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 1000)")
+    _seed_coupon_batch(store, 1000)
     service = RightsService()
 
     first = service.exchange_eggs(1, "100", idempotency_key="key-001")
@@ -421,12 +438,13 @@ def test_idempotency_key_replays_same_result(store):
     assert second["idempotent_replay"] is True
     assets = store.one("SELECT coupon_balance FROM user_assets WHERE user_id = 1")
     assert Decimal(assets["coupon_balance"]) == Decimal("900.000000")
-    assert len(store.all("SELECT id FROM rights_ledger")) == 2
+    assert len(store.all("SELECT id FROM rights_ledger")) == 5
 
 
 def test_idempotency_key_with_different_amount_conflicts(store):
     store.exec("INSERT INTO users (id) VALUES (1)")
     store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 1000)")
+    _seed_coupon_batch(store, 1000)
     service = RightsService()
     service.exchange_eggs(1, "100", idempotency_key="key-002")
     with pytest.raises(RightsError) as exc:
@@ -437,6 +455,7 @@ def test_idempotency_key_with_different_amount_conflicts(store):
 def test_quote_stale_when_unit_value_changed(store):
     store.exec("INSERT INTO users (id) VALUES (1)")
     store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 1000)")
+    _seed_coupon_batch(store, 1000)
     with pytest.raises(RightsError) as exc:
         RightsService().exchange_eggs(1, "100", expected_unit_value="0.02")
     assert exc.value.code == "QUOTE_STALE"
@@ -507,3 +526,49 @@ def test_subsidy_pool_never_pays_out(store):
     assert summary["status"] == "settled"
     pools = store.one("SELECT subsidy_coupon_balance FROM system_pools WHERE id = 1")
     assert Decimal(pools["subsidy_coupon_balance"]) == Decimal("100.000000")
+
+
+def test_exchanged_old_batch_cannot_expire_again(store):
+    today = date.today()
+    store.exec("INSERT INTO users (id) VALUES (1)")
+    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 200)")
+    for expiry in (today, today + timedelta(days=20)):
+        store.exec(
+            """INSERT INTO rights_coupon_batches (user_id, quantity, remaining, valid_from, valid_to, source_event)
+               VALUES (1, 100, 100, %s, %s, 'test')""",
+            (today - timedelta(days=1), expiry),
+        )
+    RightsService().exchange_eggs(1, "100")
+    SettlementService().expire_due_coupons(today + timedelta(days=1))
+    assets = store.one("SELECT coupon_balance, points FROM user_assets WHERE user_id = 1")
+    assert assets["coupon_balance"] == Decimal("100")
+    assert assets["points"] == 0
+
+
+def test_expired_batch_cannot_be_exchanged(store):
+    today = date.today()
+    store.exec("INSERT INTO users (id) VALUES (1)")
+    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 100)")
+    store.exec(
+        """INSERT INTO rights_coupon_batches (user_id, quantity, remaining, valid_from, valid_to, source_event)
+           VALUES (1, 100, 100, %s, %s, 'test')""",
+        (today - timedelta(days=30), today - timedelta(days=1)),
+    )
+    with pytest.raises(RightsError) as exc:
+        RightsService().exchange_eggs(1, "100")
+    assert exc.value.code == "INSUFFICIENT_BALANCE"
+    assert store.one("SELECT coupon_balance FROM user_assets WHERE user_id = 1")["coupon_balance"] == Decimal("100")
+
+
+def test_daily_settlement_expires_yesterdays_batch(store):
+    yesterday = date.today() - timedelta(days=1)
+    store.exec("INSERT INTO users (id) VALUES (1)")
+    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 100)")
+    store.exec(
+        """INSERT INTO rights_coupon_batches (user_id, quantity, remaining, valid_from, valid_to, source_event)
+           VALUES (1, 100, 100, %s, %s, 'test')""",
+        (yesterday - timedelta(days=30), yesterday),
+    )
+    result = SettlementService().run_daily_settlement(yesterday, points_value="0")
+    assert Decimal(result["expired"]["coupons_to_subsidy_pool"]) == Decimal("100")
+    assert store.one("SELECT points FROM user_assets WHERE user_id = 1")["points"] == Decimal("100")
