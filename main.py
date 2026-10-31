@@ -44,6 +44,7 @@ from api.bankcard.routes import register_bankcard_routes
 from api.offline.routes import register_offline_routes, pay_bridge_router
 from api.order.refund import router as refund_router   # ✅ 新增导入
 from api.security.routes import register_security_routes
+from api.v1 import register_v1_routes
 
 def ensure_database():
     """确保数据库存在"""
@@ -211,6 +212,14 @@ tags_metadata = [
         "name": "线下收银台付款模块",
         "description": "支付单创建,收款码生成,用户支付，后续管理等功能。",
     },
+    {
+        "name": "会员权益",
+        "description": "V1.1 会员消费回馈权益：权益总览、底池与实时咯哒值、优惠券兑换咯哒蛋（Q12 补贴池下发暂缓）。",
+    },
+    {
+        "name": "白酒专区",
+        "description": "V1.1 六星店长白酒专区：咯哒券兑酒报价（Q13 附加费用未确认）。",
+    },
 ]
 
 # ... 后续代码保持不变 ...
@@ -275,6 +284,7 @@ register_store_routes(app)
 register_bankcard_routes(app) # 修改：注册新的银行卡路由
 register_offline_routes(app)
 register_security_routes(app)
+register_v1_routes(app)
 
 # ✅ 注册退款路由（根路径 + /api 前缀，兼容不同前端请求；标准路径另有 /refund/*）
 # 必须传 tags，否则 operation 无 tags，Swagger UI 会归到「default」分组

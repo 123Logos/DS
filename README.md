@@ -88,6 +88,7 @@ WECHAT_APP_SECRET=WECHAT_APP_SECRET
 ### 会员权益需求、安全契约与验证
 
 - [业务接口文档与 V1.1 需求差异](docs/禹泽小程序接口文档.md)：区分当前接口、安全变更、未实现的咯哒权益/白酒目标契约；Q1–Q17及原资产政策未由本轮改动。
+- [V1.1 会员权益接口（第一阶段）](docs/api/v1-rights.md)：`/api/v1/rights`、`/api/v1/wine` 四条已实现接口的完整契约（Q12 补贴池下发暂缓，Q13 费用未确认）。
 - [认证与用户隐私契约](docs/api/security-auth.md)：session-backed Bearer、短信挑战/密码找回、用户/银行卡权限与迁移要求。
 - [订单、支付与退款契约](docs/api/security-payments.md)：服务端权威价格、状态竞态、持久退款恢复和回调。
 - [财务安全契约](docs/api/security-finance.md)：默认管理员访问、个人数据作用域、持久幂等发券、提款供应商未接入边界。
