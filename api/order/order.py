@@ -5,7 +5,8 @@ from services.finance_service import (
     parse_pending_coupon_ids,
 )
 from fastapi import APIRouter, HTTPException, Query, Request, Depends
-from pydantic import BaseModel, Field, ConfigDict, AliasChoices, model_validator
+from core.auth import get_current_user, is_platform_admin, require_admin_or_merchant, require_platform_admin
+from pydantic import BaseModel, Field, ConfigDict, AliasChoices, model_validator, StrictInt
 from typing import Optional, List, Dict, Any, cast
 from core.config import Settings, settings
 from core.database import get_conn
@@ -56,6 +57,7 @@ def _cancel_expire_orders_once() -> int:
                 WHERE status='pending_pay'
                   AND expire_at IS NOT NULL
                   AND expire_at <= %s
+                FOR UPDATE
                 """,
                 (now,),
             )
@@ -69,13 +71,13 @@ def _cancel_expire_orders_once() -> int:
                     cur.execute("DELETE FROM pending_rewards WHERE id = %s", (reward["id"],))
                     logger.info("删除订单 %s 待发放奖励 id=%s", ono, reward["id"])
                 cur.execute(
-                    "SELECT product_id,quantity FROM order_items WHERE order_id=%s",
+                    "SELECT sku_id,quantity FROM order_items WHERE order_id=%s",
                     (oid,),
                 )
                 for it in cur.fetchall():
                     cur.execute(
-                        "UPDATE product_skus SET stock=stock+%s WHERE product_id=%s",
-                        (it["quantity"], it["product_id"]),
+                        "UPDATE product_skus SET stock=stock+%s WHERE id=%s",
+                        (it["quantity"], it["sku_id"]),
                     )
                 cur.execute(
                     "UPDATE orders SET status='cancelled',updated_at=NOW() WHERE id=%s",
@@ -227,6 +229,7 @@ class OrderManager:
                         product_merchant_ids = set()
 
                         for it in buy_now_items:
+                            it = it.model_dump()
                             cur.execute("SELECT is_member_product, user_id, cash_only FROM products WHERE id = %s",
                                         (it["product_id"],))
                             prod = cur.fetchone()
@@ -247,15 +250,22 @@ class OrderManager:
                                     raise HTTPException(status_code=422,
                                                         detail=f"商品 {it['product_id']} 无可用 SKU，请提供 sku_id")
 
-                            if "price" not in it:
-                                raise HTTPException(status_code=422,
-                                                    detail=f"buy_now_items 必须包含 price 字段：product_id={it['product_id']}")
+                            quantity = it.get("quantity")
+                            if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
+                                raise HTTPException(status_code=422, detail="商品数量必须为正整数")
+                            cur.execute(
+                                "SELECT id, product_id, price FROM product_skus WHERE id=%s AND product_id=%s",
+                                (sku_id, it["product_id"]),
+                            )
+                            sku = cur.fetchone()
+                            if not sku:
+                                raise HTTPException(status_code=422, detail="SKU不属于该商品或已下架")
 
                             items.append({
                                 "sku_id": sku_id,
                                 "product_id": it["product_id"],
-                                "quantity": it["quantity"],
-                                "price": Decimal(str(it["price"])),
+                                "quantity": quantity,
+                                "price": Decimal(str(sku["price"])),
                                 "is_vip": prod["is_member_product"],
                                 "cash_only": prod["cash_only"]  # 新增
                             })
@@ -266,8 +276,10 @@ class OrderManager:
                                 detail="一笔订单只能包含同一商家的商品，请分开下单"
                             )
 
-                        if merchant_id is None:
-                            merchant_id = product_merchant_ids.pop() if product_merchant_ids else 0
+                        actual_merchant = next(iter(product_merchant_ids), 0)
+                        if merchant_id is not None and int(merchant_id) != int(actual_merchant):
+                            raise HTTPException(422, "商户与商品归属不匹配")
+                        merchant_id = actual_merchant
                     else:
                         cur.execute("""
                             SELECT c.product_id,
@@ -279,13 +291,17 @@ class OrderManager:
                                 c.specifications,
                                 p.cash_only
                             FROM cart c
-                            JOIN product_skus s ON s.id = c.sku_id
+                            JOIN product_skus s ON s.id = c.sku_id AND s.product_id = c.product_id
                             JOIN products p ON p.id = c.product_id
                             WHERE c.user_id = %s AND c.selected = 1
                         """, (user_id,))
                         items = cur.fetchall()
                         if not items:
                             return None
+                        for item in items:
+                            quantity = item.get("quantity")
+                            if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
+                                raise HTTPException(status_code=422, detail="商品数量必须为正整数")
 
                         merchant_ids = set(item.get("merchant_id") or 0 for item in items)
                         if len(merchant_ids) > 1:
@@ -294,8 +310,10 @@ class OrderManager:
                                 detail="购物车中包含不同商家的商品，请分开结算"
                             )
 
-                        if merchant_id is None:
-                            merchant_id = merchant_ids.pop() if merchant_ids else 0
+                        actual_merchant = next(iter(merchant_ids), 0)
+                        if merchant_id is not None and int(merchant_id) != int(actual_merchant):
+                            raise HTTPException(422, "商户与商品归属不匹配")
+                        merchant_id = actual_merchant
 
                     merchant_id = int(merchant_id or 0)
 
@@ -464,8 +482,13 @@ class OrderManager:
                     # ---------- 7. 扣库存 ----------
                     if has_stock_field:
                         for i in items:
-                            cur.execute("UPDATE product_skus SET stock = stock - %s WHERE id = %s",
-                                        (i["quantity"], i['sku_id']))
+                            cur.execute(
+                                "UPDATE product_skus SET stock = stock - %s "
+                                "WHERE id = %s AND stock >= %s",
+                                (i["quantity"], i["sku_id"], i["quantity"]),
+                            )
+                            if cur.rowcount != 1:
+                                raise HTTPException(status_code=409, detail="库存不足或库存已被其他订单占用")
 
                     # ---------- 8. 清空购物车（仅购物车结算场景） ----------
                     if not buy_now:
@@ -719,47 +742,30 @@ class OrderManager:
                 }
 
     @staticmethod
-    def update_status(order_number: str, new_status: str, reason: Optional[str] = None,
-                      external_conn=None) -> bool:
-        """统一的订单状态更新，支持外部连接复用。"""
-
-        def _apply_update(cur) -> bool:
-            cur.execute("SHOW COLUMNS FROM orders")
-            cols = {row.get("Field") for row in cur.fetchall()}
-
-            updates = ["status=%s", "updated_at=NOW()"]
-            params: List[Any] = [new_status]
-
-            if reason:
-                for col in ("status_reason", "remark"):
-                    if col in cols:
-                        updates.append(f"{col}=%s")
-                        params.append(reason)
-                        break
-
-            if new_status in ("pending_ship", "pending_recv") and "paid_at" in cols:
-                updates.append("paid_at=COALESCE(paid_at, NOW())")
-            if new_status == "pending_recv" and "shipped_at" in cols:
-                updates.append("shipped_at=COALESCE(shipped_at, NOW())")
-            if new_status == "completed" and "completed_at" in cols:
-                updates.append("completed_at=COALESCE(completed_at, NOW())")
-
-            params.append(order_number)
-            cur.execute(f"UPDATE orders SET {', '.join(updates)} WHERE order_number=%s", tuple(params))
-            return cur.rowcount > 0
-
-        if external_conn:
-            cur = external_conn.cursor()
-            try:
-                return _apply_update(cur)
-            finally:
-                cur.close()
-        else:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    updated = _apply_update(cur)
+    def update_status(order_number: str, new_status: str, reason=None,
+                      external_conn=None, current_user=None, trusted_payment=False) -> bool:
+        from contextlib import nullcontext
+        with (nullcontext(external_conn) if external_conn is not None else get_conn()) as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT * FROM orders WHERE order_number=%s FOR UPDATE', (order_number,))
+                order = cur.fetchone()
+                if not order:
+                    raise HTTPException(404, '订单不存在')
+                if current_user is not None and not is_platform_admin(current_user) and int(order.get('merchant_id') or 0) != int(current_user['id']):
+                    raise HTTPException(403, '无权更新该订单')
+                allowed = {'pending_ship': {'pending_recv'}, 'pending_recv': {'completed'}}
+                if trusted_payment and external_conn is not None and order['status'] in ('pending_pay', new_status):
+                    allowed[order['status']] = {'pending_ship', 'pending_recv', 'completed'}
+                    if order['status'] == new_status:
+                        return True
+                if new_status not in allowed.get(order['status'], set()):
+                    raise HTTPException(409, '非法订单状态流转')
+                cur.execute('UPDATE orders SET status=%s,updated_at=NOW() WHERE id=%s AND status=%s', (new_status, order['id'], order['status']))
+                if cur.rowcount != 1:
+                    raise HTTPException(409, '订单状态已变化')
+                if external_conn is None:
                     conn.commit()
-                    return updated
+                return True
 
     @staticmethod
     def confirm_receive(order_number: str, user_id: Optional[int] = None) -> Dict[str, Any]:
@@ -770,7 +776,7 @@ class OrderManager:
             with conn.cursor() as cur:
                 cur.execute(
                     """SELECT id, user_id, status, order_number, transaction_id, delivery_way
-                       FROM orders WHERE order_number=%s""",
+                       FROM orders WHERE order_number=%s FOR UPDATE""",
                     (order_number,)
                 )
                 order = cur.fetchone()
@@ -785,7 +791,7 @@ class OrderManager:
                     return {"ok": False, "message": f"订单状态不正确，当前状态：{order['status']}"}
 
                 cur.execute(
-                    "UPDATE orders SET status='completed', completed_at=NOW() WHERE id=%s",
+                    "UPDATE orders SET status='completed', completed_at=NOW() WHERE id=%s AND status='pending_recv'",
                     (order['id'],)
                 )
                 conn.commit()
@@ -1018,6 +1024,14 @@ class DeliveryWay(str, Enum):
     pickup = "pickup"
 
 
+class BuyNowItem(BaseModel):
+    product_id: StrictInt = Field(..., gt=0)
+    sku_id: Optional[StrictInt] = Field(default=None, gt=0)
+    quantity: StrictInt = Field(..., gt=0)
+    # Retained for old clients; the server never trusts this amount.
+    price: Optional[Decimal] = Field(default=None, ge=0)
+
+
 class OrderCreate(BaseModel):
     """同时接受 snake_case 与小程序常用 camelCase 请求体字段。"""
 
@@ -1129,12 +1143,12 @@ class OrderCreate(BaseModel):
     )
     specifications: Optional[str] = None
     buy_now: bool = Field(default=False, validation_alias=AliasChoices("buy_now", "buyNow"))
-    buy_now_items: Optional[List[Dict[str, Any]]] = Field(
+    buy_now_items: Optional[List[BuyNowItem]] = Field(
         default=None,
         validation_alias=AliasChoices("buy_now_items", "buyNowItems"),
     )
     points_to_use: Optional[Decimal] = Field(
-        default=Decimal('0'),
+        default=Decimal('0'), ge=0,
         validation_alias=AliasChoices("points_to_use", "pointsToUse"),
     )
     coupon_id: Optional[int] = Field(
@@ -1193,7 +1207,9 @@ class MerchantOrdersQuery(BaseModel):
 
 # ---------------- 路由 ----------------
 @router.post("/create", summary="创建订单")
-def create_order(body: OrderCreate):
+def create_order(body: OrderCreate, current_user: dict = Depends(get_current_user)):
+    if int(current_user["id"]) != body.user_id:
+        raise HTTPException(status_code=403, detail="只能为当前账户创建订单")
     logger.info(
         "创建订单入参(券): user_id=%s buy_now=%s coupon_id=%s coupon_ids=%s",
         body.user_id,
@@ -1225,32 +1241,34 @@ def create_order(body: OrderCreate):
 
 # 兼容旧客户端：/order/pay -> 代理到 /wechat-pay/create-order
 @router.post("/pay", summary="兼容：创建支付参数 (旧路径)")
-async def pay_compat(request: Request):
-    try:
-        # 延迟导入以避免循环依赖
-        from api.wechat_pay import routes as wechat_routes
-
-        return await wechat_routes.create_jsapi_order(request)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def pay_compat(request: Request, current_user: dict = Depends(get_current_user)):
+    from api.wechat_pay import routes as wechat_routes
+    return await wechat_routes.create_jsapi_order(request, current_user=current_user)
 
 
 @router.get("/{user_id}", summary="查询用户订单列表")
-def list_orders(user_id: int, status: Optional[str] = None):
+def list_orders(user_id: int, status: Optional[str] = None,
+                current_user: dict = Depends(get_current_user)):
+    if not is_platform_admin(current_user) and int(current_user["id"]) != user_id:
+        raise HTTPException(status_code=403, detail="无权查看其他用户订单")
     return OrderManager.list_by_user(user_id, status)
 
 
 @router.get("/detail/{order_number}", summary="查询订单详情")
-def order_detail(order_number: str):
+def order_detail(order_number: str, current_user: dict = Depends(get_current_user)):
     d = OrderManager.detail(order_number)
     if not d:
         raise HTTPException(status_code=404, detail="订单不存在")
+    order_info = d.get("order_info") or {}
+    if not is_platform_admin(current_user) and int(order_info.get("user_id", -1)) != int(current_user["id"]):
+        raise HTTPException(status_code=403, detail="无权查看该订单")
     return d
 
 
 @router.post("/status", summary="更新订单状态")
-def update_status(body: StatusUpdate):
-    return {"ok": OrderManager.update_status(body.order_number, body.new_status, body.reason)}
+def update_status(body: StatusUpdate,
+                  current_user: dict = Depends(require_admin_or_merchant)):
+    return {"ok": OrderManager.update_status(body.order_number, body.new_status, body.reason, current_user=current_user)}
 
 
 @router.get("/merchant/{merchant_id}", summary="查询商家订单列表")
@@ -1260,8 +1278,11 @@ def list_merchant_orders(
         start_date: Optional[str] = Query(None, description="开始日期(YYYY-MM-DD)"),
         end_date: Optional[str] = Query(None, description="结束日期(YYYY-MM-DD)"),
         page: int = Query(1, ge=1, description="页码"),
-        page_size: int = Query(20, ge=1, le=100, description="每页数量")
+        page_size: int = Query(20, ge=1, le=100, description="每页数量"),
+        current_user: dict = Depends(require_admin_or_merchant)
 ):
+    if not is_platform_admin(current_user) and int(current_user["id"]) != merchant_id:
+        raise HTTPException(status_code=403, detail="无权查看其他商家的订单")
     result = OrderManager.list_by_merchant(
         merchant_id=merchant_id,
         status=status,
@@ -1275,13 +1296,14 @@ def list_merchant_orders(
 
 # 修改后
 @router.post("/confirm-receive", summary="用户确认收货")
-def confirm_receive(body: ConfirmReceiveRequest):
+def confirm_receive(body: ConfirmReceiveRequest,
+                    current_user: dict = Depends(get_current_user)):
     """
     用户确认收货接口（已移除微信订单管理同步）
 
     仅更新本地订单状态，不再与微信发货管理系统交互
     """
-    result = OrderManager.confirm_receive(body.order_number)
+    result = OrderManager.confirm_receive(body.order_number, int(current_user["id"]))
     if not result["ok"]:
         raise HTTPException(status_code=400, detail=result["message"])
     return result
@@ -1310,7 +1332,7 @@ def auto_receive_task(db_cfg: dict = None):
                             order_number = row["order_number"]
 
                             cur.execute(
-                                "UPDATE orders SET status='completed' WHERE id=%s",
+                                "UPDATE orders SET status='completed' WHERE id=%s AND status='pending_recv'",
                                 (order_id,)
                             )
                             conn.commit()
@@ -1341,7 +1363,7 @@ class DailySummaryExportRequest(BaseModel):
 
 
 @router.post("/export", summary="导出订单详情到Excel")
-def export_orders(body: OrderExportRequest):
+def export_orders(body: OrderExportRequest, _: dict = Depends(require_platform_admin)):
     if not body.order_numbers:
         raise HTTPException(status_code=422, detail="订单号列表不能为空")
     if len(body.order_numbers) > 1000:
@@ -1359,7 +1381,7 @@ def export_orders(body: OrderExportRequest):
 
 
 @router.post("/export/by-time", summary="按时间范围导出订单")
-def export_orders_by_time(body: OrderExportByTimeRequest):
+def export_orders_by_time(body: OrderExportByTimeRequest, _: dict = Depends(require_platform_admin)):
     try:
         start = datetime.strptime(body.start_time, "%Y-%m-%d %H:%M:%S")
         end = datetime.strptime(body.end_time, "%Y-%m-%d %H:%M:%S")
@@ -1429,7 +1451,8 @@ def export_orders_by_time(body: OrderExportByTimeRequest):
 @router.post("/export/daily-summary", summary="导出日报表/月报表")
 async def export_daily_summary(
     request: DailySummaryExportRequest,
-    service: FinanceService = Depends(get_finance_service)
+    service: FinanceService = Depends(get_finance_service),
+    _: dict = Depends(require_platform_admin)
 ):
     try:
         excel_data = service.export_daily_summary(   # ← 移除 await

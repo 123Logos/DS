@@ -38,9 +38,16 @@ async def create_store_info(
     try:
         return service.create_store_info(req)
     except FinanceException as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        detail = str(e)
+        if detail == "用户不存在" or detail.startswith("用户不存在: user_id="):
+            raise HTTPException(status_code=404, detail="用户不存在")
+        if detail == "请先完成支付进件，开通开店权限":
+            raise HTTPException(status_code=400, detail=detail)
+        if detail == "店铺信息已存在，请使用更新接口":
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=400, detail="无法创建店铺信息")
     except Exception as e:
-        logger.error(f"创建店铺信息失败: {str(e)}")
+        logger.error("Create store info failed: error_type=%s", type(e).__name__)
         raise HTTPException(status_code=500, detail="系统错误，请稍后重试")
 
 
@@ -59,9 +66,11 @@ async def update_store_info(
     try:
         return service.update_store_info(user_id, req)
     except FinanceException as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        if str(e) == "店铺信息不存在":
+            raise HTTPException(status_code=404, detail="店铺信息不存在")
+        raise HTTPException(status_code=400, detail="无法更新店铺信息")
     except Exception as e:
-        logger.error(f"更新店铺信息失败: {str(e)}")
+        logger.error("Update store info failed: error_type=%s", type(e).__name__)
         raise HTTPException(status_code=500, detail="系统错误，请稍后重试")
 
 
@@ -82,7 +91,7 @@ async def get_store_info(
             return StoreInfoResp(**data)
         return None
     except Exception as e:
-        logger.error(f"获取店铺信息失败: {str(e)}")
+        logger.error("Get store info failed: error_type=%s", type(e).__name__)
         raise HTTPException(status_code=500, detail="系统错误，请稍后重试")
 
 
@@ -101,7 +110,7 @@ async def get_setup_status(
         data = service.get_setup_status(user_id)
         return StoreSetupStatusResp(**data)
     except Exception as e:
-        logger.error(f"获取店铺设置状态失败: {str(e)}")
+        logger.error("Get store setup status failed: error_type=%s", type(e).__name__)
         raise HTTPException(status_code=500, detail="系统错误，请稍后重试")
 
 
@@ -122,7 +131,7 @@ async def upload_store_logo(
     except HTTPException as e:
         raise e
     except Exception as e:
-        logger.error(f"上传LOGO失败: {str(e)}")
+        logger.error("Upload store logo failed: error_type=%s", type(e).__name__)
         raise HTTPException(status_code=500, detail="系统错误，请稍后重试")
 
 
@@ -140,7 +149,7 @@ async def delete_store_logo(
         service.delete_store_logo(user_id)
         return {"success": True, "message": "LOGO删除成功"}
     except Exception as e:
-        logger.error(f"删除LOGO失败: {str(e)}")
+        logger.error("Delete store logo failed: error_type=%s", type(e).__name__)
         raise HTTPException(status_code=500, detail="系统错误，请稍后重试")
 
 
@@ -164,7 +173,7 @@ async def preview_logo(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"预览LOGO失败: {str(e)}")
+        logger.error("Preview store logo failed: error_type=%s", type(e).__name__)
         raise HTTPException(status_code=500, detail="系统错误，请稍后重试")
 
 
@@ -185,7 +194,7 @@ async def get_store_list(
     try:
         return admin_service.get_store_list(page, page_size)
     except Exception as e:
-        logger.error(f"获取店铺列表失败: {str(e)}")
+        logger.error("Get store list failed: error_type=%s", type(e).__name__)
         raise HTTPException(status_code=500, detail="系统错误，请稍后重试")
 
 

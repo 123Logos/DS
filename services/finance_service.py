@@ -37,6 +37,7 @@ from services.finance.discount_helpers import (
     parse_pending_coupon_ids,
 )
 from services.finance.rain_point_policy import calculate_conversion
+from services.finance.durability import begin_request, finish_request, begin_event, finish_event
 
 logger = get_logger(__name__)
 
@@ -72,13 +73,11 @@ class FinanceService:
                         return default
                     d = Decimal(str(raw)).quantize(Decimal("0.000001"))
                     if d <= Decimal("0") or d > Decimal("1"):
-                        logger.warning(
-                            "distribution_platform_rate 非法(%s)，回退默认 0.20", raw
-                        )
+                        logger.warning('finance_operation_warning')
                         return default
                     return d
         except Exception as e:
-            logger.debug("读取 distribution_platform_rate 失败，使用默认 0.20: %s", e)
+            logger.debug('finance_operation_detail')
             return default
 
     def set_distribution_platform_rate(self, rate: Decimal) -> Decimal:
@@ -114,7 +113,7 @@ class FinanceService:
                     (json.dumps(parsed, ensure_ascii=False), row["id"]),
                 )
             conn.commit()
-        logger.info("已更新 distribution_platform_rate=%s", d)
+        logger.info('finance_operation_state')
         return d
 
     def get_direct_referral_reward_rate(self) -> Decimal:
@@ -146,13 +145,11 @@ class FinanceService:
                         return default
                     d = Decimal(str(raw)).quantize(Decimal("0.000001"))
                     if d <= Decimal("0") or d > Decimal("1"):
-                        logger.warning(
-                            "direct_referral_reward_rate 非法(%s)，回退默认 %s", raw, default
-                        )
+                        logger.warning('finance_operation_warning')
                         return default
                     return d
         except Exception as e:
-            logger.debug("读取 direct_referral_reward_rate 失败，使用默认 %s: %s", default, e)
+            logger.debug('finance_operation_detail')
             return default
 
     def set_direct_referral_reward_rate(self, rate: Decimal) -> Decimal:
@@ -186,7 +183,7 @@ class FinanceService:
                     (json.dumps(parsed, ensure_ascii=False), row["id"]),
                 )
             conn.commit()
-        logger.info("已更新 direct_referral_reward_rate=%s", d)
+        logger.info('finance_operation_state')
         return d
 
     def __init__(self, session: Optional[PyMySQLAdapter] = None):
@@ -228,7 +225,7 @@ class FinanceService:
                     balance_val = row.get('balance') if row else 0
                     return Decimal(str(balance_val)) if balance_val is not None else Decimal('0')
         except Exception as e:
-            logger.error(f"查询账户余额失败: {e}")
+            logger.error('finance_operation_failed')
             return Decimal('0')
 
     def get_user_balance(self, user_id: int, balance_type: str = 'promotion_balance') -> Decimal:
@@ -247,7 +244,7 @@ class FinanceService:
                     val = row.get(balance_type, 0) if row else 0
                     return Decimal(str(val))
         except Exception as e:
-            logger.error(f"查询用户余额失败: {e}")
+            logger.error('finance_operation_failed')
             return Decimal('0')
 
     def _grant_referral_points(self, cur, referrer_id: int, amount: Decimal, order_no: str):
@@ -284,7 +281,7 @@ class FinanceService:
              f"普通商品推荐奖励 - 订单{order_no}")
         )
 
-        logger.info(f"普通商品推荐奖励发放: 用户{referrer_id} +{amount:.4f}点数（订单{order_no}）")
+        logger.info('finance_operation_state')
 
     # ==================== 新增：资金池余额检查辅助方法 ====================
     def _ensure_pool_balance(self, account_type: str, amount_to_deduct: Decimal) -> None:
@@ -302,7 +299,7 @@ class FinanceService:
             return  # 不需要扣减，直接返回
 
         current_balance = self.get_account_balance(account_type)
-        logger.debug(f"检查资金池余额: {account_type} 当前余额: {current_balance}, 需要扣减: {amount_to_deduct}")
+        logger.debug('finance_operation_detail')
 
         if current_balance < amount_to_deduct:
             raise InsufficientBalanceException(
@@ -318,7 +315,7 @@ class FinanceService:
                      coupon_discount: Decimal = Decimal('0'),
                      external_conn=None) -> int:
         """订单结算（多商品版本：支持遍历所有商品分别计算奖励）"""
-        logger.debug(f"订单结算开始: {order_no}, 积分抵扣={points_to_use}, 优惠券抵扣={coupon_discount}")
+        logger.debug('finance_operation_detail')
 
         # 使用外部连接（如果有），避免嵌套事务
         if external_conn:
@@ -332,8 +329,10 @@ class FinanceService:
         else:
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    return self._settle_order_internal(cur, order_no, user_id, order_id,
-                                                       points_to_use, coupon_discount)
+                    result = self._settle_order_internal(cur, order_no, user_id, order_id,
+                                                         points_to_use, coupon_discount)
+                conn.commit()
+                return result
 
     def _calculate_distribution_base(self, total_amount: Decimal,
                                      points_discount: Decimal,
@@ -358,7 +357,7 @@ class FinanceService:
         try:
             # ---------- 查询订单信息（pending_coupon_ids 多券、delivery_way 等） ----------
             cur.execute(
-                """SELECT pending_points, pending_coupon_id, pending_coupon_ids, delivery_way,
+                """SELECT id, user_id, pending_points, pending_coupon_id, pending_coupon_ids, delivery_way,
                           total_amount AS cash_payable,
                           coupon_discount AS stored_coupon_discount,
                           points_discount AS stored_points_discount,
@@ -369,6 +368,10 @@ class FinanceService:
             order_info = cur.fetchone()
             if not order_info:
                 raise OrderException(f"订单不存在: {order_no}")
+            if int(order_info['id']) != order_id or int(order_info['user_id']) != user_id:
+                raise OrderException('结算订单身份不一致')
+            if begin_event(cur, 'settlement', order_no, order_no, {'order_id': order_id, 'user_id': user_id}):
+                return order_id
             delivery_way = order_info.get('delivery_way', 'platform')
             # points_to_use 已经由调用方传入，此处不再覆盖
             # ===============================================================
@@ -398,7 +401,7 @@ class FinanceService:
                 where_clause="id=%s",
                 select_fields=["member_level", "member_points"]
             )
-            cur.execute(select_sql, (user_id,))
+            cur.execute(select_sql + ' FOR UPDATE', (user_id,))
             user_row = cur.fetchone()
             if not user_row:
                 raise OrderException(f"用户不存在: {user_id}")
@@ -454,10 +457,7 @@ class FinanceService:
             total_discount = points_discount + coupon_discount
 
             if orig_coupon != coupon_discount or orig_points != points_to_use:
-                logger.warning(
-                    f"订单{order_no}结算收斂优惠: 券 {orig_coupon}→{coupon_discount}, "
-                    f"使用积分 {orig_points}→{points_to_use}, 商品原价={total_amount}"
-                )
+                logger.warning('finance_operation_warning')
                 cur.execute(
                     """UPDATE orders SET coupon_discount=%s, points_discount=%s, pending_points=%s
                        WHERE order_number=%s""",
@@ -466,14 +466,11 @@ class FinanceService:
 
             final_amount = total_amount - total_discount
 
-            logger.debug(
-                f"订单金额计算: 商品总额¥{total_amount}, 积分抵扣¥{points_discount}, "
-                f"优惠券¥{coupon_discount}, 重算实付¥{final_amount}, 订单应付现金¥{cash_payable}"
-            )
+            logger.debug('finance_operation_detail')
 
             # 零元订单自动完成结算
             if final_amount <= Decimal('0'):
-                logger.info(f"检测到零元订单: {order_no} ，系统将自动完成结算流程")
+                logger.info('finance_operation_state')
 
             # 处理积分抵扣
             if points_to_use > Decimal('0'):
@@ -564,11 +561,7 @@ class FinanceService:
                 total_amount, points_discount, coupon_discount
             )
 
-            logger.debug(
-                f"[分账基数] 订单{order_no} 使用原价减去积分抵扣作为基数: ¥{distribution_base:.2f} "
-                f"（原价¥{total_amount:.2f}，积分抵扣¥{points_discount:.2f}，优惠券¥{coupon_discount:.2f}，实付¥{final_amount:.2f}）"
-                f"，平台计提比例={platform_rate}（子池缩放×{subpool_scale}）"
-            )
+            logger.debug('finance_operation_detail')
 
             # 平台收入池记入 100% 实付现金
             self._add_pool_balance(
@@ -655,8 +648,8 @@ class FinanceService:
                     (PLATFORM_MERCHANT_ID, company_points_amount, cp_new_balance,
                      f"订单#{order_no} 公司积分池增加", order_id)
                 )
-            except Exception as e:
-                logger.debug(f"写入 points_log（公司积分池）失败: {e}")
+            except Exception:
+                raise
 
             # 记录平台收入池流水
             cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'platform_revenue_pool'")
@@ -724,13 +717,14 @@ class FinanceService:
 
             from api.order.order import OrderManager
 
-            OrderManager.update_status(order_no, next_status, external_conn=cur.connection)
+            OrderManager.update_status(order_no, next_status, external_conn=cur.connection, trusted_payment=True)
+            finish_event(cur, 'settlement', order_no)
 
-            logger.debug(f"订单结算成功: {order_no}，实付分账基数¥{distribution_base:.2f}")
+            logger.debug('finance_operation_detail')
             return order_id
 
         except Exception as e:
-            logger.error(f"订单结算失败: {e}", exc_info=True)
+            logger.error('finance_operation_failed')
             raise
 
     def _consume_pending_coupons(self, cur, order_info: dict, user_id: int, order_no: str) -> None:
@@ -741,7 +735,7 @@ class FinanceService:
                 (cid, user_id),
             )
             if cur.rowcount:
-                logger.info(f"订单{order_no}优惠券#{cid}已核销")
+                logger.info('finance_operation_state')
                 continue
             cur.execute(
                 "SELECT status FROM coupons WHERE id=%s AND user_id=%s",
@@ -949,7 +943,7 @@ class FinanceService:
             ('platform_revenue_pool', PLATFORM_MERCHANT_ID, platform_revenue,
              new_balance, 'income', f"会员订单#{order_id} 平台收入¥{platform_revenue:.2f}")
         )
-        logger.debug(f"平台收入池增加: {platform_revenue:.4f}（已写入流水）")
+        logger.debug('finance_operation_detail')
 
         # 使用动态配置按行分配到各池子（排除 merchant_balance）
         for atype, ratio in allocs.items():
@@ -979,9 +973,9 @@ class FinanceService:
                     (atype, PLATFORM_MERCHANT_ID, alloc_amount, new_balance, 'income',
                      f"会员订单#{order_id} {atype}池¥{alloc_amount:.2f}")
                 )
-                logger.debug(f"池子 {atype} 增加: {alloc_amount:.4f}（已写入流水）")
+                logger.debug('finance_operation_detail')
             except Exception as e:
-                logger.error(f"分配到池子 {atype} 失败: {e}")
+                logger.error('finance_operation_failed')
 
     def _create_pending_rewards_v2(self, cur, order_id: int, buyer_id: int,
                                    old_level: int, new_level: int,
@@ -999,7 +993,7 @@ class FinanceService:
         - 团队奖励：只为新达到的层级发放，必须由≥目标层级的用户获得
         - 推荐奖励和团队奖励可同时发放，互不影响
         """
-        logger.info(f"开始发放奖励: 订单#{order_id}, 购买者={buyer_id}({old_level}→{new_level}星)")
+        logger.info('finance_operation_state')
 
         # ==================== 防重复检查 ====================
         cur.execute(
@@ -1010,7 +1004,7 @@ class FinanceService:
             (f"%订单#{order_id}%",)
         )
         if cur.fetchone():
-            logger.warning(f"⚠️ 订单#{order_id}的奖励已发放过，跳过重复发放")
+            logger.warning('finance_operation_warning')
             return
         # ===================================================
 
@@ -1061,21 +1055,21 @@ class FinanceService:
                          new_balance, 'income', f"推荐奖励 - 订单#{order_id}")
                     )
 
-                    logger.info(f"推荐奖励发放: 用户{referrer['referrer_id']}({referrer_level}星) +{reward_amount:.2f}")
+                    logger.info('finance_operation_state')
                     total_distributed += reward_amount
                 else:
-                    logger.debug(f"推荐人{referrer['referrer_id']}不是星级会员({referrer_level}星)，不发放推荐奖励")
+                    logger.debug('finance_operation_detail')
             else:
-                logger.debug("购买者无推荐人，跳过推荐奖励")
+                logger.debug('finance_operation_detail')
 
         # 2. 团队奖励（只为新达到的层级发放；0→1 也发放）
         if new_level <= old_level:
-            logger.debug("等级未提升，不产生团队奖励")
+            logger.debug('finance_operation_detail')
             return
 
         # ==================== 计算新达到的层级范围 ====================
         start_layer = max(old_level + 1, 1)  # 允许 0→1 发放 L1 团队奖励
-        logger.debug(f"发放团队奖励层级范围: L{start_layer}-L{new_level}")
+        logger.debug('finance_operation_detail')
         # ========================================================================
 
         # ==================== 核心修复：构建完整推荐链 ============================
@@ -1091,14 +1085,14 @@ class FinanceService:
             ref = cur.fetchone()
 
             if not ref or not ref['referrer_id']:
-                logger.debug(f"第{current_layer}层无推荐人，链断裂")
+                logger.debug('finance_operation_detail')
                 break
 
             referrer_id = ref['referrer_id']
 
             # 避免自指或循环导致自己拿团队奖
             if referrer_id in visited:
-                logger.debug(f"推荐链出现自指/循环（用户{referrer_id}），停止发放团队奖励")
+                logger.debug('finance_operation_detail')
                 break
             visited.add(referrer_id)
             cur.execute("SELECT member_level FROM users WHERE id = %s", (referrer_id,))
@@ -1111,11 +1105,11 @@ class FinanceService:
                 'member_level': referrer_level
             })
 
-            logger.debug(f"第{current_layer}层: 用户{referrer_id}({referrer_level}星)")
+            logger.debug('finance_operation_detail')
             current_id = referrer_id
 
         if not referrer_chain:
-            logger.debug("推荐链为空，无法发放团队奖励")
+            logger.debug('finance_operation_detail')
             return
         # ========================================================================
 
@@ -1148,12 +1142,11 @@ class FinanceService:
                         'actual_layer': candidate['layer'],
                         'member_level': candidate['member_level']
                     }
-                    logger.debug(
-                        f"找到满足条件的推荐人: 用户{candidate['user_id']}（第{candidate['layer']}层，{candidate['member_level']}星）")
+                    logger.debug('finance_operation_detail')
                     break
 
             if not reward_recipient:
-                logger.debug(f"第{target_layer}层无满足星级{target_layer}的推荐人，跳过")
+                logger.debug('finance_operation_detail')
                 continue
 
             # ==================== 发放奖励 ====================
@@ -1189,10 +1182,9 @@ class FinanceService:
             )
 
             total_distributed += reward_amount
-            logger.info(
-                f"团队奖励发放: 用户{recipient_id}（第{actual_layer}层）获得L{target_layer}奖励 {reward_amount:.2f}")
+            logger.info('finance_operation_state')
 
-        logger.info(f"奖励发放完成: 订单#{order_id}共发放{total_distributed:.2f}点数")
+        logger.info('finance_operation_state')
 
     # ==================== 关键修改3：member_points积分发放 ====================
     def _allocate_funds_to_pools(self, order_id: int, total_amount: Decimal) -> None:
@@ -1213,7 +1205,7 @@ class FinanceService:
                 alloc_amount = total_amount * ratio
                 self._add_pool_balance(atype, alloc_amount, f"订单#{order_id} 分配到{atype}")
                 if atype == 'public_welfare':
-                    logger.debug(f"公益基金获得: ¥{alloc_amount}")
+                    logger.debug('finance_operation_detail')
         else:
             for purpose, percent in ALLOCATIONS.items():
                 if purpose == AllocationKey.PLATFORM_REVENUE_POOL:
@@ -1221,7 +1213,7 @@ class FinanceService:
                 alloc_amount = total_amount * percent
                 self._add_pool_balance(purpose.value, alloc_amount, f"订单#{order_id} 分配到{purpose.value}")
                 if purpose == AllocationKey.PUBLIC_WELFARE:
-                    logger.debug(f"公益基金获得: ¥{alloc_amount}")
+                    logger.debug('finance_operation_detail')
 
     def audit_and_distribute_rewards(self, reward_ids: List[int], approve: bool, auditor: str = 'admin') -> bool:
         """批量审核奖励并发放优惠券"""
@@ -1276,14 +1268,14 @@ class FinanceService:
                             flow_type='coupon',
                             remark=f"{reward_desc}奖励发放优惠券#{coupon_id} ¥{reward['amount']:.2f}"
                         )
-                        logger.debug(f"奖励{reward['id']}已批准，发放优惠券{coupon_id}")
+                        logger.debug('finance_operation_detail')
                 else:
                     # 拒绝奖励
                     cur.execute(
                         f"UPDATE pending_rewards SET status = 'rejected' WHERE id IN ({placeholders})",
                         reward_ids
                     )
-                    logger.debug(f"已拒绝 {len(reward_ids)} 条奖励")
+                    logger.debug('finance_operation_detail')
 
                 # 提交事务
                 conn.commit()
@@ -1373,7 +1365,7 @@ class FinanceService:
                         except:
                             pass
         except Exception as e:
-            logger.error(f"获取积分值配置失败: {e}")
+            logger.error('finance_operation_failed')
         return None
 
     def adjust_subsidy_points_value(self, points_value: Optional[float] = None, auto_clear: bool = False) -> bool:
@@ -1392,7 +1384,7 @@ class FinanceService:
                         cur.execute(
                             "UPDATE finance_accounts SET config_params = NULL WHERE account_type = 'subsidy_pool'"
                         )
-                        logger.info("已取消周补贴积分值手动调整，恢复自动计算")
+                        logger.info('finance_operation_state')
                     else:
                         # 设置调整值
                         value = Decimal(str(points_value))
@@ -1406,12 +1398,12 @@ class FinanceService:
                             (config,)
                         )
 
-                        logger.info(f"已设置周补贴积分值手动调整: {value:.4f}，auto_clear={auto_clear}")
+                        logger.info('finance_operation_state')
 
                     conn.commit()
             return True
         except Exception as e:
-            logger.error(f"调整积分值失败: {e}")
+            logger.error('finance_operation_failed')
             raise
 
     def get_current_points_value(self) -> Dict[str, Any]:
@@ -1505,7 +1497,7 @@ class FinanceService:
                         ratio = config.get('daily_subsidy_ratio', 0.05)
                         return Decimal(str(ratio))
         except Exception as e:
-            logger.error(f"获取日补贴比例失败: {e}")
+            logger.error('finance_operation_failed')
         return Decimal('0.05')
 
     def set_daily_subsidy_ratio(self, ratio: float) -> bool:
@@ -1527,10 +1519,10 @@ class FinanceService:
                         (json.dumps(config),)
                     )
                     conn.commit()
-                    logger.info(f"日补贴比例已调整为: {ratio}")
+                    logger.info('finance_operation_state')
                     return True
         except Exception as e:
-            logger.error(f"设置日补贴比例失败: {e}")
+            logger.error('finance_operation_failed')
             return False
 
     # ==================== 补贴发放 ====================
@@ -1555,21 +1547,21 @@ class FinanceService:
         """
         today = datetime.now().date()
         if not force and self._daily_subsidy_already_distributed(today):
-            logger.warning("日补贴发放跳过：今日 %s 已发放过", today)
+            logger.warning('finance_operation_warning')
             raise FinanceException(f"今日({today})日补贴已发放，请勿重复执行")
 
-        logger.info("日补贴发放开始（每日可分配金额 = 补贴池余额 × 日比例）")
+        logger.info('finance_operation_state')
 
         pool_balance = self.get_account_balance('subsidy_pool')
         if pool_balance <= 0:
-            logger.warning("❌ 补贴池余额不足")
+            logger.warning('finance_operation_warning')
             return False
 
         # 获取日补贴比例
         daily_ratio = self.get_daily_subsidy_ratio()
         daily_available = pool_balance * daily_ratio
         if daily_available <= 0:
-            logger.warning("❌ 当日可分配金额为0")
+            logger.warning('finance_operation_warning')
             return False
 
         # ========== 计算完整的平台总积分（包含商家和平台）==========
@@ -1592,7 +1584,7 @@ class FinanceService:
                 total_system_points = total_user_points + total_merchant_points + company_points_balance
 
         if total_system_points <= 0:
-            logger.warning("❌ 总积分为0，无法发放补贴")
+            logger.warning('finance_operation_warning')
             return False
 
         # 自动计算积分值（已受全局上限约束）
@@ -1607,16 +1599,13 @@ class FinanceService:
             auto_clear = adjusted_config.get('auto_clear', False)
             # 取自动值与手动值中的较小者（手动值作为上限）
             points_value = min(manual_value, auto_value)
-            logger.info(
-                f"使用手动调整作为上限: 手动{manual_value:.4f}, 自动{auto_value:.4f}, 实际使用{points_value:.4f}")
+            logger.info('finance_operation_state')
         else:
             points_value = auto_value
             auto_clear = False
-            logger.info(
-                f"自动计算积分值: {points_value:.4f} (可分配金额 {daily_available:.2f} / 总积分 {total_system_points})")
+            logger.info('finance_operation_state')
 
-        logger.info(
-            f"补贴池: ¥{pool_balance} | 当日可分配: ¥{daily_available:.4f} | 总系统积分: {total_system_points} | 积分值: ¥{points_value:.4f}/分")
+        logger.info('finance_operation_state')
 
         total_distributed = Decimal('0')
         total_points_deducted = Decimal('0')
@@ -1679,7 +1668,7 @@ class FinanceService:
                                 related_user=None
                             )
                         except InsufficientBalanceException:
-                            logger.error(f"补贴池余额不足，无法发放用户{user_id}的补贴")
+                            logger.error('finance_operation_failed')
                             raise FinanceException("补贴池余额不足，发放失败")
 
                         cur.execute(
@@ -1692,13 +1681,11 @@ class FinanceService:
 
                         total_distributed += subsidy_amount
                         total_points_deducted += points_to_deduct
-                        logger.info(
-                            f"用户{user_id}: 发放点数{points_to_add:.4f}, 扣减积分{points_to_deduct:.4f}"
-                        )
+                        logger.info('finance_operation_state')
 
                     # ========== 用户26平台积分池特殊发放 ==========
                     try:
-                        logger.info("开始处理平台积分池(company_points)补贴发放给用户26")
+                        logger.info('finance_operation_state')
                         cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'company_points'")
                         cp_current_row = cur.fetchone()
                         company_points_current = Decimal(
@@ -1714,7 +1701,7 @@ class FinanceService:
                                     str(subsidy_pool_row['balance'] or 0)) if subsidy_pool_row else Decimal('0')
 
                                 if current_subsidy_pool < platform_subsidy_amount:
-                                    logger.error(f"补贴池余额不足，无法发放用户26的平台积分补贴")
+                                    logger.error('finance_operation_failed')
                                     raise FinanceException("补贴池余额不足，无法完成平台积分补贴发放")
 
                                 cur.execute(
@@ -1723,7 +1710,7 @@ class FinanceService:
                                 )
 
                                 if cur.rowcount == 0:
-                                    logger.error("用户26不存在，无法发放平台积分补贴")
+                                    logger.error('finance_operation_failed')
                                     raise FinanceException("用户26不存在")
 
                                 self._add_pool_balance(
@@ -1759,144 +1746,30 @@ class FinanceService:
                                 )
 
                                 total_distributed += platform_subsidy_amount
-                                logger.info(f"用户26获得平台积分补贴: ¥{platform_subsidy_amount:.4f}")
+                                logger.info('finance_operation_state')
                             else:
-                                logger.info("计算发放金额为0，跳过用户26发放")
+                                logger.info('finance_operation_state')
                         else:
-                            logger.info("平台积分池余额为0，跳过用户26的特殊发放")
+                            logger.info('finance_operation_state')
                     except Exception as e:
-                        logger.error(f"用户26平台积分补贴发放失败: {e}", exc_info=True)
+                        logger.error('finance_operation_failed')
 
                     conn.commit()
 
             if auto_clear:
-                logger.info("发放完成，自动清除手动积分值配置")
+                logger.info('finance_operation_state')
                 self.adjust_subsidy_points_value(None)
 
-            logger.info(
-                f"日补贴完成: 发放¥{total_distributed:.4f}等值点数，当日可分配¥{daily_available:.4f}，剩余补贴池¥{pool_balance - daily_available:.4f}")
+            logger.info('finance_operation_state')
             return True
 
         except InsufficientBalanceException:
-            logger.error(f"❌ 日补贴发放失败: 补贴池余额不足")
+            logger.error('finance_operation_failed')
             raise FinanceException("补贴池余额不足，无法完成发放")
         except Exception as e:
-            logger.error(f"❌ 日补贴发放失败: {e}", exc_info=True)
+            logger.error('finance_operation_failed')
             return False
 
-    # ==================== 关键修改4：退款逻辑使用member_points ====================
-    def refund_order(self, order_no: str) -> bool:
-        try:
-            # 先读取订单信息（只读），随后通过条件更新来避免长时间持有行锁
-            result = self.session.execute(
-                "SELECT order_number, status, is_member_order, user_id, total_amount, merchant_id, original_amount FROM orders WHERE order_number = %s",
-                {"order_number": order_no}
-            )
-            order = result.fetchone()
-
-            if not order or order.status == 'refunded':
-                raise FinanceException("订单不存在或已退款")
-
-            # 尝试将订单状态置为 refunded（条件更新保证并发安全且不会长时间锁行）
-            res = self.session.execute(
-                "UPDATE orders SET status = 'refunded' WHERE order_number = %s AND status != 'refunded'",
-                {"order_number": order_no}
-            )
-            if res.rowcount == 0:
-                raise FinanceException("订单已被并发处理或状态已改变")
-
-            is_member = order.is_member_order
-            user_id = order.user_id
-            amount = Decimal(str(order.total_amount))
-            merchant_id = order.merchant_id
-
-            logger.debug(f"订单退款: {order_no} (会员商品: {is_member})")
-
-            if is_member:
-                result = self.session.execute(
-                    "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
-                    {"user_id": user_id}
-                )
-                referrer = result.fetchone()
-                if referrer and referrer.referrer_id:
-                    reward_amount = (
-                        Decimal(str(order.original_amount)) * self.get_direct_referral_reward_rate()
-                    )
-                    self.session.execute(
-                        """UPDATE users SET promotion_balance = promotion_balance - %s
-                           WHERE id = %s AND promotion_balance >= %s""",
-                        {"amount": reward_amount, "user_id": referrer.referrer_id}
-                    )
-
-                    # 动态构造 SELECT 语句（使用临时连接获取表结构，不影响当前事务）
-                    with get_conn() as temp_conn:
-                        with temp_conn.cursor() as temp_cur:
-                            select_fields, existing_columns = _build_team_rewards_select(temp_cur, ['reward_amount'])
-                            # 确保包含 user_id 字段（如果不存在则添加默认值 0）
-                            if 'user_id' not in existing_columns:
-                                select_fields = "0 AS user_id, " + select_fields
-                            else:
-                                # 如果 user_id 存在，确保它在最前面
-                                fields_list = [f.strip() for f in select_fields.split(",")]
-                                # 移除 user_id（如果存在）
-                                fields_list = [f for f in fields_list if
-                                               f != 'user_id' and not f.startswith('user_id ')]
-                                select_fields = "user_id, " + ", ".join(fields_list)
-
-                    result = self.session.execute(
-                        f"SELECT {select_fields} FROM team_rewards WHERE order_id = %s",
-                        {"order_id": order.id}
-                    )
-                    rewards = result.fetchall()
-                    for reward in rewards:
-                        self.session.execute(
-                            """UPDATE users SET promotion_balance = promotion_balance - %s
-                               WHERE id = %s AND promotion_balance >= %s""",
-                            {"amount": reward.reward_amount, "user_id": reward.user_id}
-                        )
-
-                    # 关键修改：退款时扣减member_points（不再是points）
-                    user_points = Decimal(str(order.original_amount))
-                    self.session.execute(
-                        "UPDATE users SET member_points = GREATEST(member_points - %s, 0) WHERE id = %s",
-                        {"points": user_points, "user_id": user_id}
-                    )
-                    self.session.execute(
-                        "UPDATE users SET member_level = GREATEST(member_level - 1, 0) WHERE id = %s",
-                        {"user_id": user_id}
-                    )
-                    logger.info(f"⚠️ 用户{user_id}退款后降级")
-
-                merchant_amount = amount * Decimal('0.80')
-
-                if is_member:
-                    self._check_pool_balance('platform_revenue_pool', merchant_amount)
-                    self._add_pool_balance('platform_revenue_pool', -merchant_amount, f"退款 - 订单#{order_no}")
-                else:
-                    if merchant_id == PLATFORM_MERCHANT_ID:
-                        self._add_pool_balance('platform_revenue_pool', -merchant_amount, f"退款 - 订单#{order_no}")
-                    else:
-                        self._check_user_balance(merchant_id, merchant_amount, 'merchant_balance')
-                        self.session.execute(
-                            "UPDATE users SET merchant_balance = merchant_balance - %s WHERE id = %s",
-                            {"amount": merchant_amount, "merchant_id": merchant_id}
-                        )
-
-                # ===== 新增：回冲各子资金池 =====
-                reverse_split_on_refund(order_no)
-
-                self.session.execute(
-                    "UPDATE orders SET refund_status = 'refunded', updated_at = NOW() WHERE id = %s",
-                    {"order_id": order.id}
-                )
-
-            logger.debug(f"订单退款成功: {order_no}")
-            return True
-
-        except Exception as e:
-            logger.error(f"❌ 退款失败: {e}")
-            return False
-        
     @staticmethod
     def revoke_order_discounts(order_number: str, external_cur=None) -> None:
         """
@@ -1920,11 +1793,16 @@ class FinanceService:
             """, (order_number,))
             order = cur.fetchone()
             if not order:
-                logger.warning(f"退款回退折扣时订单不存在: {order_number}")
+                logger.warning('finance_operation_warning')
                 return
             if order['status'] != 'refunded':
-                logger.info(f"订单 {order_number} 状态不是 refunded，跳过回退")
+                logger.info('finance_operation_state')
                 return
+            if begin_event(cur, 'discount_refund', order_number, order_number, {}):
+                return
+            cur.execute('SELECT id FROM users WHERE id=%s FOR UPDATE', (order['user_id'],))
+            if not cur.fetchone():
+                raise FinanceException('退款用户不存在')
 
             user_id = order['user_id']
             order_id = order['id']
@@ -1944,7 +1822,7 @@ class FinanceService:
                     INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at)
                     VALUES (%s, %s, %s, 'member', %s, %s, NOW())
                 """, (user_id, pending_points, new_balance, f"订单退款退回积分: {order_number}", order_id))
-                logger.info(f"订单 {order_number} 退回积分 {pending_points} 给用户 {user_id}")
+                logger.info('finance_operation_state')
 
             # 3. 退回使用的优惠券（线上：pending_coupon_ids；线下：券只记在 offline_order）
             coupon_ids: list = []
@@ -1953,7 +1831,7 @@ class FinanceService:
                     raw_ids = json.loads(pending_coupon_ids_json)
                     coupon_ids = [int(x) for x in raw_ids] if isinstance(raw_ids, list) else []
                 except Exception:
-                    logger.warning(f"解析 pending_coupon_ids 失败: {pending_coupon_ids_json}")
+                    logger.warning('finance_operation_warning')
             if order.get("offline_order_flag"):
                 cur.execute(
                     "SELECT coupon_id, coupon_ids FROM offline_order WHERE order_no=%s LIMIT 1",
@@ -1977,9 +1855,9 @@ class FinanceService:
                         SET status = 'unused', used_at = NULL
                         WHERE id IN ({','.join(['%s'] * len(valid_ids))})
                     """, tuple(valid_ids))
-                    logger.info(f"订单 {order_number} 退回优惠券: {valid_ids}")
+                    logger.info('finance_operation_state')
                 else:
-                    logger.info(f"订单 {order_number} 使用的优惠券均已过期，无法退回")
+                    logger.info('finance_operation_state')
 
             # 4. 收回因该订单获得的积分（线上发放 + 线下实付发放；历史线下行 related_order 可能为 NULL）
             offline_grant_reason = f"线下订单支付获得积分: {order_number}"
@@ -2023,9 +1901,10 @@ class FinanceService:
                         INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at)
                         VALUES (%s, %s, %s, 'member', %s, %s, NOW())
                     """, (user_id, -actual_deduct, new_balance, f"订单退款收回奖励积分: {order_number}", order_id))
-                    logger.info(f"订单 {order_number} 收回奖励积分 {actual_deduct} 从用户 {user_id}（应收回 {total_granted}，余额不足仅扣 {actual_deduct}）")
+                    logger.info('finance_operation_state')
                 else:
-                    logger.warning(f"订单 {order_number} 用户 {user_id} 积分余额不足，无法收回奖励积分 {total_granted}")
+                    logger.warning('finance_operation_warning')
+            finish_event(cur, 'discount_refund', order_number)
 
         if external_cur is not None:
             cur = external_cur
@@ -2089,12 +1968,12 @@ class FinanceService:
             )
 
             self.session.commit()
-            logger.debug(f"提现申请 #{withdrawal_id}: ¥{amount_decimal}（税¥{tax_amount:.2f}，实到¥{actual_amount:.2f}）")
+            logger.debug('finance_operation_detail')
             return withdrawal_id
 
         except Exception as e:
             self.session.rollback()
-            logger.error(f"❌ 提现申请失败: {e}")
+            logger.error('finance_operation_failed')
             return None
 
     def audit_withdrawal(self, withdrawal_id: int, approve: bool, auditor: str = 'admin') -> bool:
@@ -2142,14 +2021,11 @@ class FinanceService:
                 withdraw = cur.fetchone()
 
                 if approve:
-                    self._record_flow(
-                        account_type='withdrawal',
-                        related_user=withdraw['user_id'],
-                        change_amount=Decimal(str(withdraw['actual_amount'])),
-                        flow_type='income',
-                        remark=f"提现到账 #{withdrawal_id}"
+                    cur.execute(
+                        "INSERT INTO account_flow(account_type,related_user,change_amount,balance_after,flow_type,remark,created_at) VALUES('withdrawal',%s,%s,0,'income',%s,NOW())",
+                        (withdraw['user_id'], withdraw['actual_amount'], f'提现到账 #{withdrawal_id} 操作者:{auditor}'),
                     )
-                    logger.debug(f"提现审核通过 #{withdrawal_id}，到账¥{withdraw['actual_amount']:.2f}")
+                    logger.debug('finance_operation_detail')
                 else:
                     # 退回金额
                     balance_field = 'promotion_balance' if withdraw.get('withdrawal_type',
@@ -2159,14 +2035,13 @@ class FinanceService:
                         (withdraw['amount'], withdraw['user_id'])
                     )
 
-                    self._record_flow(
-                        account_type=balance_field,
-                        related_user=withdraw['user_id'],
-                        change_amount=Decimal(str(withdraw['amount'])),
-                        flow_type='income',
-                        remark=f"提现拒绝退回 #{withdrawal_id}"
+                    cur.execute(f'SELECT `{balance_field}` AS balance FROM users WHERE id=%s', (withdraw['user_id'],))
+                    balance_after = cur.fetchone()['balance']
+                    cur.execute(
+                        "INSERT INTO account_flow(account_type,related_user,change_amount,balance_after,flow_type,remark,created_at) VALUES(%s,%s,%s,%s,'income',%s,NOW())",
+                        (balance_field, withdraw['user_id'], withdraw['amount'], balance_after, f'提现拒绝退回 #{withdrawal_id} 操作者:{auditor}'),
                     )
-                    logger.debug(f"提现审核拒绝 #{withdrawal_id}")
+                    logger.debug('finance_operation_detail')
 
                 # 提交事务
                 conn.commit()
@@ -2250,10 +2125,12 @@ class FinanceService:
 
         # 记录流水
         flow_type = 'income' if amount >= 0 else 'expense'
-        self._insert_account_flow(cur, account_type=account_type, related_user=related_user,
-                                  change_amount=amount, flow_type=flow_type, remark=remark)
+        cur.execute(
+            "INSERT INTO account_flow(account_type,related_user,change_amount,balance_after,flow_type,remark,created_at) VALUES(%s,%s,%s,%s,%s,%s,NOW())",
+            (account_type, related_user, amount, balance_after, flow_type, remark),
+        )
 
-        logger.debug(f"资金池 {account_type} 余额变更: {amount:.4f}，当前余额: {balance_after:.4f}")
+        logger.debug('finance_operation_detail')
         return balance_after
 
     # 关键修改：points_log插入支持DECIMAL(12,4)精度
@@ -2319,9 +2196,9 @@ class FinanceService:
     # 在 get_public_welfare_balance 方法中添加
     def get_public_welfare_balance(self) -> Decimal:
         # ========== 临时日志开始 ==========
-        logger.info("🔍 DEBUG: get_public_welfare_balance 被调用")
+        logger.info('finance_operation_state')
         result = self.get_account_balance('public_welfare')
-        logger.info(f"🔍 DEBUG: get_account_balance 返回: {result} (类型: {type(result)})")
+        logger.info('finance_operation_state')
         return result
         # ========== 临时日志结束 ==========
         # return self.get_account_balance('public_welfare')
@@ -2344,18 +2221,6 @@ class FinanceService:
         cfg_map: Dict[str, Any] = {}
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # 确保表有 config_params 列；如果没有则尝试添加（容错）
-                try:
-                    cur.execute("SHOW COLUMNS FROM finance_accounts LIKE 'config_params'")
-                    if not cur.fetchone():
-                        try:
-                            cur.execute("ALTER TABLE finance_accounts ADD COLUMN config_params JSON DEFAULT NULL")
-                            conn.commit()
-                        except Exception as e:
-                            logger.debug(f"无法添加 config_params 列: {e}")
-
-                except Exception:
-                    logger.debug("检查 finance_accounts.config_params 列时出错，继续尝试读取行")
 
                 # 查询表中与我们关心的 account_type 列表匹配的行（使用安全占位符构造）
                 try:
@@ -2366,7 +2231,7 @@ class FinanceService:
                         params_tuple)
                     rows = cur.fetchall()
                 except Exception as e:
-                    logger.error(f"读取 finance_accounts 行失败: {e}")
+                    logger.error('finance_operation_failed')
                     rows = []
 
                 for r in rows:
@@ -2388,7 +2253,7 @@ class FinanceService:
                             if isinstance(parsed, dict) and at in parsed:
                                 cfg_map[at] = Decimal(str(parsed[at]))
                     except Exception:
-                        logger.debug(f"解析 finance_accounts.account_type={at} config_params 失败，忽略")
+                        logger.debug('finance_operation_detail')
 
         # 默认配置（数值为相对于总额的占比）
         defaults = {
@@ -2482,7 +2347,7 @@ class FinanceService:
                                 (atype, atype, 0, json.dumps(parsed, ensure_ascii=False))
                             )
                     except Exception as e:
-                        logger.error(f"更新 finance_accounts.account_type={atype} 的 config_params 失败: {e}")
+                        logger.error('finance_operation_failed')
                 conn.commit()
 
         # 返回最新的合并配置（读取每行）
@@ -2590,12 +2455,12 @@ class FinanceService:
             )
 
             self.session.commit()
-            logger.debug(f"用户{user_id}的推荐人设置为{referrer_id}（{referrer.member_level}星）")
+            logger.debug('finance_operation_detail')
             return True
 
         except Exception as e:
             self.session.rollback()
-            logger.error(f"❌ 设置推荐人失败: {e}")
+            logger.error('finance_operation_failed')
             return False
 
     def get_user_referrer(self, user_id: int) -> Optional[Dict[str, Any]]:
@@ -2640,7 +2505,7 @@ class FinanceService:
 
     def check_director_promotion(self) -> bool:
         try:
-            logger.debug("荣誉董事晋升审核")
+            logger.debug('finance_operation_detail')
 
             result = self.session.execute("SELECT id FROM users WHERE member_level = 6")
             six_star_users = result.fetchall()
@@ -2679,15 +2544,15 @@ class FinanceService:
                     )
                     if result.rowcount > 0:
                         promoted_count += 1
-                        logger.info(f"用户{user_id}晋升为荣誉董事！（直接:{direct_count}, 团队:{total_count}）")
+                        logger.info('finance_operation_state')
 
             self.session.commit()
-            logger.info(f"荣誉董事审核完成: 晋升{promoted_count}人")
+            logger.info('finance_operation_state')
             return True
 
         except Exception as e:
             self.session.rollback()
-            logger.error(f"❌ 荣誉董事审核失败: {e}")
+            logger.error('finance_operation_failed')
             return False
 
     # ==================== 关键修改6：get_user_info使用member_points ====================
@@ -2862,11 +2727,7 @@ class FinanceService:
                         total_amount += amt
                     processed += 1
                 conn.commit()
-        logger.info(
-            "过期优惠券结算: %s 张, 合计面额 %s 已入补贴池并发放等额会员积分",
-            processed,
-            total_amount,
-        )
+        logger.info('finance_operation_state')
         return {"processed": processed, "total_amount": float(total_amount)}
 
     def settle_monthly_rain_points(self, settlement_period: Optional[str] = None) -> Dict[str, Any]:
@@ -3122,7 +2983,7 @@ class FinanceService:
                         except (json.JSONDecodeError, KeyError, TypeError):
                             pass
         except Exception as e:
-            logger.error(f"获取调整配置失败: {e}")
+            logger.error('finance_operation_failed')
         return None
 
     # ========== 完整函数 2：计算联创星级分红预览 ==========
@@ -3139,7 +3000,7 @@ class FinanceService:
         - total_capped_users: 达到上限的用户数（新增）
         - capped_users_list: 被限制的用户列表（新增）
         """
-        logger.info("计算联创星级分红预览（含单个用户上限1万）")
+        logger.info('finance_operation_state')
 
         # 1. 查询分红池余额（优先使用资金分配池 director_pool，与分配配置保持一致）
         pool_balance = self.get_account_balance('director_pool')
@@ -3306,7 +3167,7 @@ class FinanceService:
                             "UPDATE finance_accounts SET config_params = NULL WHERE account_type = 'director_pool'"
                         )
                         result["message"] = "已取消联创分红手动调整，恢复自动计算"
-                        logger.info("已取消联创分红手动调整，恢复自动计算")
+                        logger.info('finance_operation_state')
                     else:
                         # 设置调整金额
                         amount = Decimal(str(amount_per_weight))
@@ -3354,10 +3215,7 @@ class FinanceService:
                                 "max_theoretical_amount": float(max_theoretical),
                                 "capped_users": capped_users[:10]  # 只返回前10个，避免数据过大
                             }
-                            logger.warning(
-                                f"联创分红手动调整设定 ¥{amount:.4f}/权重 "
-                                f"将导致 {len(capped_users)} 个用户达到上限10,000元"
-                            )
+                            logger.warning('finance_operation_warning')
                         # ===================================================================
 
                         import json
@@ -3367,14 +3225,14 @@ class FinanceService:
                             (config,)
                         )
                         result["message"] = f"联创分红金额已调整为: ¥{amount:.4f}/权重"
-                        logger.info(f"已设置联创分红手动调整: ¥{amount:.4f}/权重")
+                        logger.info('finance_operation_state')
 
                     conn.commit()
 
             return result
 
         except Exception as e:
-            logger.error(f"调整分红金额失败: {e}")
+            logger.error('finance_operation_failed')
             raise
 
     def distribute_unilevel_dividend(self) -> bool:
@@ -3386,7 +3244,7 @@ class FinanceService:
         2. 保留：余额检查、资金池扣减等保护逻辑
         3. 记录：超限情况日志，便于审计
         """
-        logger.info("联创星级分红发放开始（检测手动调整配置 + 用户上限1万）")
+        logger.info('finance_operation_state')
 
         # 查询所有联创用户
         with get_conn() as conn:
@@ -3409,7 +3267,7 @@ class FinanceService:
                 unilevel_users = cur.fetchall()
 
         if not unilevel_users:
-            logger.warning("没有符合条件的联创用户")
+            logger.warning('finance_operation_warning')
             return False
 
         # 计算总权重
@@ -3419,7 +3277,7 @@ class FinanceService:
         pool_balance = self.get_account_balance('director_pool')
 
         if pool_balance <= 0:
-            logger.warning(f"联创分红池余额不足: ¥{pool_balance}")
+            logger.warning('finance_operation_warning')
             return False
 
         # 检查手动调整配置
@@ -3437,10 +3295,10 @@ class FinanceService:
                     f"当前余额¥{pool_balance:.4f}"
                 )
 
-            logger.info(f"使用手动调整金额: ¥{amount_per_weight:.4f}/权重")
+            logger.info('finance_operation_state')
         else:
             amount_per_weight = pool_balance / total_weight
-            logger.info(f"使用自动计算金额: ¥{amount_per_weight:.4f}/权重")
+            logger.info('finance_operation_state')
 
         # 执行分红发放
         try:
@@ -3462,10 +3320,7 @@ class FinanceService:
 
                         if actual_amount != theoretical_amount:
                             total_limited += 1
-                            logger.warning(
-                                f"用户{user_id}联创分红金额超限: {theoretical_amount:.4f} -> {actual_amount:.4f} "
-                                f"(权重:{weight}, 上限:{MAX_PER_USER})"
-                            )
+                            logger.warning('finance_operation_warning')
                         # ===================================================================
 
                         points_to_add = actual_amount
@@ -3499,34 +3354,33 @@ class FinanceService:
                                 related_user=None
                             )
                         except InsufficientBalanceException:
-                            logger.error(f"联创分红池余额不足，无法发放用户{user_id}的分红")
+                            logger.error('finance_operation_failed')
                             raise FinanceException("联创分红池余额不足，发放失败")
 
                         total_distributed += points_to_add
-                        logger.debug(f"用户{user_id}获得联创星级分红: {points_to_add:.4f}点数")
+                        logger.debug('finance_operation_detail')
 
                     conn.commit()
 
             # 分红成功后，清除手动调整配置（避免下次误用）
             if adjusted_amount is not None:
-                logger.info("分红完成，清除手动调整配置")
+                logger.info('finance_operation_state')
                 self.adjust_unilevel_dividend_amount(None)
 
             # ==================== 新增：记录被限制的用户数 ====================
             if total_limited > 0:
-                logger.info(f"联创星级分红完成: 共{len(unilevel_users)}人，发放点数{total_distributed:.4f}，"
-                            f"其中{total_limited}人达到上限10,000元")
+                logger.info('finance_operation_state')
             else:
-                logger.info(f"联创星级分红完成: 共{len(unilevel_users)}人，发放点数{total_distributed:.4f}")
+                logger.info('finance_operation_state')
             # ===================================================================
 
             return True
 
         except InsufficientBalanceException:
-            logger.error(f"❌ 联创星级分红失败: 分红池余额不足")
+            logger.error('finance_operation_failed')
             raise FinanceException("联创分红池余额不足，无法完成发放")
         except Exception as e:
-            logger.error(f"联创星级分红失败: {e}", exc_info=True)
+            logger.error('finance_operation_failed')
             return False
 
     # ==================== 关键修改8：积分流水报告使用member_points ====================
@@ -3708,7 +3562,7 @@ class FinanceService:
                     )
                 order = cur.fetchone()
                 if not order:
-                    logger.info(f"用户 {user_id} 无订单记录，返回空交易链")
+                    logger.info('finance_operation_state')
                     return {
                         "order_id": None,
                         "order_no": None,
@@ -3823,7 +3677,15 @@ class FinanceService:
         if not user_row:
             raise FinanceException(f"用户不存在: {user_id}")
 
-        current_balance = Decimal(str(user_row.get('true_total_points', 0) or 0))
+        # Lock the asset row for the whole coupon insertion/debit transaction.
+        cur.execute(
+            "SELECT true_total_points FROM users WHERE id=%s FOR UPDATE",
+            (user_id,),
+        )
+        locked_row = cur.fetchone()
+        if not locked_row:
+            raise FinanceException(f"用户不存在: {user_id}")
+        current_balance = Decimal(str(locked_row.get('true_total_points', 0) or 0))
         if current_balance < amount:
             raise FinanceException(
                 f"用户 {user_id} true_total_points 余额不足，当前余额: {current_balance:.4f}，需要 {amount:.4f}"
@@ -3842,9 +3704,12 @@ class FinanceService:
         # 3. 扣除 true_total_points
         new_balance = current_balance - amount
         cur.execute(
-            "UPDATE users SET true_total_points = %s WHERE id = %s",
-            (new_balance, user_id)
+            "UPDATE users SET true_total_points = %s "
+            "WHERE id = %s AND true_total_points >= %s",
+            (new_balance, user_id, amount)
         )
+        if cur.rowcount != 1:
+            raise FinanceException("余额已变化，请重试")
 
         # 4. 记录扣除流水
         cur.execute(
@@ -3855,8 +3720,7 @@ class FinanceService:
              f"发放优惠券扣除 - 优惠券#{coupon_id}，金额¥{amount:.2f}，类型:{applicable_product_type}")
         )
 
-        logger.debug(
-            f"发放优惠券给用户{user_id}: ID={coupon_id}, 金额¥{amount:.2f}, 扣除 true_total_points {amount:.4f}")
+        logger.debug('finance_operation_detail')
         return coupon_id
 
     # ===========================================================================
@@ -3882,19 +3746,28 @@ class FinanceService:
             coupon_type: str = 'user',
             applicable_product_type: str = 'all',
             valid_days: int = COUPON_VALID_DAYS,
+            *, actor_id: int = None, request_key: str = None,
     ) -> List[int]:
         """为指定用户在同一事务内发放 count 张 1 元优惠券（每张等额扣除 true_total_points）。"""
-        if count < 1:
-            raise FinanceException("发放张数必须至少为 1")
+        if type(count) is not int or count < 1:
+            raise FinanceException("发放张数必须至少为 1 的整数")
+        if actor_id is None or not request_key:
+            raise FinanceException('发券需要可信操作者与持久请求身份')
         amount_per = Decimal('1')
         with get_conn() as conn:
             with conn.cursor() as cur:
+                replay = begin_request(cur, actor_id, request_key, 'coupon_issue',
+                    {'user_id': user_id, 'count': count, 'coupon_type': coupon_type,
+                     'applicable_product_type': applicable_product_type, 'valid_days': valid_days})
+                if replay is not None:
+                    return replay
                 coupon_ids: List[int] = []
                 for _ in range(count):
                     cid = self._distribute_coupon_internal(
                         cur, user_id, amount_per, coupon_type, applicable_product_type, valid_days
                     )
                     coupon_ids.append(cid)
+                finish_request(cur, actor_id, request_key, coupon_ids)
                 conn.commit()
         return coupon_ids
 
@@ -3902,7 +3775,7 @@ class FinanceService:
     def distribute_coupons_batch(self, user_ids: List[int], amount: float,
                                  coupon_type: str = 'user',
                                  applicable_product_type: str = 'all',
-                                 valid_days: int = COUPON_VALID_DAYS) -> Dict[str, Any]:
+                                 valid_days: int = COUPON_VALID_DAYS, *, actor_id: int, request_key: str) -> Dict[str, Any]:
         """
         批量发放优惠券（部分成功模式）
         返回: {
@@ -3917,27 +3790,32 @@ class FinanceService:
 
         with get_conn() as conn:
             with conn.cursor() as cur:
+                replay = begin_request(cur, actor_id, request_key, 'coupon_batch',
+                    {'user_ids': user_ids, 'amount': str(amount_dec), 'coupon_type': coupon_type,
+                     'applicable_product_type': applicable_product_type, 'valid_days': valid_days})
+                if replay is not None:
+                    return replay
                 for uid in user_ids:
+                    cur.execute('SAVEPOINT coupon_recipient')
                     try:
                         cid = self._distribute_coupon_internal(
                             cur, uid, amount_dec, coupon_type, applicable_product_type, valid_days
                         )
                         coupon_ids.append(cid)
                     except FinanceException as e:
+                        cur.execute('ROLLBACK TO SAVEPOINT coupon_recipient')
                         # 余额不足或其他业务异常，跳过该用户，记录失败，继续下一个
                         failed_users.append({
                             'user_id': uid,
                             'reason': str(e)
                         })
-                        logger.warning(f"用户 {uid} 发放失败，已跳过：{e}")
+                        logger.warning('finance_operation_warning')
                 # 最后统一提交，成功的操作会持久化
+                result = {'success_count': len(coupon_ids), 'failed_users': failed_users, 'coupon_ids': coupon_ids}
+                finish_request(cur, actor_id, request_key, result)
                 conn.commit()
 
-        return {
-            'success_count': len(coupon_ids),
-            'failed_users': failed_users,
-            'coupon_ids': coupon_ids
-        }
+        return result
 
     # =================================================================
 
@@ -3949,7 +3827,7 @@ class FinanceService:
             amount: Decimal,
             coupon_type: str = 'user',
             applicable_product_type: str = 'all',
-            remark: str = None
+            remark: str = None, *, actor_id: int, request_key: str,
     ) -> List[int]:
         """
         将指定资金池的金额转化为多张 1 元优惠券赠送给用户（扣池金额与券面额一致，须为整数元）。
@@ -3981,6 +3859,14 @@ class FinanceService:
 
         with get_conn() as conn:
             with conn.cursor() as cur:
+                replay = begin_request(cur, actor_id, request_key, 'pool_coupon',
+                    {'pool_type': pool_type, 'user_id': user_id, 'amount': str(amount),
+                     'coupon_type': coupon_type, 'applicable_product_type': applicable_product_type, 'remark': remark})
+                if replay is not None:
+                    return replay
+                cur.execute('SELECT id FROM users WHERE id=%s FOR UPDATE', (user_id,))
+                if not cur.fetchone():
+                    raise FinanceException('接收用户不存在')
                 # 1. 扣除资金池余额并记录支出流水
                 self._add_pool_balance(
                     cur,
@@ -4015,6 +3901,7 @@ class FinanceService:
                 """, ('coupon', user_id, Decimal('0'), Decimal('0'), 'info',
                       f"通过资金池转正获得{n}张1元优惠券（id:{ids_part}），合计¥{whole_yuan}，来源池:{pool_type}"))
 
+                finish_request(cur, actor_id, request_key, coupon_ids)
                 conn.commit()
                 return coupon_ids
 
@@ -4257,7 +4144,7 @@ class FinanceService:
                     cur.execute(
                         """SELECT c.*, u.name as user_name
                            FROM coupons c JOIN users u ON c.user_id = u.id
-                           WHERE c.id = %s AND c.user_id = %s AND c.status = 'unused'""",
+                           WHERE c.id = %s AND c.user_id = %s AND c.status = 'unused' FOR UPDATE""",
                         (coupon_id, user_id)
                     )
                     coupon = cur.fetchone()
@@ -4294,13 +4181,13 @@ class FinanceService:
                     )
 
                     conn.commit()
-                    logger.debug(f"用户{user_id}使用优惠券{coupon_id}:¥{coupon['amount']:.2f}成功")
+                    logger.debug('finance_operation_detail')
                     return True
 
         except FinanceException as e:
             raise
         except Exception as e:
-            logger.error(f"❌ 使用优惠券失败: {e}")
+            logger.error('finance_operation_failed')
             raise
 
     # ==================== 提现申请处理报表（高优先级） ====================
@@ -4313,7 +4200,7 @@ class FinanceService:
 
         统计提现申请的数量、金额、税费、实际到账金额及各状态分布
         """
-        logger.info(f"生成提现申请报表: 日期范围={start_date}至{end_date}, 用户={user_id}, 状态={status}")
+        logger.info('finance_operation_state')
 
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -4428,7 +4315,7 @@ class FinanceService:
         2. 确保 WHERE 条件与参数数量匹配
         3. 不影响原有功能和逻辑
         """
-        logger.info(f"生成总会员积分明细报表: 用户={user_id or '所有用户'}, 日期范围={start_date}至{end_date}")
+        logger.info('finance_operation_state')
 
         from datetime import datetime, date
 
@@ -4583,7 +4470,7 @@ class FinanceService:
     def get_pool_flow_report(self, account_type: str,
                              start_date: str, end_date: str,
                              page: int = 1, page_size: int = 20) -> Dict[str, Any]:
-        logger.info(f"生成资金池流水报表: 账户={account_type}, 日期范围={start_date}至{end_date}")
+        logger.info('finance_operation_state')
 
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -4714,7 +4601,7 @@ class FinanceService:
 
         查询联创会员的星级分红发放记录，支持按用户、星级、日期筛选
         """
-        logger.info(f"生成联创星级点数流水报表: 用户={user_id}, 星级={level}, 日期范围={start_date}至{end_date}")
+        logger.info('finance_operation_state')
 
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -4767,20 +4654,10 @@ class FinanceService:
                 cur.execute(detail_sql, tuple(detail_params))
                 records = cur.fetchall()
 
-                # 3. 汇总统计（不包含user_id过滤条件）
+                # Summary uses the same owner/date/level scope as records.
                 summary_where = where_conditions.copy()
                 summary_params = query_params.copy()
 
-                # 移除user_id相关的条件（如果存在）
-                if user_id:
-                    user_idx = -1
-                    for idx, condition in enumerate(summary_where):
-                        if "af.related_user" in condition:
-                            user_idx = idx
-                            break
-                    if user_idx >= 0:
-                        summary_where.pop(user_idx)
-                        summary_params.pop(user_idx)
 
                 summary_sql = f"""
                     SELECT COUNT(DISTINCT af.related_user) as total_users,
@@ -4821,7 +4698,7 @@ class FinanceService:
 
     def clear_fund_pools(self, pool_types: List[str]) -> Dict[str, Any]:
         """清空指定的资金池（增加余额保护）"""
-        logger.info(f"开始清空资金池: {pool_types}")
+        logger.info('finance_operation_state')
 
         if not pool_types:
             raise FinanceException("必须指定要清空的资金池类型")
@@ -4837,7 +4714,7 @@ class FinanceService:
         for pool_type in pool_types:
             current_balance = self.get_account_balance(pool_type)
             if current_balance <= 0:
-                logger.debug(f"资金池 {pool_type} 余额为0，跳过")
+                logger.debug('finance_operation_detail')
                 continue
 
             # 获取账户名称
@@ -4857,7 +4734,7 @@ class FinanceService:
             })
 
         if not pools_to_clear:
-            logger.info("所有指定资金池余额为0，无需清空")
+            logger.info('finance_operation_state')
             return {
                 "cleared_pools": [],
                 "total_cleared": 0.0
@@ -4890,14 +4767,14 @@ class FinanceService:
                             })
                             total_cleared += current_balance
 
-                            logger.info(f"已清空资金池 {pool_type}: ¥{current_balance:.2f}")
+                            logger.info('finance_operation_state')
                         except InsufficientBalanceException:
-                            logger.error(f"资金池 {pool_type} 余额不足，无法清空")
+                            logger.error('finance_operation_failed')
                             raise FinanceException(f"资金池 {pool_type} 余额不足，清空失败")
 
                     conn.commit()
 
-            logger.info(f"资金池清空完成: 共清空 {len(cleared_pools)} 个，总计 ¥{total_cleared:.2f}")
+            logger.info('finance_operation_state')
 
             return {
                 "cleared_pools": cleared_pools,
@@ -4905,13 +4782,13 @@ class FinanceService:
             }
 
         except Exception as e:
-            logger.error(f"清空资金池失败: {e}", exc_info=True)
+            logger.error('finance_operation_failed')
             raise
 
     def get_weekly_subsidy_report(self, year: int, week: int, user_id: Optional[int] = None,
                                   page: int = 1, page_size: int = 20) -> Dict[str, Any]:
         """周补贴明细报表（适配平台积分池补贴）"""
-        logger.info(f"生成周补贴明细报表: {year}年第{week}周")
+        logger.info('finance_operation_state')
 
         from datetime import date, timedelta
 
@@ -4987,18 +4864,15 @@ class FinanceService:
                         SUM(CASE WHEN NOT (wsr.user_id = 26 AND wsr.remark LIKE '%%平台积分池%%')
                             THEN wsr.subsidy_amount ELSE 0 END) as regular_subsidy
                     FROM weekly_subsidy_records wsr
-                    WHERE {where_sql.replace(' AND wsr.user_id = %s', '') if user_id else where_sql}
+                    WHERE {where_sql}
                 """
-                if user_id:
-                    cur.execute(summary_sql, (week_start, week_end))
-                else:
-                    cur.execute(summary_sql, tuple(params[:-2]))
+                cur.execute(summary_sql, tuple(params[:-2]))
                 summary = cur.fetchone()
 
                 # 查询平台积分池当前余额
-                cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'company_points'")
+                cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'company_points' AND %s IS NULL", (user_id,))
                 cp_row = cur.fetchone()
-                company_points_balance = float(cp_row['balance'] if cp_row else 0)
+                company_points_balance = float(cp_row['balance'] if cp_row else 0) if user_id is None else None
 
                 # 格式化返回数据
                 formatted_records = []
@@ -5070,7 +4944,7 @@ class FinanceService:
     def get_monthly_subsidy_report(self, year: int, month: int, user_id: Optional[int] = None,
                                    page: int = 1, page_size: int = 20) -> Dict[str, Any]:
         """月补贴明细报表（同步适配平台积分池补贴）"""
-        logger.info(f"生成月补贴明细报表: {year}年{month}月")
+        logger.info('finance_operation_state')
 
         from datetime import date
         import calendar
@@ -5131,12 +5005,9 @@ class FinanceService:
                         SUM(CASE WHEN NOT (wsr.user_id = 26 AND wsr.remark LIKE '%%平台积分池%%')
                             THEN wsr.subsidy_amount ELSE 0 END) as regular_subsidy
                     FROM weekly_subsidy_records wsr
-                    WHERE {where_sql.replace(' AND wsr.user_id = %s', '') if user_id else where_sql}
+                    WHERE {where_sql}
                 """
-                if user_id:
-                    cur.execute(summary_sql, (month_start, month_end))
-                else:
-                    cur.execute(summary_sql, tuple(params[:-2]))
+                cur.execute(summary_sql, tuple(params[:-2]))
                 summary = cur.fetchone()
 
                 return {
@@ -5195,7 +5066,7 @@ class FinanceService:
         Returns:
             包含汇总、分页和明细的字典
         """
-        logger.info(f"生成用户积分周报表: {year}年第{week}周")
+        logger.info('finance_operation_state')
 
         from datetime import date, timedelta
 
@@ -5253,12 +5124,9 @@ class FinanceService:
                            SUM(CASE WHEN pl.change_amount < 0 THEN ABS(pl.change_amount) ELSE 0 END) as total_expense,
                            SUM(pl.change_amount) as net_change
                     FROM points_log pl
-                    WHERE {where_sql.replace(' AND pl.user_id = %s', '') if user_id else where_sql}
+                    WHERE {where_sql}
                 """
-                if user_id:
-                    cur.execute(summary_sql, (week_start, week_end))
-                else:
-                    cur.execute(summary_sql, tuple(params[:-2]))
+                cur.execute(summary_sql, tuple(params[:-2]))
                 summary = cur.fetchone()
 
                 return {
@@ -5309,7 +5177,7 @@ class FinanceService:
         Returns:
             包含汇总、分页和明细的字典
         """
-        logger.info(f"生成用户积分月报表: {year}年{month}月")
+        logger.info('finance_operation_state')
 
         from datetime import date
         import calendar
@@ -5363,12 +5231,9 @@ class FinanceService:
                            SUM(CASE WHEN pl.change_amount < 0 THEN ABS(pl.change_amount) ELSE 0 END) as total_expense,
                            SUM(pl.change_amount) as net_change
                     FROM points_log pl
-                    WHERE {where_sql.replace(' AND pl.user_id = %s', '') if user_id else where_sql}
+                    WHERE {where_sql}
                 """
-                if user_id:
-                    cur.execute(summary_sql, (month_start, month_end))
-                else:
-                    cur.execute(summary_sql, tuple(params[:-2]))
+                cur.execute(summary_sql, tuple(params[:-2]))
                 summary = cur.fetchone()
 
                 return {
@@ -5409,7 +5274,7 @@ class FinanceService:
 
         查询指定周次内商家merchant_points的变动明细
         """
-        logger.info(f"生成商家积分周报表: {year}年第{week}周")
+        logger.info('finance_operation_state')
 
         from datetime import date, timedelta
 
@@ -5461,12 +5326,9 @@ class FinanceService:
                            SUM(CASE WHEN pl.change_amount < 0 THEN ABS(pl.change_amount) ELSE 0 END) as total_expense,
                            SUM(pl.change_amount) as net_change
                     FROM points_log pl
-                    WHERE {where_sql.replace(' AND pl.user_id = %s', '') if user_id else where_sql}
+                    WHERE {where_sql}
                 """
-                if user_id:
-                    cur.execute(summary_sql, (week_start, week_end))
-                else:
-                    cur.execute(summary_sql, tuple(params[:-2]))
+                cur.execute(summary_sql, tuple(params[:-2]))
                 summary = cur.fetchone()
 
                 return {
@@ -5504,7 +5366,7 @@ class FinanceService:
     def get_monthly_merchant_points_report(self, year: int, month: int, user_id: Optional[int] = None,
                                            page: int = 1, page_size: int = 20) -> Dict[str, Any]:
         """商家积分月报表"""
-        logger.info(f"生成商家积分月报表: {year}年{month}月")
+        logger.info('finance_operation_state')
 
         from datetime import date
         import calendar
@@ -5552,12 +5414,9 @@ class FinanceService:
                            SUM(CASE WHEN pl.change_amount < 0 THEN ABS(pl.change_amount) ELSE 0 END) as total_expense,
                            SUM(pl.change_amount) as net_change
                     FROM points_log pl
-                    WHERE {where_sql.replace(' AND pl.user_id = %s', '') if user_id else where_sql}
+                    WHERE {where_sql}
                 """
-                if user_id:
-                    cur.execute(summary_sql, (month_start, month_end))
-                else:
-                    cur.execute(summary_sql, tuple(params[:-2]))
+                cur.execute(summary_sql, tuple(params[:-2]))
                 summary = cur.fetchone()
 
                 return {
@@ -5594,7 +5453,7 @@ class FinanceService:
 
     def get_weekly_subsidy_preview(self, year: int, week: int, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
         """周补贴预览报表（全用户，包含用户26平台积分池特殊发放预览）"""
-        logger.info(f"生成全用户周补贴预览报表: {year}年第{week}周，页码={page}")
+        logger.info('finance_operation_state')
 
         from datetime import date, timedelta
 
@@ -5656,8 +5515,7 @@ class FinanceService:
                     points_value = min(manual_value, auto_value)
                     is_manual_adjusted = True
                     manual_value_for_display = float(manual_value)
-                    logger.info(
-                        f"预览使用手动调整上限: 手动{manual_value:.4f}, 自动{auto_value:.4f}, 实际预览值{points_value:.4f}")
+                    logger.info('finance_operation_state')
                 else:
                     points_value = auto_value
                     is_manual_adjusted = False
@@ -5754,7 +5612,7 @@ class FinanceService:
                 if user26_preview and user26_preview.get('can_distribute'):
                     total_estimated_subsidy += Decimal(str(user26_preview['estimated_subsidy_amount']))
 
-                logger.info(f"全用户周补贴预览生成完成: 共{len(user_records)}条普通用户记录 + 用户26平台积分发放预览")
+                logger.info('finance_operation_state')
 
                 return {
                     "summary": {
@@ -5811,7 +5669,7 @@ class FinanceService:
         Returns:
             包含汇总统计、分页信息和流水明细的字典
         """
-        logger.info(f"生成订单积分流水报告: 日期范围={start_date}至{end_date}, 用户={user_id}, 订单号={order_no}")
+        logger.info('finance_operation_state')
 
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -5942,11 +5800,11 @@ class FinanceService:
 
                 # 平台积分（company_points）计入总用户积分
                 try:
-                    cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'company_points'")
+                    cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'company_points' AND %s IS NULL", (user_id,))
                     cp_row = cur.fetchone() or {}
                     platform_points = Decimal(str(cp_row.get('balance', 0) or 0))
                 except Exception as e:
-                    logger.debug(f"查询平台积分失败，忽略: {e}")
+                    logger.debug('finance_operation_detail')
 
                 total_user_points_with_platform = total_user_points + platform_points
 
@@ -6028,7 +5886,7 @@ class FinanceService:
         Returns:
             包含各点数类型统计和明细的字典
         """
-        logger.info(f"生成纯点数流水报表: 用户={user_id or '所有用户'}")
+        logger.info('finance_operation_state')
 
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -6209,7 +6067,7 @@ class FinanceService:
     # ==================== 周补贴点数报表 ====================
     def get_subsidy_points_report(self, user_id: Optional[int] = None) -> Dict[str, Any]:
         """查询周补贴点数明细报表"""
-        logger.info(f"生成周补贴点数报表: 用户={user_id or '所有用户'}")
+        logger.info('finance_operation_state')
 
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -6273,7 +6131,7 @@ class FinanceService:
     # ==================== 联创星级点数报表 ====================
     def get_unilevel_points_report(self, user_id: Optional[int] = None) -> Dict[str, Any]:
         """查询联创星级点数明细报表"""
-        logger.info(f"生成联创星级点数报表: 用户={user_id or '所有用户'}")
+        logger.info('finance_operation_state')
 
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -6344,7 +6202,7 @@ class FinanceService:
         2. team_reward_points - 团队奖励点数
         3. combined_total - 推荐和团队点数合计
         """
-        logger.info(f"生成推荐+团队合并点数报表: 用户={user_id or '所有用户'}")
+        logger.info('finance_operation_state')
 
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -6457,7 +6315,7 @@ class FinanceService:
         - team_reward_points → users.team_reward_points  （团队奖励）
         - true_total_points  → users.true_total_points   （真实总点数）
         """
-        logger.info(f"生成综合点数流水报表: 用户={user_id or '所有用户'}, 日期={start_date}至{end_date}")
+        logger.info('finance_operation_state')
 
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -6720,7 +6578,7 @@ class FinanceService:
         Returns:
             dict: 包含捐赠结果和流水ID的字典
         """
-        logger.info(f"用户 {user_id} 申请捐赠 true_total_points: {amount:.4f}")
+        logger.info('finance_operation_state')
 
         donation_amount = Decimal(str(amount))
         if donation_amount <= 0:
@@ -6736,7 +6594,7 @@ class FinanceService:
                         where_clause="id=%s",
                         select_fields=["true_total_points", "name"]
                     )
-                    cur.execute(select_sql, (user_id,))
+                    cur.execute(select_sql + ' FOR UPDATE', (user_id,))
                     user_row = cur.fetchone()
 
                     if not user_row:
@@ -6794,10 +6652,7 @@ class FinanceService:
 
                     conn.commit()
 
-                    logger.info(
-                        f"用户 {user_id} 捐赠成功: -{donation_amount:.4f} true_total_points, "
-                        f"公益基金 +{donation_amount:.4f}"
-                    )
+                    logger.info('finance_operation_state')
 
                     return {
                         "success": True,
@@ -6812,7 +6667,7 @@ class FinanceService:
         except FinanceException:
             raise
         except Exception as e:
-            logger.error(f"❌ 用户 {user_id} 捐赠失败: {e}")
+            logger.error('finance_operation_failed')
             raise FinanceException(f"捐赠失败: {e}")
 
     def get_platform_flow_summary(
@@ -6834,10 +6689,7 @@ class FinanceService:
         4. 合并所有流水，按时间倒序排列
         5. 计算总体统计和趋势分析
         """
-        logger.info(
-            f"生成平台综合流水报表: 日期范围={start_date}至{end_date}, "
-            f"用户={user_id or '所有用户'}, 包含明细={include_detail}"
-        )
+        logger.info('finance_operation_state')
 
         from datetime import datetime, date
         import itertools
@@ -6951,7 +6803,7 @@ class FinanceService:
                             all_raw_flows.extend(flows)
 
             except Exception as e:
-                logger.warning(f"查询资金池 {pool_type} 数据失败: {e}")
+                logger.warning('finance_operation_warning')
                 continue
 
         # ==================== 3. 查询订单相关流水（积分抵扣、用户支付） ====================
@@ -7009,7 +6861,7 @@ class FinanceService:
                     })
 
             except Exception as e:
-                logger.warning(f"查询订单相关流水失败: {e}")
+                logger.warning('finance_operation_warning')
 
         # ==================== 4. 合并所有流水并统一格式 ====================
         all_flows = []
@@ -7046,7 +6898,7 @@ class FinanceService:
                     'account_type': flow['account_type']
                 })
             except Exception as e:
-                logger.debug(f"处理流水记录失败: {e}")
+                logger.debug('finance_operation_detail')
                 continue
 
         # 添加订单流水
@@ -7110,10 +6962,7 @@ class FinanceService:
             ]
         }
 
-        logger.info(
-            f"平台综合流水报表生成完成: {total_records}笔交易, "
-            f"净流量¥{grand_net_change:.2f}, {active_pools}个活跃资金池"
-        )
+        logger.info('finance_operation_state')
 
         return result
 
@@ -7226,7 +7075,7 @@ class FinanceService:
 
         整合三类积分流水，提供总余额合计
         """
-        logger.info(f"生成总积分明细报表: 用户={user_id or '所有用户'}, 日期范围={start_date}至{end_date}")
+        logger.info('finance_operation_state')
 
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -7511,114 +7360,16 @@ class FinanceService:
             remark: Optional[str] = None,
             notify_url: Optional[str] = None
     ) -> Dict[str, Any]:
-        """
-        商户账户提现到银行卡（自提）
-        ...
-        """
-        import uuid
-        import time
-        from datetime import datetime
-
-        logger.info(
-            f"商户提现到银行卡申请: out_request_no={out_request_no}, amount={amount}, account_type={account_type}")
-
-        # 参数校验
-        if amount <= 0:
-            raise FinanceException("提现金额必须大于0")
-        if amount > 800000000:  # 8亿元限制
-            raise FinanceException("提现金额不能超过8亿元")
-
-        # 检查提现单号是否已存在
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id FROM merchant_withdraw_records WHERE out_request_no = %s",
-                    (out_request_no,)
-                )
-                if cur.fetchone():
-                    raise FinanceException(f"提现单号 {out_request_no} 已存在，请勿重复提交")
-
-        # 构建微信支付请求参数
-        request_data = {
-            "out_request_no": out_request_no,
-            "amount": amount,
-            "account_type": account_type
-        }
-
-        if bank_memo:
-            request_data["bank_memo"] = bank_memo
-        if remark:
-            request_data["remark"] = remark
-        if notify_url:
-            request_data["notify_url"] = notify_url
-
-        try:
-            # 模拟调用微信支付接口（实际项目中替换为真实调用）
-            mock_response = {
-                "withdraw_id": f"WD{uuid.uuid4().hex[:16].upper()}",
-                "out_request_no": out_request_no,
-                "amount": amount,
-                "account_type": account_type,
-                "status": "INIT",
-                "create_time": datetime.now().strftime("%Y-%m-%dT%H:%M:%S+08:00")
-            }
-
-            # 记录提现申请到数据库
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """INSERT INTO merchant_withdraw_records 
-                           (out_request_no, withdraw_id, amount, account_type, 
-                            bank_memo, remark, status, notify_url, created_at)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())""",
-                        (
-                            out_request_no,
-                            mock_response["withdraw_id"],
-                            amount,
-                            account_type,
-                            bank_memo,
-                            remark,
-                            "INIT",
-                            notify_url
-                        )
-                    )
-
-                    # 记录资金池流水（从平台收入池扣除）
-                    self._add_pool_balance(
-                        cur,
-                        'platform_revenue_pool',
-                        -Decimal(str(amount / 100)),  # 转换为元
-                        f"商户提现到银行卡 - 单号:{out_request_no}, 金额:{amount / 100:.2f}元",
-                        related_user=None
-                    )
-
-                    conn.commit()
-
-            logger.info(f"商户提现申请成功: withdraw_id={mock_response['withdraw_id']}")
-
-            return {
-                "withdraw_id": mock_response["withdraw_id"],
-                "out_request_no": out_request_no,
-                "amount": amount,
-                "amount_yuan": amount / 100,
-                "account_type": account_type,
-                "status": "INIT",
-                "status_text": "初始态，已提交申请",
-                "create_time": mock_response["create_time"],
-                "remark": remark,
-                "bank_memo": bank_memo
-            }
-
-        except Exception as e:
-            logger.error(f"商户提现申请失败: {e}", exc_info=True)
-            raise FinanceException(f"提现申请失败: {str(e)}")
+        """Unavailable until a real withdrawal provider is integrated."""
+        from fastapi import HTTPException
+        raise HTTPException(503, '商户提现供应商尚未接入，未创建申请或扣款')
 
     def query_merchant_withdraw_status(self, out_request_no: str) -> Dict[str, Any]:
         """
         查询商户提现状态
         ...
         """
-        logger.info(f"查询商户提现状态: out_request_no={out_request_no}")
+        logger.info('finance_operation_state')
 
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -7671,7 +7422,7 @@ class FinanceService:
         查询商户提现记录列表
         ...
         """
-        logger.info(f"查询商户提现记录列表: start_date={start_date}, end_date={end_date}, status={status}")
+        logger.info('finance_operation_state')
 
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -7913,7 +7664,7 @@ class FinanceService:
                         row_idx += 1
 
                     except Exception as e:
-                        logger.error(f"生成日报表时 {date_str} 数据失败: {e}")
+                        logger.error('finance_operation_failed')
                         # 继续处理下一天
                     current_date += timedelta(days=1)
 
@@ -8105,7 +7856,7 @@ class FinanceService:
                     if row:
                         return row['config_value']
         except Exception as e:
-            logger.error(f"读取系统配置 {key} 失败: {e}")
+            logger.error('finance_operation_failed')
         return default
 
     def get_user_true_total_points(self, user_id: int) -> Decimal:
@@ -8188,105 +7939,34 @@ class FinanceService:
                 conn.commit()
                 return count
 
-    def batch_exchange_coupons(self, max_per_user: Optional[int] = None) -> Dict[str, Any]:
-        """
-        批量将所有有雨点的用户雨点兑换为1元优惠券。
-
-        Args:
-            max_per_user: 每个用户发放的最大优惠券数量。
-                         如果为 None，则使用系统配置的上限（coupon_exchange_max_count），
-                         且如果用户雨点余额大于上限，则只发放上限数量。
-                         如果传入具体数值（正整数），则为每个用户发放 min(floor(雨点余额), max_per_user) 张优惠券。
-
-        Returns:
-            统计结果字典
-        """
-        from core.config import COUPON_VALID_DAYS
-        from datetime import datetime, timedelta
-
-        # 获取所有 true_total_points > 0 的用户
+    def batch_exchange_coupons(self, max_per_user: Optional[int] = None, *, actor_id: int, request_key: str) -> Dict[str, Any]:
+        """Each issuer request commits all eligible users or none."""
+        limit = max_per_user
+        if limit is None:
+            limit = int(self.get_system_config('coupon_exchange_max_count', default='10'))
+        limit = min(limit, 1000)
+        if limit < 1:
+            raise FinanceException('兑换上限必须为正整数')
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM users WHERE true_total_points > 0")
-                rows = cur.fetchall()
-                user_ids = [row['id'] for row in rows]
-
-        if not user_ids:
-            return {
-                'success_count': 0,
-                'total_users': 0,
-                'failed_users': [],
-                'total_coupons_issued': 0,
-                'message': '没有符合条件的用户'
-            }
-
-        success_count = 0
-        failed_users = []
-        total_coupons_issued = 0
-
-        # 如果未指定 max_per_user，则使用系统上限
-        use_system_limit = max_per_user is None
-        if use_system_limit:
-            max_count_str = self.get_system_config('coupon_exchange_max_count', default='10')
-            try:
-                max_count = int(max_count_str)
-            except (TypeError, ValueError):
-                max_count = 10
-        else:
-            # 防御：手动输入数量不能超过 1000（可根据需要调整）
-            if max_per_user > 1000:
-                max_per_user = 1000
-            if max_per_user <= 0:
-                return {
-                    'success_count': 0,
-                    'total_users': len(user_ids),
-                    'failed_users': [],
-                    'total_coupons_issued': 0,
-                    'message': '无效的兑换数量，必须大于0'
-                }
-
-        # 分批处理，避免单次事务过长
-        batch_size = 100
-        for i in range(0, len(user_ids), batch_size):
-            batch = user_ids[i:i + batch_size]
-            for user_id in batch:
-                try:
-                    # 获取用户雨点余额
-                    balance = self.get_user_true_total_points(user_id)
-                    if balance <= 0:
-                        continue
-
-                    # 计算应兑换张数
-                    if use_system_limit:
-                        count = int(balance)
-                        if count > max_count:
-                            count = max_count
-                    else:
-                        count = min(int(balance), max_per_user)
-
-                    if count <= 0:
-                        continue
-
-                    # 调用已有兑换方法
-                    actual = self.exchange_coupons(user_id, count)
-                    success_count += 1
-                    total_coupons_issued += actual
-
-                except Exception as e:
-                    logger.error(f"批量兑换失败 - 用户{user_id}: {e}")
-                    failed_users.append({'user_id': user_id, 'reason': str(e)})
-
-            # 每批提交后休息一下，避免数据库压力
-            import time
-            time.sleep(0.1)
-
-        return {
-            'success_count': success_count,
-            'total_users': len(user_ids),
-            'failed_users': failed_users,
-            'total_coupons_issued': total_coupons_issued,
-            'message': f'批量兑换完成，成功{success_count}人，失败{len(failed_users)}人，共发放{total_coupons_issued}张优惠券'
-        }
+                replay = begin_request(cur, actor_id, request_key, 'coupon_exchange', {'max_per_user': max_per_user})
+                if replay is not None:
+                    return replay
+                cur.execute('SELECT id,true_total_points FROM users WHERE true_total_points>0 ORDER BY id FOR UPDATE')
+                users = cur.fetchall()
+                issued = 0
+                success = 0
+                for user in users:
+                    count = min(int(Decimal(str(user['true_total_points']))), limit)
+                    for _ in range(count):
+                        self._distribute_coupon_internal(cur, user['id'], Decimal('1'))
+                    issued += count
+                    success += int(count > 0)
+                result = {'success_count': success, 'total_users': len(users), 'failed_users': [],
+                          'total_coupons_issued': issued, 'message': f'批量兑换完成，成功{success}人，共发放{issued}张优惠券'}
+                finish_request(cur, actor_id, request_key, result)
+            conn.commit()
+        return result
 
 
 # ==================== 订单系统财务功能（来自 order/finance.py） ====================
@@ -8340,23 +8020,12 @@ def split_order_funds(order_number: str, total: Decimal, is_vip: bool, cursor=No
     from core.database import get_conn
 
     if cursor is not None:
-        cur = cursor
-        use_external_cursor = True
+        _execute_split(cursor, order_number, total)
     else:
-        use_external_cursor = False
-
-    try:
-        if not use_external_cursor:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    _execute_split(cur, order_number, total)
-                    conn.commit()
-        else:
-            _execute_split(cur, order_number, total)
-    except Exception as e:
-        if not use_external_cursor:
-            raise
-        raise
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                _execute_split(cur, order_number, total)
+            conn.commit()
 
 
 def _execute_split(cur, order_number: str, total: Decimal):
@@ -8367,6 +8036,11 @@ def _execute_split(cur, order_number: str, total: Decimal):
         order_number: 订单号
         total: 订单总金额
     """
+    cur.execute('SELECT id FROM orders WHERE order_number=%s FOR UPDATE', (order_number,))
+    if not cur.fetchone():
+        raise FinanceException('分账订单不存在')
+    if begin_event(cur, 'legacy_split', order_number, order_number, {'total': format(total.quantize(Decimal('0.01')), 'f')}):
+        return
     # 动态读取配置（优先从 finance_accounts 行中读取 allocation）
     try:
         svc = FinanceService()
@@ -8377,13 +8051,13 @@ def _execute_split(cur, order_number: str, total: Decimal):
 
     # 单元级日志：记录订单与初始分配信息
     try:
-        logger.debug(f"_execute_split START order={order_number} total={total:.2f} merchant={merchant:.2f}")
+        logger.debug('finance_operation_detail')
         if 'allocs' in locals():
             try:
                 ratios_str = {k: str(v) for k, v in allocs.items()}
-                logger.debug(f"_execute_split ratios: {ratios_str}")
+                logger.debug('finance_operation_detail')
             except Exception:
-                logger.debug("_execute_split: 无法序列化 allocs 比例")
+                logger.debug('finance_operation_detail')
     except Exception:
         pass
 
@@ -8444,7 +8118,7 @@ def _execute_split(cur, order_number: str, total: Decimal):
         try:
             amt = total * ratio
             # 单元级日志：准备分配到指定资金池的金额与比例
-            logger.debug(f"_execute_split allocating to {account_type}: ratio={ratio} amt={amt:.2f}")
+            logger.debug('finance_operation_detail')
 
             # 确保 finance_accounts 中存在该账户类型
             cur.execute(
@@ -8478,75 +8152,83 @@ def _execute_split(cur, order_number: str, total: Decimal):
             )
             # 单元级日志：记录分配后余额
             try:
-                logger.debug(f"_execute_split {account_type} balance_after={Decimal(str(balance_after)):.2f}")
+                logger.debug('finance_operation_detail')
             except Exception:
-                logger.debug(f"_execute_split {account_type} balance_after (unserializable): {balance_after}")
-        except Exception as e:
-            logger.error(f"分配到池子 {account_type} 时出错: {e}")
+                logger.debug('finance_operation_detail')
+        except Exception:
+            raise
+    finish_event(cur, 'legacy_split', order_number)
 
 
-def reverse_split_on_refund(order_number: str):
-    """退款回冲：撤销订单分账"""
-    from core.database import get_conn
-    from decimal import Decimal
-
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            # 从 account_flow 查询商家分得金额
-            cur.execute(
-                """SELECT SUM(change_amount) AS m FROM account_flow 
-                   WHERE account_type='merchant_balance' AND remark LIKE %s AND flow_type='income'""",
-                (f"订单分账: {order_number}%",)
-            )
-            m = cur.fetchone()["m"] or Decimal("0")
-
-            if m > 0:
-                # 回冲商家余额
-                cur.execute(
-                    "UPDATE users SET merchant_balance=merchant_balance-%s WHERE id=1",
-                    (m,)
-                )
-                # 获取回冲后的余额
-                cur.execute("SELECT merchant_balance FROM users WHERE id=1")
-                merchant_balance_after = cur.fetchone()["merchant_balance"]
-                # 记录回冲流水
-                cur.execute(
-                    """INSERT INTO account_flow (account_type, change_amount, balance_after, flow_type, remark, created_at)
-                       VALUES (%s, %s, %s, %s, %s, NOW())""",
-                    ("merchant_balance", -m, merchant_balance_after, "expense", f"退款回冲: {order_number}")
-                )
-
-            # 回冲各个资金池
-            pool_mapping = {
-                "public": "public_welfare",
-                "maintain": "maintain_pool",
-                "subsidy": "subsidy_pool",
-                "director": "director_pool",
-                "shop": "shop_pool",
-                "city": "city_pool",
-                "branch": "branch_pool",
-                "fund": "fund_pool"
-            }
-
-            for pool_key, account_type in pool_mapping.items():
-                cur.execute(
-                    """SELECT SUM(change_amount) AS amt FROM account_flow 
-                       WHERE account_type=%s AND remark LIKE %s AND flow_type='income'""",
-                    (account_type, f"订单分账: {order_number}%")
-                )
-                pool_amt = cur.fetchone()["amt"] or Decimal("0")
-                if pool_amt > 0:
-                    cur.execute(
-                        "UPDATE finance_accounts SET balance = balance - %s WHERE account_type = %s",
-                        (pool_amt, account_type)
-                    )
-                    cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (account_type,))
-                    balance_after = cur.fetchone()["balance"]
-                    cur.execute(
-                        """INSERT INTO account_flow (account_type, change_amount, balance_after, flow_type, remark, created_at)
-                           VALUES (%s, %s, %s, %s, %s, NOW())""",
-                        (account_type, -pool_amt, balance_after, "expense", f"退款回冲: {order_number}")
-                    )
+def reverse_split_on_refund(order_number: str, external_conn=None, event_key=None, refund_amount=None):
+    """Reverse each refund's proportional share in the order transaction."""
+    def apply(cur):
+        cur.execute('SELECT id,total_amount FROM orders WHERE order_number=%s FOR UPDATE', (order_number,))
+        order = cur.fetchone()
+        if not order:
+            raise FinanceException('退款订单不存在')
+        total = Decimal(str(order['total_amount'] or 0))
+        amount = total if refund_amount is None else Decimal(str(refund_amount))
+        if amount < 0 or amount > total:
+            raise FinanceException('退款金额超出订单实付')
+        key = event_key or order_number
+        if begin_event(cur, 'refund_split', key, order_number, {'amount': format(amount.quantize(Decimal('0.01')), 'f')}):
+            return
+        cur.execute("SELECT result_json FROM finance_events WHERE order_number=%s AND event_kind='refund_split' AND result_json IS NOT NULL FOR UPDATE", (order_number,))
+        prior = [json.loads(r['result_json']) if isinstance(r['result_json'], str) else r['result_json'] for r in cur.fetchall()]
+        refunded = sum((Decimal(r['amount']) for r in prior), Decimal('0'))
+        if refunded + amount > total:
+            raise FinanceException('累计退款超过订单实付')
+        # Match whole order tokens, never wildcard/order-number prefixes.
+        prefix_a, prefix_b = f'订单分账: {order_number}', f'订单#{order_number}'
+        offline_prefix = f'线下订单#{order_number} '
+        offline_allocation = f'线下订单分配: {order_number} -> '
+        cur.execute(
+            "SELECT account_type,SUM(change_amount) AS delta FROM account_flow "
+            "WHERE (remark=%s OR LEFT(remark,%s)=%s OR LEFT(remark,%s)=%s "
+            "OR remark IN (%s,%s,%s) OR LEFT(remark,%s)=%s OR LEFT(remark,%s)=%s) "
+            "AND account_type NOT IN ('true_total_points','coupon','referral_points','team_points') "
+            "AND NOT (account_type='platform_revenue_pool' AND LEFT(remark,%s)=%s) GROUP BY account_type ORDER BY account_type",
+            (prefix_a, len(prefix_a)+1, prefix_a+' ', len(prefix_b)+1, prefix_b+' ',
+             f'线下订单收入: {order_number}', f'线下订单平台积分: {order_number}', f'线下订单商家结算: {order_number}',
+             len(offline_prefix), offline_prefix, len(offline_allocation), offline_allocation,
+             len(prefix_a+' 平台收入'), prefix_a+' 平台收入'),
+        )
+        applied = {}
+        for row in cur.fetchall():
+            account = row['account_type']
+            original = Decimal(str(row['delta'] or 0))
+            previous = sum((Decimal(r.get('accounts', {}).get(account, '0')) for r in prior), Decimal('0'))
+            target = (original * (refunded + amount) / total).quantize(Decimal('0.0001')) if total else original
+            delta = target - previous
+            if not delta:
+                continue
+            if account == 'merchant_balance':
+                cur.execute('SELECT merchant_balance FROM users WHERE id=%s FOR UPDATE', (PLATFORM_MERCHANT_ID,))
+                user = cur.fetchone()
+                if not user:
+                    raise FinanceException('结算商户不存在')
+                balance = Decimal(str(user['merchant_balance'] or 0)) - delta
+                cur.execute('UPDATE users SET merchant_balance=%s WHERE id=%s', (balance, PLATFORM_MERCHANT_ID))
+            else:
+                cur.execute('SELECT balance FROM finance_accounts WHERE account_type=%s FOR UPDATE', (account,))
+                pool = cur.fetchone()
+                if not pool:
+                    raise FinanceException('结算资金池不存在')
+                balance = Decimal(str(pool['balance'] or 0)) - delta
+                cur.execute('UPDATE finance_accounts SET balance=%s WHERE account_type=%s', (balance, account))
+            cur.execute("INSERT INTO account_flow(account_type,change_amount,balance_after,flow_type,remark,created_at) VALUES(%s,%s,%s,%s,%s,NOW())",
+                        (account, -delta, balance, 'expense' if delta > 0 else 'income', f'退款回冲: {order_number}'))
+            applied[account] = str(delta)
+        cur.execute("UPDATE finance_events SET result_json=%s WHERE event_kind='refund_split' AND event_key=%s",
+                    (json.dumps({'amount': str(amount), 'accounts': applied}), key))
+    if external_conn is not None:
+        with external_conn.cursor() as cur:
+            apply(cur)
+    else:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                apply(cur)
             conn.commit()
 
 
@@ -8706,5 +8388,4 @@ def generate_statement():
                 (1, yesterday, opening, income, withdraw_amount, closing)
             )
             conn.commit()
-
 

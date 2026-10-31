@@ -37,7 +37,7 @@ def _load_cert_serial_no(cert_path: str) -> str:
         logger.info(f"[WeChat] loaded merchant cert serial_no from {path}: {serial}")
         return serial
     except Exception as exc:
-        logger.warning(f"[WeChat] unable to load cert serial_no: {exc}")
+        logger.warning('payment_cert_load_failed')
         return ""
 
 
@@ -221,12 +221,19 @@ class OfflineService:
             with conn.cursor(pymysql.cursors.DictCursor) as cur:
                 # 1. 查询订单原始金额（仅用订单号，移除商家ID条件）
                 cur.execute(
-                    "SELECT amount, status, merchant_id, user_id, store_name FROM offline_order WHERE order_no=%s",
+                    "SELECT amount,paid_amount,coupon_ids,coupon_id,status,merchant_id,user_id,store_name,security_prepay_frozen FROM offline_order WHERE order_no=%s FOR UPDATE",
                     (order_no,)
                 )
                 row = cur.fetchone()
                 if not row or row["status"] != 1:
                     raise ValueError("订单不存在或不可支付")
+                if row.get('user_id') is not None and int(row['user_id']) != int(user_id):
+                    raise ValueError('无权支付该订单')
+                cur.execute('SELECT openid FROM users WHERE id=%s', (user_id,))
+                payer = cur.fetchone()
+                if not payer or payer.get('openid') != openid:
+                    raise ValueError('支付身份不匹配')
+                cur.execute('UPDATE offline_order SET user_id=%s WHERE order_no=%s', (user_id, order_no))
 
                 original_amount: int = row["amount"]
                 final_amount = original_amount
@@ -235,6 +242,10 @@ class OfflineService:
                     coupon_ids=coupon_ids,
                     coupon_id=coupon_id,
                 )
+                if row.get('security_prepay_frozen'):
+                    from services.finance_service import parse_offline_coupon_ids
+                    if target_coupon_ids != parse_offline_coupon_ids(row):
+                        raise ValueError('订单优惠已锁定')
 
                 # 2. 验证并应用优惠券（支持多张叠加）
                 if target_coupon_ids:
@@ -270,54 +281,23 @@ class OfflineService:
                         coupon_ids=%s,
                         coupon_discount=%s,
                         paid_amount=%s,
-                        updated_at=NOW()
+                        security_prepay_frozen=1, updated_at=NOW()
                     WHERE order_no=%s""",
                     (primary_coupon_id, coupon_ids_json, coupon_discount, final_amount, order_no)
                 )
-                if cur.rowcount == 0:
-                    logger.error(f"[Offline] 更新订单 {order_no} paid_amount 失败，影响行数为0")
-                    raise ValueError("订单状态异常，无法更新实付金额")
-
-                # 显式提交事务，确保数据持久化
+                if final_amount <= 0:
+                    for cid in target_coupon_ids:
+                        cur.execute("UPDATE coupons SET status='used',used_at=NOW() WHERE id=%s AND user_id=%s AND status='unused' AND valid_to>=CURDATE()", (cid, user_id))
+                        if cur.rowcount != 1:
+                            raise ValueError('优惠券不可用')
+                    cur.execute('UPDATE offline_order SET status=2,pay_time=NOW() WHERE order_no=%s', (order_no,))
+                    await OfflineService.on_paid(order_no, Decimal(0), Decimal(coupon_discount)/100, external_conn=conn)
+                    cur.execute('INSERT INTO payment_events(event_key,order_number,transaction_id,total_fee) VALUES(%s,%s,%s,0)', ('pay:' + order_no, order_no, 'zero:' + order_no))
                 conn.commit()
-                logger.info(f"[Offline] 订单 {order_no} 事务已提交")
-
-                # 再次查询更新后的 paid_amount 并记录
-                cur.execute("SELECT paid_amount FROM offline_order WHERE order_no=%s", (order_no,))
-                updated = cur.fetchone()
-                logger.info(
-                    f"[Offline] 订单 {order_no} 提交后 paid_amount={updated['paid_amount'] if updated else None}")
 
         # ==================== 零元订单处理 ====================
         if final_amount <= 0:
-            logger.info(f"[Offline] 零元订单，无需支付: {order_no}")
-
-            # ========== 主动核销优惠券（因为无微信回调）==========
-            zero_coupon_ids = OfflineService._merge_offline_coupon_ids(
-                coupon_ids=coupon_ids,
-                coupon_id=coupon_id,
-            )
-            if zero_coupon_ids:
-                try:
-                    from services.finance_service import FinanceService
-                    fs = FinanceService()
-                    for cid in zero_coupon_ids:
-                        fs.use_coupon(
-                            coupon_id=int(cid),
-                            user_id=user_id,
-                            order_type="normal"
-                        )
-                    logger.info(f"[Offline] 零元订单优惠券核销成功: {zero_coupon_ids}")
-                except Exception as e:
-                    # 优惠券核销失败不影响订单完成，但需记录错误人工处理
-                    logger.error(f"[Offline] 零元订单优惠券核销失败（需人工处理）: {e}")
-
-            # 同步调用资金分账和状态更新
-            transfer_warn = await OfflineService.on_paid(
-                order_no=order_no,
-                amount=Decimal(final_amount) / 100,  # 转为元
-                coupon_discount=Decimal(coupon_discount) / 100
-            )
+            transfer_warn = None
             # 生成模拟支付参数（与线上订单保持一致）
             import uuid, time
             pay_params = {
@@ -339,8 +319,7 @@ class OfflineService:
             return out_zero
         # ===================================================
 
-        # 金额兜底：库内为 0 或异常时用前端传的 total_fee（分），避免微信报「缺少参数 total_fee」
-        amount_for_wx = final_amount if final_amount and final_amount > 0 else (total_fee or 0)
+        amount_for_wx = final_amount
         if amount_for_wx <= 0:
             raise ValueError("订单金额异常或未传 total_fee，无法发起支付")
 
@@ -368,7 +347,7 @@ class OfflineService:
                     "paySign": "MOCK_SIGN_PLACEHOLDER",  # Mock 签名，前端可识别
                 }
 
-                logger.info(f"[MOCK] 返回支付参数: {pay_params}")
+                logger.info('mock_offline_prepay_created')
             else:
                 # 真实微信支付模式
                 logger.info(f"[WeChatPay] 调用真实统一下单: order_no={order_no}, amount={amount_for_wx}")
@@ -384,10 +363,10 @@ class OfflineService:
 
                 prepay_id = wx_response.get('prepay_id')
                 if not prepay_id:
-                    logger.error(f"微信统一下单失败: {wx_response}")
-                    raise ValueError(f"微信统一下单失败: {wx_response.get('message', '未知错误')}")
+                    logger.error('offline_prepay_missing')
+                    raise ValueError('微信统一下单失败')
 
-                logger.info(f"[WeChatPay] 获取 prepay_id 成功: {prepay_id}")
+                logger.info('offline_prepay_created')
 
                 # 使用核心客户端生成前端支付参数（包含真实签名）
                 pay_params = wxpay_client.generate_jsapi_pay_params(prepay_id)
@@ -401,8 +380,8 @@ class OfflineService:
             }
 
         except Exception as e:
-            logger.error(f"微信支付调用失败: {e}", exc_info=True)
-            raise ValueError(f"支付调用失败: {str(e)}")
+            logger.error('offline_provider_failed')
+            raise ValueError('支付服务暂时不可用') from None
 
     # ---------- 5. 订单列表 ----------
     @staticmethod
@@ -475,74 +454,15 @@ class OfflineService:
     # ---------- 6. 退款 ----------
     @staticmethod
     async def refund(order_no: str, refund_amount: Optional[int], user_id: int):
-        current_user_id = str(user_id)
-        out_refund_no = None  # 🔧 提前定义，避免作用域问题
-        
+        from services.refund_service import RefundService
+        from core.auth import is_platform_admin
         with get_conn() as conn:
-            with conn.cursor(pymysql.cursors.DictCursor) as cur:
-                # 🔧 修改1：增加查询 transaction_id 和 paid_amount
-                cur.execute(
-                    "SELECT id, amount, paid_amount, status, transaction_id FROM offline_order WHERE order_no=%s AND merchant_id=%s",
-                    (order_no, current_user_id)
-                )
+            with conn.cursor() as cur:
+                cur.execute('SELECT merchant_id FROM offline_order WHERE order_no=%s', (order_no,))
                 row = cur.fetchone()
-                if not row or row["status"] != 2:
-                    raise ValueError("订单未支付或状态异常")
-                
-                # 🔧 修改2：使用实际支付金额（paid_amount）而非订单金额
-                total_fee = int(row["paid_amount"]) if row["paid_amount"] else int(row["amount"])
-                refund_fee = refund_amount or total_fee
-                transaction_id = row.get("transaction_id")
-                
-                if not transaction_id:
-                    raise ValueError("订单缺少微信交易号，无法退款")
-                
-                # 🔧 修改3：生成唯一退款单号
-                import time
-                out_refund_no = f"REF{order_no}_{int(time.time())}"
-                
-                # 🔧 修改4：调用微信退款接口（关键修改）
-                try:
-                    from core.wx_pay_client import wxpay_client
-                    logger.info(f"[Offline] 调用微信退款: order_no={order_no}, transaction_id={transaction_id}, refund_fee={refund_fee}")
-                    
-                    wx_result = wxpay_client.refund(
-                        transaction_id=transaction_id,
-                        out_refund_no=out_refund_no,
-                        total_fee=total_fee,
-                        refund_fee=refund_fee,
-                        notify_url=f"{settings.WECHAT_PAY_NOTIFY_URL}/refund-notify" if settings.WECHAT_PAY_NOTIFY_URL else None
-                    )
-                    
-                    logger.info(f"[Offline] 微信退款申请成功: {wx_result}")
-                    
-                    # 🔧 修改5：更新订单状态为退款处理中（status=4），并记录退款单号
-                    cur.execute(
-                        """UPDATE offline_order 
-                        SET status=4, 
-                            refund_id=%s,
-                            refund_time=NOW(),
-                            updated_at=NOW() 
-                        WHERE order_no=%s AND merchant_id=%s""",
-                        (out_refund_no, order_no, current_user_id)
-                    )
-                    conn.commit()
-                    
-                except Exception as wx_err:
-                    logger.error(f"[Offline] 微信退款申请失败: {wx_err}", exc_info=True)
-                    conn.rollback()
-                    raise ValueError(f"微信退款申请失败: {str(wx_err)}")
-                
-                # 🔧 修改6：内部账务处理（放在微信调用之后）
-                try:
-                    await FinanceService.refund_order(order_no)
-                except Exception as finance_err:
-                    logger.error(f"[Offline] 内部账务退款失败（需人工处理）: {finance_err}", exc_info=True)
-                    # 不抛出异常，因为微信退款已成功，仅记录日志
-
-        # ✅ 修正缩进：这两行必须在方法内部，与 with 块同级
-        logger.info(f"[Offline] 退款申请提交成功: {order_no}, 退款单号={out_refund_no}, 金额={refund_fee}")
-        return {"refund_no": out_refund_no, "status": "processing", "message": "退款申请已提交，等待微信处理"}
+                if not row or int(row['merchant_id']) != int(user_id):
+                    raise ValueError('无权退款该订单')
+        return RefundService.request(order_no, {'id': user_id}, refund_fee=refund_amount, audit=False, merchant_address=None, merchant_actor=True)
 
     # ---------- 7. 收款码状态 ----------
     @staticmethod
@@ -583,6 +503,7 @@ class OfflineService:
         amount: Decimal,
         coupon_discount: Decimal = Decimal(0),
         transaction_id: Optional[str] = None,
+        external_conn=None,
     ) -> Optional[str]:
         """
         线下订单支付成功后的处理：
@@ -594,7 +515,8 @@ class OfflineService:
         若微信「商家转账」失败（如 SIGN_ERROR），仅记录日志并返回告警文案，不抛异常，
         避免零元单已核销优惠券后接口仍返回 400。
         """
-        with get_conn() as conn:
+        from contextlib import nullcontext
+        with (nullcontext(external_conn) if external_conn is not None else get_conn()) as conn:
             with conn.cursor(pymysql.cursors.DictCursor) as cur:
                 # 查询订单信息
                 cur.execute(
@@ -727,24 +649,16 @@ class OfflineService:
                     cur, 'platform_revenue_pool', -merchant_amount,
                     f"线下订单商家结算: {order_no}", merchant_id
                 )
+                if merchant_amount > 0:
+                    import hashlib
+                    batch = 'MT' + hashlib.sha256(order_no.encode()).hexdigest()[:30]
+                    cur.execute('SELECT openid FROM users WHERE id=%s', (merchant_id,))
+                    merchant = cur.fetchone()
+                    cur.execute('INSERT INTO payment_merchant_transfers(order_number,merchant_id,beneficiary_openid,amount,out_batch_no) VALUES(%s,%s,%s,%s,%s)', (order_no, merchant_id, merchant.get('openid') if merchant else None, int(merchant_amount * 100), batch))
 
-                conn.commit()
+                if external_conn is None:
+                    conn.commit()
 
-        # 5. 异步通知商家转账（转账金额基于完整基数）
-        if merchant_amount > 0:
-            try:
-                await notify_merchant(
-                    merchant_id=merchant_id,
-                    order_no=order_no,
-                    amount=int(merchant_amount * 100)  # 转换为分
-                )
-            except Exception as e:
-                msg = str(e)
-                logger.error(
-                    f"[on_paid] 商家转账失败（订单已分账入库，需人工核对/修证书） order={order_no}: {msg}",
-                    exc_info=True,
-                )
-                return msg
         return None
 
     @staticmethod
@@ -807,7 +721,7 @@ class OfflineService:
                         qr_im.save(buf, format="PNG")
                         qrcode_bytes = buf.getvalue()
                 except Exception as e:
-                    logger.warning(f"叠加商户头像失败: {e}")
+                    logger.warning('merchant_qrcode_avatar_failed')
             # ==========================================
 
             qrcode_base64 = base64.b64encode(qrcode_bytes).decode()
@@ -854,7 +768,7 @@ class OfflineService:
                 normal_qrcode_b64 = base64.b64encode(buf.getvalue()).decode()
                 normal_qrcode_data_url = f"data:image/png;base64,{normal_qrcode_b64}"
             except Exception as e:
-                logger.warning(f"生成普通二维码失败: {e}")
+                logger.warning('merchant_qrcode_render_failed')
             # =================================
 
             return {
@@ -866,7 +780,7 @@ class OfflineService:
                 "merchant_id": merchant_id
             }
         except Exception as e:
-            logger.error(f"生成商户{merchant_id}永久二维码失败: {e}", exc_info=True)
+            logger.error('merchant_qrcode_failed')
             raise
 
     # ==============================================================

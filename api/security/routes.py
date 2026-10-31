@@ -12,54 +12,51 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from core.auth import get_current_user
-from core.logging import get_logger
-from services.wechat_api import msg_sec_check
-
-logger = get_logger(__name__)
+from services.wechat_api import check_text_security
 
 router = APIRouter()
 
 
 class MsgSecCheckReq(BaseModel):
     content: str = Field(..., min_length=1, max_length=2500, description="待检测文本内容")
-    scene: int = Field(1, ge=1, le=4, description="场景值：1=资料,2=评论,3=论坛,4=社交日志")
-    openid: Optional[str] = Field(None, description="用户 openid（不传则使用当前登录用户的 openid）")
+    scene: int = Field(1, strict=True, ge=1, le=4, description="场景值：1=资料,2=评论,3=论坛,4=社交日志")
+    openid: Optional[str] = Field(None, max_length=128, description="可省略；如提供，必须等于登录用户 openid，不能指定他人身份")
+
+    @field_validator("content")
+    @classmethod
+    def nonblank_content(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("内容不能为空白")
+        return value
 
 
-@router.post("/msg-sec-check", summary="内容安全检测（msgSecCheck）")
+class MsgSecCheckResp(BaseModel):
+    passed: bool = Field(alias="pass", description="仅明确合规时为 true；false 时禁止提交")
+    message: str = Field(description="用户提示，不包含微信原始响应或敏感信息")
+
+
+@router.post("/msg-sec-check", response_model=MsgSecCheckResp, summary="内容安全检测（msgSecCheck）")
 async def msg_sec_check_endpoint(
     body: MsgSecCheckReq,
     user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """检测文本是否违规；违规时返回 pass=false，前端据此提示用户。"""
-    content = body.content.strip()
-    if not content:
-        return {"pass": True, "message": "内容为空"}
-
-    # 优先使用请求中的 openid，否则使用当前登录用户的 openid
-    openid = (body.openid or "").strip() or (user or {}).get("openid") or ""
-
-    try:
-        result = await msg_sec_check(content, scene=body.scene, openid=openid)
-    except Exception as e:
-        logger.error("内容安全检测失败，降级放行: %s", e, exc_info=True)
-        return {"pass": True, "message": "检测服务不可用"}
-
-    errcode = int(result.get("errcode") or 0)
-    errmsg = result.get("errmsg") or ""
-
-    if errcode == 0:
-        return {"pass": True, "message": "内容合规"}
-    if errcode == 87014:
-        logger.info("内容安全检测命中违规: scene=%s errmsg=%s", body.scene, errmsg)
-        return {"pass": False, "message": "内容含有违规信息，请修改后重试"}
-
-    # 其他错误码（如参数错误、频控等）：记录日志并降级放行，避免阻塞正常业务
-    logger.error("内容安全检测返回异常 errcode=%s errmsg=%s", errcode, errmsg)
-    return {"pass": True, "message": "检测服务异常，降级放行"}
+    """保留 HTTP 200 业务拦截契约；异常不能成为发布许可。"""
+    openid = user.get("openid") or ""
+    if not openid:
+        return {"pass": False, "message": "请先登录微信小程序后重试"}
+    if body.openid is not None and body.openid != openid:
+        return {"pass": False, "message": "openid 与当前登录用户不匹配"}
+    decision = await check_text_security(body.content, scene=body.scene, openid=openid)
+    messages = {
+        "pass": "内容合规",
+        "risky": "内容含有违规信息，请修改后重试",
+        "review": "内容需进一步审核，暂不可提交",
+        "unavailable": "检测服务暂不可用，请稍后重试",
+    }
+    return {"pass": decision == "pass", "message": messages[decision]}
 
 
 def register_security_routes(app) -> None:

@@ -9,6 +9,7 @@ from core.config import BASE_PIC_DIR, CATEGORY_CHOICES
 from core.table_access import build_dynamic_select, get_table_structure
 from pypinyin import lazy_pinyin, Style
 from core.auth import get_current_user
+from services.wechat_api import require_safe_text
 from core.logging import get_logger  # ✅ 新增：日志
 
 logger = get_logger(__name__)  # ✅ 新增：模块级 logger
@@ -39,6 +40,39 @@ def register_routes(app):
     app.include_router(router, prefix="/api", tags=["商品管理"])
     app.include_router(product_ext_router, prefix="/api", tags=["商品管理"])
 
+
+def _decode_public_json(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            return value
+    return value
+
+def _public_texts(value: Any, path: str = "content"):
+    """Yield public string leaves and dictionary keys with their request path."""
+    if isinstance(value, str):
+        yield path, value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str):
+                yield f"{path}.{key} (key)", key
+            yield from _public_texts(item, f"{path}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            yield from _public_texts(item, f"{path}[{index}]")
+
+
+async def _review_product_texts(values: List[Any], openid: Optional[str]) -> None:
+    """Review each final public text leaf independently before persistence."""
+    if not openid:
+        raise HTTPException(status_code=403, detail="当前账户未绑定微信审核身份")
+    for path, value in values:
+        for field_path, text in _public_texts(value, path):
+            if len(text) > 2500:
+                raise HTTPException(status_code=400, detail=f"文本字段超过2500字：{field_path}")
+            if text.strip():
+                await require_safe_text(text, openid=openid, scene=1)
 
 def to_pinyin(text: str) -> str:
     return " ".join(lazy_pinyin(text, style=Style.NORMAL)).upper()
@@ -476,7 +510,7 @@ def get_product(id: int):
 
 # ✅ 新增商品（需要登录且必须是商家或平台）
 @router.post("/products", summary="➕ 新增商品")
-def add_product(
+async def add_product(
     payload: ProductCreate,
     current_user: Dict[str, Any] = Depends(get_current_user)  # 新增依赖
 ):
@@ -486,6 +520,14 @@ def add_product(
     merchant_type = current_user.get('is_merchant', 0)
     if merchant_type not in [1, 2]:
         raise HTTPException(status_code=403, detail="只有商家或平台可以发布商品")
+    await _review_product_texts(
+        [("name", payload.name), ("description", payload.description),
+         ("category", payload.category), ("buy_rule", payload.buy_rule),
+         ("attributes", payload.attributes),
+         ("skus", [sku.specifications for sku in payload.skus]),
+         ("skus.sku_code", [sku.sku_code for sku in payload.skus])],
+        current_user.get("openid"),
+    )
 
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -521,7 +563,8 @@ def add_product(
                         price,
                         sku.original_price,
                         sku.stock,
-                        json.dumps(sku.specifications, ensure_ascii=False) if sku.specifications else None
+                        json.dumps(_decode_public_json(sku.specifications), ensure_ascii=False)
+                        if sku.specifications is not None else None
                     ))
 
                 # 插入 attributes
@@ -574,7 +617,7 @@ def add_product(
                         "data": build_product_dict(product, skus, attributes)}
             except Exception as e:
                 conn.rollback()
-                raise HTTPException(status_code=400, detail=f"创建商品失败: {str(e)}")
+                raise HTTPException(status_code=400, detail="创建商品失败")
 
 
 @router.put("/products/home-recommend", summary="⚙️ 批量设置商品首页推荐")
@@ -606,24 +649,83 @@ def set_home_recommend(
 
 # ✅ 更新商品（需要登录且必须是商品拥有者或平台管理员）
 @router.put("/products/{id}", summary="✏️ 更新商品")
-def update_product(
+async def update_product(
     id: int,
     payload: ProductUpdate,
     current_user: Dict[str, Any] = Depends(get_current_user)  # 新增依赖
 ):
     with get_conn() as conn:
         with conn.cursor() as cur:
+            select_sql = build_dynamic_select(cur, "products", where_clause="id = %s")
+            cur.execute(select_sql, (id,))
+            snapshot_product = cur.fetchone()
+            if not snapshot_product:
+                raise HTTPException(status_code=404, detail="商品不存在")
+            if current_user.get("is_merchant") != 2 and int(snapshot_product["user_id"]) != int(current_user["id"]):
+                raise HTTPException(status_code=403, detail="无权修改该商品")
+            cur.execute("SELECT id, sku_code, specifications FROM product_skus WHERE product_id=%s ORDER BY id", (id,))
+            snapshot_skus = [
+                {"id": row["id"], "sku_code": row["sku_code"],
+                 "specifications": _decode_public_json(row.get("specifications"))}
+                for row in cur.fetchall()
+            ]
+            cur.execute("SELECT id, name, value FROM product_attributes WHERE product_id=%s ORDER BY id", (id,))
+            snapshot_attributes = cur.fetchall()
+
+    reviewed_skus = snapshot_skus
+    if payload.skus:
+        reviewed_skus = []
+        for sku in payload.skus:
+            if sku.id:
+                current = next((row for row in snapshot_skus if row["id"] == sku.id), None)
+                if current is None:
+                    raise HTTPException(status_code=400, detail="SKU不属于此商品")
+            else:
+                current = {}
+            reviewed_skus.append({
+                "id": sku.id,
+                "sku_code": sku.sku_code if sku.sku_code is not None else current.get("sku_code"),
+                "specifications": _decode_public_json(
+                    sku.specifications if sku.specifications is not None else current.get("specifications")
+                ),
+            })
+    reviewed_attributes = payload.attributes if payload.attributes is not None else snapshot_attributes
+    await _review_product_texts(
+        [("name", payload.name if payload.name is not None else snapshot_product.get("name")),
+         ("description", payload.description if payload.description is not None else snapshot_product.get("description")),
+         ("category", payload.category if payload.category is not None else snapshot_product.get("category")),
+         ("buy_rule", payload.buy_rule if payload.buy_rule is not None else snapshot_product.get("buy_rule")),
+         ("attributes", reviewed_attributes), ("skus", reviewed_skus)],
+        current_user.get("openid"),
+    )
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
             try:
                 # 检查商品是否存在并获取其 user_id
-                select_sql = build_dynamic_select(cur, "products", where_clause="id = %s")
+                select_sql = build_dynamic_select(cur, "products", where_clause="id = %s") + " FOR UPDATE"
                 cur.execute(select_sql, (id,))
                 product = cur.fetchone()
                 if not product:
                     raise HTTPException(status_code=404, detail="商品不存在")
+                if current_user.get("is_merchant") != 2 and int(product["user_id"]) != int(current_user["id"]):
+                    raise HTTPException(status_code=403, detail="无权修改该商品")
+                cur.execute("SELECT id, sku_code, specifications FROM product_skus WHERE product_id=%s ORDER BY id FOR UPDATE", (id,))
+                current_skus = cur.fetchall()
+                cur.execute("SELECT id, name, value FROM product_attributes WHERE product_id=%s ORDER BY id FOR UPDATE", (id,))
+                current_attributes = cur.fetchall()
+                product_text_fields = ("name", "description", "category", "buy_rule")
+                if (
+                    {key: product.get(key) for key in product_text_fields}
+                    != {key: snapshot_product.get(key) for key in product_text_fields}
+                    or [{"id": row["id"], "sku_code": row["sku_code"], "specifications": _decode_public_json(row.get("specifications"))} for row in current_skus]
+                    != snapshot_skus
+                    or [dict(row) for row in current_attributes] != snapshot_attributes
+                ):
+                    raise HTTPException(status_code=409, detail="商品内容已被其他请求修改，请重新加载后提交")
 
-                # 权限校验：必须是商品拥有者或平台管理员
                 if product['user_id'] != current_user['id'] and current_user.get('is_merchant') != 2:
-                    raise HTTPException(status_code=403, detail="您没有权限修改此商品")
+                    raise HTTPException(status_code=403, detail="无权修改此商品")
 
                 # 如果试图更改 user_id，只有平台管理员允许
                 if payload.user_id is not None and payload.user_id != product['user_id']:
@@ -680,12 +782,12 @@ def update_product(
                                 sku_update.price,
                                 sku_update.original_price,
                                 sku_update.stock,
-                                json.dumps(sku_update.specifications, ensure_ascii=False)
-                                if sku_update.specifications else None
+                                json.dumps(_decode_public_json(sku_update.specifications), ensure_ascii=False)
+                                if sku_update.specifications is not None else None
                             ))
                             new_sku_id = cur.lastrowid
                             provided_sku_ids.append(new_sku_id)
-                            logger.info(f"✅ 新增SKU: {sku_update.sku_code} (ID: {new_sku_id})")  # ✅ 替换 print
+                            logger.info("Created product SKU: id=%s", new_sku_id)
                             continue
 
                         provided_sku_ids.append(sku_update.id)
@@ -706,13 +808,13 @@ def update_product(
                             sku_params.append(sku_update.stock)
                         if sku_update.specifications is not None:
                             sku_fields.append("specifications = %s")
-                            sku_params.append(json.dumps(sku_update.specifications, ensure_ascii=False))
+                            sku_params.append(json.dumps(_decode_public_json(sku_update.specifications), ensure_ascii=False))
 
                         if sku_fields:
                             cur.execute("SELECT 1 FROM product_skus WHERE id = %s AND product_id = %s",
                                         (sku_update.id, id))
                             if not cur.fetchone():
-                                raise HTTPException(status_code=400, detail=f"SKU ID {sku_update.id} 不属于商品 {id}")
+                                raise HTTPException(status_code=400, detail="SKU不属于此商品")
 
                             sku_params.extend([sku_update.id, id])
                             from core.table_access import build_select_list
@@ -721,7 +823,7 @@ def update_product(
                                 SET {build_select_list(sku_fields)}, updated_at = NOW()
                                 WHERE id = %s AND product_id = %s
                             """, tuple(sku_params))
-                            logger.info(f"✅ 更新SKU ID {sku_update.id}")  # ✅ 替换 print
+                            logger.info("Updated product SKU")
 
                     if provided_sku_ids:
                         format_ids = ','.join(['%s'] * len(provided_sku_ids))
@@ -733,9 +835,9 @@ def update_product(
 
                         deleted_count = cur.rowcount
                         if deleted_count > 0:
-                            logger.info(f"✅ 删除 {deleted_count} 个未提及的SKU")  # ✅ 替换 print
+                            logger.info("Removed omitted product SKUs: count=%s", deleted_count)
                     else:
-                        logger.warning("⚠️ 未提供任何SKU ID，跳过删除逻辑")  # ✅ 替换 print
+                        logger.warning("Empty SKU update list; no SKUs deleted")
 
                 elif new_is_member is True:
                     cur.execute("""
@@ -743,7 +845,7 @@ def update_product(
                         SET price = 1980.00, updated_at = NOW()
                         WHERE product_id = %s
                     """, (id,))
-                    logger.info("✅ 会员商品：强制所有SKU价格为1980")  # ✅ 替换 print
+                    logger.info("Member product SKU prices set")
 
                 # 更新 attributes
                 if payload.attributes is not None:
@@ -798,7 +900,7 @@ def update_product(
                 raise
             except Exception as e:
                 conn.rollback()
-                raise HTTPException(status_code=400, detail=f"更新商品失败: {str(e)}")
+                raise HTTPException(status_code=400, detail="更新商品失败")
 
 
 # ✅ 删除商品（需要登录且必须是商品拥有者或平台管理员，同时检查未完成订单）
@@ -867,11 +969,11 @@ def delete_product(
                             file_path = Path(str(BASE_PIC_DIR)) / relative_path
                             if file_path.exists():
                                 file_path.unlink()
-                                logger.info(f"✅ 已删除商品图片文件: {file_path}")  # ✅ 替换 print
+                                logger.info("Deleted product image")
                             else:
-                                logger.warning(f"⚠️ 文件不存在: {file_path}")  # ✅ 新增（原无，但可统一处理）
+                                logger.warning("Product image file missing")
                         except Exception as e:
-                            logger.warning(f"⚠️ 删除图片文件失败 {url}: {e}")  # ✅ 替换 print
+                            logger.warning("Unable to delete product image: error_type=%s", type(e).__name__)
 
                 return {
                     "status": "success",
@@ -1160,11 +1262,11 @@ def delete_images(
                         file_path = Path(str(BASE_PIC_DIR)) / relative_path
                         if file_path.exists():
                             file_path.unlink()
-                            logger.info(f"✅ 已删除文件: {file_path}")  # ✅ 替换 print
+                            logger.info("Deleted product image")
                         else:
-                            logger.warning(f"⚠️ 文件不存在: {file_path}")  # ✅ 替换 print
+                            logger.warning("Product image file missing")
                     except Exception as e:
-                        logger.warning(f"⚠️ 删除文件失败 {url}: {e}")  # ✅ 替换 print
+                        logger.warning("Unable to delete product image: error_type=%s", type(e).__name__)
 
                 conn.commit()
 

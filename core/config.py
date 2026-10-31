@@ -29,6 +29,20 @@ class Settings(BaseSettings):
 
     ENABLE_UUID_AUTH: int = 0
 
+    SECURITY_ISOLATION_RUN_ID: str = ""
+    SECURITY_ISOLATION_RESOURCE_DIR: str = ""
+    ENABLE_BACKGROUND_TASKS: bool = True
+    SMS_SECRET_ID: str = ""
+    SMS_SECRET_KEY: SecretStr = SecretStr("")
+    SMS_SDK_APP_ID: str = ""
+    SMS_SIGN_NAME: str = ""
+    SMS_RESET_TEMPLATE_ID: str = ""
+    SMS_BANKCARD_TEMPLATE_ID: str = ""
+    SMS_REGION: str = "ap-guangzhou"
+    SMS_TIMEOUT_SECONDS: int = Field(default=10, ge=1, le=30)
+    SMS_CODE_SECRET: SecretStr = SecretStr("")
+    SMS_GLOBAL_HOURLY_LIMIT: int = Field(default=1000, ge=1)
+
     # 应用级配置
     UVICORN_PORT: int = 8000
     DRAFT_EXPIRE_DAYS: int = 7
@@ -269,8 +283,11 @@ class UnilevelLevel(IntEnum):
 
 
 # ==================== 图片存储路径 ====================
+_RESOURCE_ROOT = Path(settings.SECURITY_ISOLATION_RESOURCE_DIR) if settings.SECURITY_ISOLATION_RESOURCE_DIR else Path(__file__).resolve().parent.parent
+if settings.SECURITY_ISOLATION_RESOURCE_DIR and not _RESOURCE_ROOT.is_absolute():
+    raise ValueError("SECURITY_ISOLATION_RESOURCE_DIR must be absolute")
 # 用户头像存储在与 main.py 同一级的 `user_pic/avatars` 文件夹
-BASE_PIC_DIR: Final[Path] = Path(__file__).resolve().parent.parent / "user_pic"
+BASE_PIC_DIR: Final[Path] = _RESOURCE_ROOT / "user_pic"
 AVATAR_UPLOAD_DIR: Final[Path] = BASE_PIC_DIR / "avatars"
 AVATAR_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 AVATAR_PENDING_DIR: Final[Path] = BASE_PIC_DIR / "avatar_pending"
@@ -322,9 +339,9 @@ class OrderStatus(StrEnum):
 VALID_PAY_WAYS: Final[set[str]] = {"alipay", "wechat", "card", "wx_pub", "wx_app","paid","pending_pay"}
 
 # ==================== 日志配置 ====================
-LOG_DIR: Final[Path] = Path(__file__).resolve().parent.parent / 'logs'
+LOG_DIR: Final[Path] = _RESOURCE_ROOT / "logs"
 LOG_FILE: Final[Path] = LOG_DIR / 'api.log'
-LOG_DIR.mkdir(exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # ==================== 微信配置 ====================
 WECHAT_APP_ID: Final[str] = settings.WECHAT_APP_ID
@@ -333,7 +350,7 @@ WECHAT_APP_SECRET: Final[str] = settings.WECHAT_APP_SECRET
 # ==================== 商品图片配置 ====================
 # 挂载静态文件目录（/pic -> pic_data）
 # 将 `PIC_PATH` 指向存放商品图片的 `pic_data` 目录，保证 `/pic/<分类>/...` 能正确映射到磁盘文件
-PIC_PATH: Final[Path] = Path(__file__).resolve().parent.parent / "pic_data"
+PIC_PATH: Final[Path] = _RESOURCE_ROOT / "pic_data"
 
 # 向后兼容：Wechat_ID 字典
 Wechat_ID: Final[dict] = {
@@ -343,8 +360,8 @@ Wechat_ID: Final[dict] = {
 
 # ==================== 商品管理配置 ====================
 # 上传目录
-BASE_PIC_DIR: Final[Path] = Path(__file__).resolve().parent.parent / "pic_data"
-BASE_PIC_DIR.mkdir(exist_ok=True)
+BASE_PIC_DIR: Final[Path] = _RESOURCE_ROOT / "pic_data"
+BASE_PIC_DIR.mkdir(parents=True, exist_ok=True)
 
 # 分类白名单
 CATEGORY_CHOICES: Final[list[str]] = [

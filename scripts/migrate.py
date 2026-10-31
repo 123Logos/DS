@@ -51,6 +51,11 @@ def run_sql_file(path: Path, dry_run: bool) -> None:
     with get_conn() as conn:
         with conn.cursor() as cur:
             for stmt in statements:
+                # Historical migration003 used MariaDB syntax; keep its checksum stable.
+                if path.name == '003_rain_point_monthly_coupon.sql' and 'ADD COLUMN IF NOT EXISTS rain_settlement_id' in stmt:
+                    if _column_exists(cur, 'coupons', 'rain_settlement_id'):
+                        continue
+                    stmt = stmt.replace('ADD COLUMN IF NOT EXISTS rain_settlement_id', 'ADD COLUMN rain_settlement_id')
                 cur.execute(stmt)
             conn.commit()
 
@@ -73,8 +78,25 @@ def ensure_users_points_columns(dry_run: bool) -> None:
 
 def run_migrations(dry_run: bool = False) -> None:
     migrations_dir = ROOT / "migrations"
-    for path in sorted(migrations_dir.glob("*.sql")):
-        run_sql_file(path, dry_run)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if not dry_run:
+                cur.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR(255) PRIMARY KEY, sha256 CHAR(64) NOT NULL, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB")
+                conn.commit()
+            for path in sorted(migrations_dir.glob("*.sql")):
+                import hashlib
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                if not dry_run:
+                    cur.execute("SELECT sha256 FROM schema_migrations WHERE version=%s", (path.name,))
+                    applied = cur.fetchone()
+                    if applied:
+                        if applied['sha256'] != digest:
+                            raise RuntimeError("Applied migration checksum changed: " + path.name)
+                        continue
+                run_sql_file(path, dry_run)
+                if not dry_run:
+                    cur.execute("INSERT INTO schema_migrations(version,sha256) VALUES(%s,%s)", (path.name, digest))
+                    conn.commit()
     ensure_users_points_columns(dry_run)
     logger.info("迁移完成")
 

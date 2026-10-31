@@ -90,7 +90,7 @@ class WechatApplymentService:
                 )
             return bank_info
         except Exception as e:
-            logger.error(f"银行卡信息加密失败: {str(e)}")
+            logger.error("银行卡信息加密失败: error_type=%s", type(e).__name__)
             raise HTTPException(status_code=500, detail="银行卡信息处理失败")
 
     def save_draft(self, user_id: int, data: dict) -> dict:
@@ -155,7 +155,7 @@ class WechatApplymentService:
                     params = list(update_data.values()) + [existing["id"]]
                     cur.execute(update_sql, tuple(params))
                     conn.commit()
-                    logger.info(f"用户 {user_id} 更新了进件草稿: {existing['id']}")
+                    logger.info("Updated application draft")
                     return {"applyment_id": existing["id"], "business_code": existing.get("business_code")}
                 else:
                     # ✅ 修复：使用原生 SQL 插入，避免 build_dynamic_insert 参数问题
@@ -185,7 +185,7 @@ class WechatApplymentService:
                     ))
                     conn.commit()
                     new_id = cur.lastrowid
-                    logger.info(f"用户 {user_id} 创建了进件草稿: {new_id}")
+                    logger.info("Created application draft")
                     return {"applyment_id": new_id, "business_code": business_code}
 
     async def submit_applyment(self, user_id: int, data: dict, parent_mchid: str = None) -> dict:
@@ -236,7 +236,7 @@ class WechatApplymentService:
                       AND media_type IN ('id_card_front', 'id_card_back', 'business_license')
                 """, (applyment["id"], user_id))
                 conn.commit()
-                logger.info(f"关联 {cur.rowcount} 个材料到草稿 {applyment['id']}")
+                logger.info("Linked application media: count=%s", cur.rowcount)
 
                 # 验证材料完整性
                 self._validate_media(cur, user_id, applyment["id"])
@@ -440,7 +440,7 @@ class WechatApplymentService:
                                            "SYSTEM", response.get("state_msg", ""))
 
                     conn.commit()
-                    logger.info(f"用户 {user_id} 提交进件申请: {applyment_id} (服务商: {WECHAT_PAY_SP_MCH_ID})")
+                    logger.info("提交进件申请成功")
 
                     # 推送通知
                     await push_service.send_applyment_status_notification(
@@ -455,29 +455,9 @@ class WechatApplymentService:
                     conn.rollback()
                     http_resp = getattr(e, "response", None)
                     status_code = getattr(http_resp, "status_code", None)
-                    resp_body = None
-                    if http_resp is not None:
-                        try:
-                            resp_body = http_resp.text[:1500]
-                        except Exception:
-                            resp_body = "<read_response_failed>"
 
-                    wx_applyment_id = None
-                    if "response" in locals():
-                        wx_applyment_id = response.get("applyment_id") if isinstance(response, dict) else None
-
-                    logger.exception(
-                        "用户 %s 提交进件失败: %s | db_applyment_id=%s business_code=%s wx_applyment_id=%s status=%s resp_body=%s payload=%s",
-                        user_id,
-                        str(e),
-                        applyment.get("id"),
-                        applyment.get("business_code"),
-                        wx_applyment_id,
-                        status_code,
-                        resp_body,
-                        payload_snapshot,
-                    )
-                    raise HTTPException(status_code=500, detail=f"提交失败: {str(e)}")
+                    logger.error("提交进件申请失败: error_type=%s http_status=%s", type(e).__name__, status_code)
+                    raise HTTPException(status_code=500, detail="提交进件失败，请稍后重试")
 
     async def upload_media(self, user_id: int, file: UploadFile, media_type: str) -> dict:
         """上传进件材料"""
@@ -540,7 +520,7 @@ class WechatApplymentService:
                     datetime.datetime.now() + datetime.timedelta(days=1)
                 ))
                 conn.commit()
-                logger.info(f"用户 {user_id} 上传材料: {media_id} - {file.filename}")
+                logger.info("进件材料上传成功: bytes=%s", file_size)
 
                 return {
                     "media_id": media_id,
@@ -705,7 +685,7 @@ class WechatApplymentService:
                 # ========================================
 
                 conn.commit()
-                logger.info(f"用户 {user_id} 修改核心信息，重新进件: {cur.lastrowid}")
+                logger.info("Core application changes submitted for review")
                 return {"new_applyment_id": cur.lastrowid, "business_code": new_business_code}
 
     def resubmit_applyment(self, user_id: int, applyment_id: int) -> dict:
@@ -767,7 +747,7 @@ class WechatApplymentService:
                                        "USER", "用户重新提交")
 
                 conn.commit()
-                logger.info(f"用户 {user_id} 重新提交进件: {applyment_id}, 微信单号: {wx_applyment_id}")
+                logger.info("Application resubmitted for review")
                 return {"applyment_id": applyment_id, "wx_applyment_id": wx_applyment_id}
 
     def get_merchant_info(self, user_id: int) -> dict:
@@ -878,7 +858,7 @@ class WechatApplymentService:
                 else:
                     account_number_plain = account_number
             except Exception as e:
-                logger.warning(f"解密结算账户信息失败（可能已是明文）: {e}")
+                logger.warning("解密结算账户信息失败: error_type=%s", type(e).__name__)
                 account_name_plain = account_name
                 account_number_plain = account_number
 
@@ -938,11 +918,9 @@ class WechatApplymentService:
                 'VERIFY_SUCCESS'  # 进件成功默认验证通过
             ))
 
-            logger.info(f"同步结算账户成功: user_id={user_id}, sub_mchid={sub_mchid}")
-
+            logger.info("同步结算账户成功")
         except Exception as e:
-            logger.error(f"同步结算账户失败: {e}", exc_info=True)
-            # 不抛出异常，避免影响主流程
+            logger.error("同步结算账户失败: error_type=%s", type(e).__name__)
 
     # 修改原有的 handle_applyment_state_change 方法
     async def handle_applyment_state_change(self, applyment_id: int, new_state: str, status_info: Dict[str, Any]):
@@ -957,7 +935,7 @@ class WechatApplymentService:
                 """, (applyment_id,))
                 result = cur.fetchone()
                 if not result:
-                    logger.error(f"未找到进件记录: {applyment_id}")
+                    logger.error("Application record not found")
                     return
 
                 user_id = result['user_id']
@@ -1007,4 +985,4 @@ class WechatApplymentService:
                     status_info.get("state_msg", "")
                 )
 
-                logger.info(f"进件状态变更: {applyment_id} -> {new_state}")
+                logger.info("Application state changed: state=%s", new_state)
