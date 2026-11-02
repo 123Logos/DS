@@ -179,7 +179,7 @@ class SettlementService:
         if isinstance(target_date, datetime):
             target_date = target_date.date()
 
-        expired = self.expire_due_coupons(target_date)
+        expired = self.expire_due_coupons(target_date + timedelta(days=1))
 
         value = self.resolve_points_value(points_value)
         if value <= 0:
@@ -292,7 +292,7 @@ class SettlementService:
                     if cur.rowcount == 1:
                         total += remaining
                 if total <= 0:
-                    conn.rollback()
+                    conn.commit()
                     return Decimal("0")
 
                 # 2. 锁旧账本会员行（必须先于 user_assets）
@@ -304,12 +304,8 @@ class SettlementService:
                 assets = service.lock_user_assets(cur, user_id)
                 coupon_balance = to_decimal(assets["coupon_balance"])
                 if coupon_balance < total:
-                    # 券余额与批次不一致：先按实际余额入池，避免出现负余额，并记录告警
                     logger.error("coupon_balance_invariant_broken user=%s balance=%s batches=%s", user_id, coupon_balance, total)
-                    total = coupon_balance
-                    if total <= 0:
-                        conn.rollback()
-                        return Decimal("0")
+                    raise RuntimeError("优惠券余额与批次不一致，已回滚过期结算")
 
                 cur.execute(
                     """UPDATE system_pools

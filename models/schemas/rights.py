@@ -32,6 +32,8 @@ def _parse_decimal(raw: str, field: str, *, positive: bool) -> str:
         raise ValueError(f"{field} 必须大于 0")
     if value < 0:
         raise ValueError(f"{field} 不能为负数")
+    if value >= Decimal("100000000000000"):
+        raise ValueError(f"{field} 必须小于 100000000000000")
     if value.as_tuple().exponent < -6:
         raise ValueError(f"{field} 最多支持 6 位小数")
     return str(value)
