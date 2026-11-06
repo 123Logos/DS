@@ -195,7 +195,7 @@ def _seed_coupon_batch(store, quantity):
 
 def test_concurrent_exchange_is_atomic_and_never_oversells(store):
     store.exec("INSERT INTO users (id) VALUES (1)")
-    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 1000)")
+    store.exec("UPDATE user_assets SET coupon_balance = 1000 WHERE user_id = 1")
     _seed_coupon_batch(store, 1000)
 
     results = _race(8, lambda: RightsService().exchange_eggs(1, "100"))
@@ -233,7 +233,7 @@ def test_concurrent_exchange_respects_platform_inventory(store):
     """平台库存不足时，并发操作必须整笔失败，不得部分成交或出现负库存。"""
     store.exec("UPDATE system_pools SET pool_coupon_balance = 100, platform_egg_balance = 10000 WHERE id = 1")
     store.exec("INSERT INTO users (id) VALUES (1)")
-    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 10000)")
+    store.exec("UPDATE user_assets SET coupon_balance = 10000 WHERE user_id = 1")
     _seed_coupon_batch(store, 10000)
 
     # 价格 0.01 时 1000 券需 80,000 枚，远超 10,000 枚库存
@@ -256,7 +256,7 @@ def test_concurrent_exchange_conserves_egg_supply(store):
     """库存被并发逐步耗尽时，蛋守恒：平台剩余 + 会员持有 = 初始库存。"""
     store.exec("UPDATE system_pools SET pool_coupon_balance = 100, platform_egg_balance = 20000 WHERE id = 1")
     store.exec("INSERT INTO users (id) VALUES (1)")
-    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 10000)")
+    store.exec("UPDATE user_assets SET coupon_balance = 10000 WHERE user_id = 1")
     _seed_coupon_batch(store, 10000)
 
     results = _race(8, lambda: RightsService().exchange_eggs(1, "100"))
@@ -292,6 +292,7 @@ def test_exchange_and_legacy_points_update_never_deadlock(store):
     """
     store.exec("INSERT INTO users (id, member_points) VALUES (1, 0)")
     store.exec("UPDATE user_assets SET coupon_balance = 100000 WHERE user_id = 1")
+    _seed_coupon_batch(store, 100000)
 
     def exchange_worker():
         errors = []
@@ -357,7 +358,7 @@ def test_quote_egg_exchange_preview(store):
 
 def test_weighted_average_cost_and_auto_conversion_in_db(store):
     store.exec("INSERT INTO users (id) VALUES (1)")
-    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 1000)")
+    store.exec("UPDATE user_assets SET coupon_balance = 1000 WHERE user_id = 1")
     _seed_coupon_batch(store, 1000)
     service = RightsService()
 
@@ -397,7 +398,7 @@ def test_weighted_average_cost_and_auto_conversion_in_db(store):
 
 def test_auto_conversion_not_triggered_below_double(store):
     store.exec("INSERT INTO users (id) VALUES (1)")
-    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 1000)")
+    store.exec("UPDATE user_assets SET coupon_balance = 1000 WHERE user_id = 1")
     _seed_coupon_batch(store, 1000)
     service = RightsService()
     service.exchange_eggs(1, "100")
@@ -498,7 +499,7 @@ def test_total_egg_supply_is_immutable(store):
 
 def test_idempotency_key_replays_same_result(store):
     store.exec("INSERT INTO users (id) VALUES (1)")
-    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 1000)")
+    store.exec("UPDATE user_assets SET coupon_balance = 1000 WHERE user_id = 1")
     _seed_coupon_batch(store, 1000)
     service = RightsService()
 
@@ -514,7 +515,7 @@ def test_idempotency_key_replays_same_result(store):
 
 def test_idempotency_key_with_different_amount_conflicts(store):
     store.exec("INSERT INTO users (id) VALUES (1)")
-    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 1000)")
+    store.exec("UPDATE user_assets SET coupon_balance = 1000 WHERE user_id = 1")
     _seed_coupon_batch(store, 1000)
     service = RightsService()
     service.exchange_eggs(1, "100", idempotency_key="key-002")
@@ -525,7 +526,7 @@ def test_idempotency_key_with_different_amount_conflicts(store):
 
 def test_quote_stale_when_unit_value_changed(store):
     store.exec("INSERT INTO users (id) VALUES (1)")
-    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 1000)")
+    store.exec("UPDATE user_assets SET coupon_balance = 1000 WHERE user_id = 1")
     _seed_coupon_batch(store, 1000)
     with pytest.raises(RightsError) as exc:
         RightsService().exchange_eggs(1, "100", expected_unit_value="0.02")
@@ -543,6 +544,7 @@ def _seed_trigger_scenario(store):
     store.exec("UPDATE system_pools SET pool_coupon_balance = 2000, platform_egg_balance = 200000 WHERE id = 1")
     store.exec("INSERT INTO users (id) VALUES (1)")
     store.exec("UPDATE user_assets SET coupon_balance = 1000 WHERE user_id = 1")
+    _seed_coupon_batch(store, 1000)
 
 
 def test_exchange_and_auto_conversion_share_one_transaction(store):
@@ -580,8 +582,15 @@ def test_exchange_and_auto_conversion_share_one_transaction(store):
     deltas = {row["asset_type"]: Decimal(row["delta"]) for row in ledger}
     assert deltas["coupon"] == Decimal("-1000")
     assert deltas["egg"] == Decimal("0")
-    assert deltas["platform_egg"] == Decimal("80000")
+    assert deltas["platform_egg"] == Decimal("0")
     assert deltas["goda_coupon"] == Decimal("1866.640000")
+    platform_egg_entries = store.all(
+        "SELECT quantity_delta FROM rights_ledger WHERE asset_type = 'platform_egg'"
+    )
+    assert sorted(Decimal(row["quantity_delta"]) for row in platform_egg_entries) == [
+        Decimal("-80000"),
+        Decimal("80000"),
+    ]
 
     # 兑换与转券各一条操作记录（转券先写、兑换后写），兑换记录里保存的是最终状态
     ops = store.all("SELECT operation_type, result FROM rights_operations")
@@ -782,7 +791,7 @@ def test_subsidy_pool_never_pays_out(store):
 def test_exchanged_old_batch_cannot_expire_again(store):
     today = date.today()
     store.exec("INSERT INTO users (id) VALUES (1)")
-    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 200)")
+    store.exec("UPDATE user_assets SET coupon_balance = 200 WHERE user_id = 1")
     for expiry in (today, today + timedelta(days=20)):
         store.exec(
             """INSERT INTO rights_coupon_batches (user_id, quantity, remaining, valid_from, valid_to, source_event)
@@ -799,7 +808,7 @@ def test_exchanged_old_batch_cannot_expire_again(store):
 def test_expired_batch_cannot_be_exchanged(store):
     today = date.today()
     store.exec("INSERT INTO users (id) VALUES (1)")
-    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 100)")
+    store.exec("UPDATE user_assets SET coupon_balance = 100 WHERE user_id = 1")
     store.exec(
         """INSERT INTO rights_coupon_batches (user_id, quantity, remaining, valid_from, valid_to, source_event)
            VALUES (1, 100, 100, %s, %s, 'test')""",
@@ -814,7 +823,7 @@ def test_expired_batch_cannot_be_exchanged(store):
 def test_daily_settlement_expires_yesterdays_batch(store):
     yesterday = date.today() - timedelta(days=1)
     store.exec("INSERT INTO users (id) VALUES (1)")
-    store.exec("INSERT INTO user_assets (user_id, coupon_balance) VALUES (1, 100)")
+    store.exec("UPDATE user_assets SET coupon_balance = 100 WHERE user_id = 1")
     store.exec(
         """INSERT INTO rights_coupon_batches (user_id, quantity, remaining, valid_from, valid_to, source_event)
            VALUES (1, 100, 100, %s, %s, 'test')""",
